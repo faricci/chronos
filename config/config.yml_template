@@ -1,0 +1,25 @@
+coinbase:
+  base_url: "https://api.coinbase.com" 
+  name: "",
+  privateKey: ""
+
+coinbase_sandbox:
+  base_url: "https://api-sandbox.coinbase.com"
+  name: "",
+  privateKey: ""
+
+trading:
+  products:
+    - "BTC-USD"
+    - "ETH-USD"
+  risk_management:
+    stop_loss_percent: 0.02
+    take_profit_percent: 0.05
+
+faiss:
+  index_path: "data/faiss_index.index"
+
+schedule:
+  real_time_interval_minutes: 1
+  sentiment_interval_hours: 8
+  historical_interval_hours: 8

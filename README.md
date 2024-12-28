@@ -59,11 +59,16 @@ pip install -r requirements.txt
 ```
 
 ### Set up config:
+Rename the `config/config.yml_template` to `config/config.yml`
 Update `config/config.yml` with your actual Coinbase API credentials. Customize your product list (BTC-USD, ETH-USD, etc.) and intervals.
 
 ### Testing:
 ```
 python -m unittest discover -s tests
+```
+or for single class you can use:
+```
+python -m unittest tests.test_data_fetch
 ```
 
 ### Run:
