@@ -47,10 +47,14 @@ def convert_granularity_to_coinbase_str(granularity_seconds: int) -> str:
 class DataFetcher:
     def __init__(self, config):
         self.config = config
-        # Initialize Coinbase client
+
+        # Initialize Coinbase client with the correct base URL
+        base_url = self.config['coinbase'].get('base_url', 'https://api.coinbase.com')
+
         self.client = RESTClient(
-            api_key=self.config['coinbase']['api_key'],
-            api_secret=self.config['coinbase']['api_secret'],
+            api_url=base_url,
+            api_key=self.config['coinbase']['name'],
+            api_secret=self.config['coinbase']['privateKey'],
             timeout=10
         )
 
