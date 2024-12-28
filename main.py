@@ -43,15 +43,51 @@ def main():
         for product in config['trading']['products']:
             # 1) Fetch real-time data
             df = fetcher.fetch_realtime_data(product)
+
             # 2) Generate signal
             signal = trading_logic.generate_signal(df)
             logger.info(f"Signal for {product}: {signal}")
-            # 3) Execute order if signal is buy or sell
-            if signal in ["BUY", "SELL"]:
-                current_price = df['price'].iloc[-1]
-                order_id = executor.execute_order(product, side=signal, price=current_price, size=0.001)
-                # 4) Log trade
-                log_trade(signal, product, current_price, 0.001)
+
+            # 3) Check current market price
+            current_price = df['price'].iloc[-1]
+
+            if signal == "BUY":
+                # Example bracket: 5% take-profit, 2% stop-loss
+                take_profit = current_price * 1.05
+                stop_loss = current_price * 0.98
+                size = 0.001  # e.g., 0.001 BTC
+
+                order_id = executor.execute_bracket_order(
+                    product_id=product,
+                    side="SELL",  # For bracket orders that close your new position
+                    entry_price=current_price, 
+                    take_profit_price=take_profit,
+                    stop_loss_price=stop_loss,
+                    size=size
+                )
+                log_trade("BUY with bracket", product, current_price, size)
+
+            elif signal == "SELL":
+                # Similarly place a bracket that triggers on the upside or further downside
+                # (Though for a short, your bracket logic might differ. 
+                #  Or you might bracket an existing long to close it.)
+                pass
+
+            # else: HOLD => do nothing
+
+    #def trading_task():
+    #    for product in config['trading']['products']:
+    #        # 1) Fetch real-time data
+    #        df = fetcher.fetch_realtime_data(product)
+    #        # 2) Generate signal
+    #        signal = trading_logic.generate_signal(df)
+    #        logger.info(f"Signal for {product}: {signal}")
+    #        # 3) Execute order if signal is buy or sell
+    #        if signal in ["BUY", "SELL"]:
+    #            current_price = df['price'].iloc[-1]
+    #            order_id = executor.execute_order(product, side=signal, price=current_price, size=0.001)
+    #            # 4) Log trade
+    #            log_trade(signal, product, current_price, 0.001)
 
     # Task 2: Fetch Sentiment Data and Store in FAISS (runs every 8 hours)
     def sentiment_task():

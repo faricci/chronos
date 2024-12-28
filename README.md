@@ -20,6 +20,9 @@ Each Python file in `modules/` corresponds to a specific step in your pipeline:
 - `monitoring.py`: performance tracking, logs
 - `utils.py`: any helper functions, shared code
 
+### `tests/`
+Contains unit tests for your modules. Each module should have a corresponding test file (e.g., `test_data_fetch.py`, `test_data_preprocessing.py`). Use a framework like `unittest` or `pytest` to write and run your tests.
+
 ### `main.py`
 The central file that ties all modules together. Schedules tasks, runs main loops, and orchestrates the end-to-end process.
 
@@ -57,6 +60,11 @@ pip install -r requirements.txt
 
 ### Set up config:
 Update `config/config.yml` with your actual Coinbase API credentials. Customize your product list (BTC-USD, ETH-USD, etc.) and intervals.
+
+### Testing:
+```
+python -m unittest discover -s tests
+```
 
 ### Run:
 ```
