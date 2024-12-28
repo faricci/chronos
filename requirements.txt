@@ -1,0 +1,12 @@
+pandas
+numpy
+scikit-learn
+torch
+transformers
+langchain
+faiss-cpu
+requests
+beautifulsoup4
+schedule
+pyyaml
+coinbase-advanced-py
