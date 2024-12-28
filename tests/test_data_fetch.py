@@ -3,6 +3,7 @@
 import unittest
 from datetime import datetime, timedelta
 import pandas as pd
+import logging
 
 from modules.data_fetch import DataFetcher
 from modules.utils import load_config  # or wherever your load_config function is defined
@@ -36,8 +37,11 @@ class TestDataFetcher(unittest.TestCase):
         Typically used to initialize shared resources, such as the DataFetcher.
         Here, we specifically override the 'coinbase' config with 'coinbase_sandbox' settings.
         """
+
+        logging.basicConfig(level=logging.DEBUG)
+
         # Load your entire config from the YAML file
-        config = load_config("config/config.yaml")
+        config = load_config()
 
         # Overwrite the 'coinbase' section with the sandbox credentials
         # so that DataFetcher will use the sandbox environment.

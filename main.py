@@ -103,7 +103,7 @@ def main():
     def historical_task():
         # Example: last 24 hours
         end = datetime.utcnow()
-        start = end - timedelta(hours=24)
+        start = end - timedelta(hours=8)
         for product in config['trading']['products']:
             df = fetcher.fetch_historical_data(product, start, end)
             # Save or do something with df

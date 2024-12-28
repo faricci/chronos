@@ -52,7 +52,7 @@ class DataFetcher:
         base_url = self.config['coinbase'].get('base_url', 'https://api.coinbase.com')
 
         self.client = RESTClient(
-            api_url=base_url,
+            base_url=base_url,
             api_key=self.config['coinbase']['name'],
             api_secret=self.config['coinbase']['privateKey'],
             timeout=10
@@ -94,17 +94,36 @@ class DataFetcher:
         Also appends/creates a CSV file at data/realtime_<product_id>.csv
         """
         try:
+            #FIXME add pagination
             response = self.client.get_best_bid_ask(product_id)
-            logger.info(f"Fetched realtime data for {product_id}. Response: {response}")
 
+            logger.debug(f"BID/ASK response for {product_id}: {response}")
+
+            # Now with the new structure:
+            pricebooks = response['pricebooks']
+            if not pricebooks:
+                logger.error("No pricebooks in best_bid_ask response")
+                return pd.DataFrame()  # or raise an exception
+
+            first_pb = pricebooks[0]
+            bid = first_pb["bids"][0]
+            ask = first_pb["asks"][0]
+
+            # We define "price" as the midpoint (your choice)
+            mid_price = (float(bid["price"]) + float(ask["price"])) / 2.0
+
+            # Example "volume" as sum of top bid/ask sizes:
+            volume = float(bid["size"]) + float(ask["size"])
+
+            # Or parse time from first_pb["time"] if you prefer that
             data = {
-                "time": datetime.utcnow(),
-                "price": float(response['price']),
-                "volume": float(response['volume_24h'])
+                "time": datetime.utcnow(),  
+                "price": mid_price,
+                "volume": volume
             }
             df = pd.DataFrame([data])
-
-            # Append to local CSV file
+            
+            # Append to local CSV
             file_path = f"data/realtime_{product_id}.csv"
             self._append_data_to_file(df, file_path=file_path, time_col="time")
 
@@ -132,7 +151,7 @@ class DataFetcher:
 
         Also appends/creates a CSV file at data/historical_<product_id>.csv
         """
-        try:
+        try:            
             start_ts = int(start.timestamp())
             end_ts = int(end.timestamp())
             gran_str = convert_granularity_to_coinbase_str(granularity)
@@ -140,6 +159,7 @@ class DataFetcher:
             logger.info(f"Fetching historical data for {product_id} from {start} to {end}, "
                         f"granularity={granularity} ({gran_str})")
 
+            #FIXME add pagination
             candles = self.client.get_candles(
                 product_id=product_id,
                 start=str(start_ts),
@@ -147,25 +167,29 @@ class DataFetcher:
                 granularity=gran_str
             )
 
-            # Check response validity
-            if (not candles) or ('candles' not in candles) or (not candles['candles']):
-                raise ValueError(f"No candles returned for {product_id}")
+            logger.debug(f"Candles response for {product_id}: {candles}")
+
+            logger.debug(f"[DEBUG] Checking candles validity: {candles}")
+            if (not candles) or (not candles['candles']):
+                print("[DEBUG] Condition triggered => raising ValueError")
+                raise ValueError("Error evaluating candles")
+            logger.debug("PASSED the condition check!")
 
             rows = []
             for c in candles['candles']:
                 rows.append({
-                    "time": datetime.fromtimestamp(c[0], tz=timezone.utc),
-                    "low": float(c[1]),
-                    "high": float(c[2]),
-                    "open": float(c[3]),
-                    "close": float(c[4]),
-                    "volume": float(c[5])
+                    "time": datetime.fromtimestamp(int(c['start']), tz=timezone.utc),
+                    "low": float(c['low']),
+                    "high": float(c['high']),
+                    "open": float(c['open']),
+                    "close": float(c['close']),
+                    "volume": float(c['volume'])
                 })
 
             df = pd.DataFrame(rows)
             df.sort_values("time", inplace=True, ignore_index=True)
 
-            logger.info(f"Fetched {len(df)} candle records for {product_id}.")
+            logger.info(f"Fetched {len(df)} candle records for {product_id}.")            
 
             # Append to local CSV
             file_path = f"data/historical_{product_id}.csv"
@@ -174,5 +198,6 @@ class DataFetcher:
             return df
 
         except Exception as e:
-            logger.error(f"Error fetching historical data for {product_id}: {e}", exc_info=True)
+            print("Exception details:", e)
+            logger.exception("Error fetching historical data", exc_info=True)
             return pd.DataFrame()
