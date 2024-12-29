@@ -8,14 +8,16 @@ A class to handle the execution of different types of orders on a trading platfo
 Attributes:
     config (dict): Configuration settings for the order executor.
     client (object): An instance of the Coinbase client to interact with the trading platform.
+
 Methods:
     execute_market_order(product_id, side, size):
     execute_limit_order(product_id, side, limit_price, size):
     execute_stop_limit_order(product_id, side, stop_price, limit_price, size):
-        Places a STOP LIMIT order that triggers once the last trade price hits stop_price,
     execute_bracket_order(product_id, side, entry_price, take_profit_price, stop_loss_price, size):
-        Places a 'Bracket Order' with two triggers: take-profit and stop-loss.
+    execute_order_with_risk_management(product_id, side, current_price, size):
+        Automatically applies risk management parameters (stop-loss, take-profit).
 """
+
 class OrderExecutor:
     def __init__(self, config, coinbase_client):
         self.config = config
@@ -27,13 +29,12 @@ class OrderExecutor:
         This might not handle risk management automatically.
         """
         logger.info(f"Placing MARKET {side} order on {product_id}, size={size}")
-        # Example of the required parameters (pseudo-code):
-        order_type = "market_market_ioc"  # immediate or cancel
+        order_type = "market_market_ioc"
         order_id = self.client.place_order(
             product_id=product_id,
-            side=side,           # "BUY" or "SELL"
+            side=side,           
             order_type=order_type,
-            base_size=size       # for SELL or BUY in base currency
+            base_size=size       
         )
         return order_id
 
@@ -89,9 +90,7 @@ class OrderExecutor:
             f"entry={entry_price}, TP={take_profit_price}, SL={stop_loss_price}, size={size}"
         )
 
-        # GTC = Good 'Till Cancel
-        # GTD = Good 'Till Date (requires specifying an expiration date)
-        order_type = "trigger_bracket_gtc"
+        order_type = "trigger_bracket_gtc"  # or "trigger_bracket_gtd" if you prefer an expiration date
 
         order_id = self.client.place_order(
             product_id=product_id,
@@ -99,10 +98,39 @@ class OrderExecutor:
             order_type=order_type,
             base_size=size,
             # Pseudo-fields for bracket order
-            entry_price=entry_price,         # (some bracket orders might not require entry price if you already hold a position)
+            entry_price=entry_price,
             take_profit_price=take_profit_price,
             stop_price=stop_loss_price
-            # The exact field names may differ in the real SDK
         )
 
         return order_id
+
+    # -----------------------------------------------------------------
+    # NEW METHOD: Use stop_loss_percent & take_profit_percent from config
+    # -----------------------------------------------------------------
+    def execute_order_with_risk_management(self, product_id, side, current_price, size):
+        """
+        Places a bracket order (take-profit & stop-loss) automatically, 
+        using risk_management config parameters.
+
+        Example:
+          - If stop_loss_percent = 0.02 => stop_loss_price = current_price * (1 - 0.02)
+          - If take_profit_percent = 0.05 => take_profit_price = current_price * (1 + 0.05)
+        """
+        stop_loss_pct = self.config["risk_management"]["stop_loss_percent"]
+        take_profit_pct = self.config["risk_management"]["take_profit_percent"]
+
+        take_profit_price = current_price * (1 + take_profit_pct)
+        stop_loss_price = current_price * (1 - stop_loss_pct)
+
+        logger.info(f"Placing bracket order with risk management: side={side}, "
+                    f"entry_price={current_price}, TP={take_profit_price}, SL={stop_loss_price}")
+
+        return self.execute_bracket_order(
+            product_id=product_id,
+            side=side,
+            entry_price=current_price,
+            take_profit_price=take_profit_price,
+            stop_loss_price=stop_loss_price,
+            size=size
+        )

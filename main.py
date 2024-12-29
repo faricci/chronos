@@ -51,20 +51,15 @@ def main():
             # 3) Check current market price
             current_price = df['price'].iloc[-1]
 
-            if signal == "BUY":
-                # Example bracket: 5% take-profit, 2% stop-loss
-                take_profit = current_price * 1.05
-                stop_loss = current_price * 0.98
-                size = 0.001  # e.g., 0.001 BTC
-
-                order_id = executor.execute_bracket_order(
+            if signal == "BUY":                
+                size = 5  # e.g., 0.001 BTC
+                order_id = executor.execute_order_with_risk_management(
                     product_id=product,
-                    side="SELL",  # For bracket orders that close your new position
-                    entry_price=current_price, 
-                    take_profit_price=take_profit,
-                    stop_loss_price=stop_loss,
+                    side="BUY",
+                    current_price=current_price,
                     size=size
                 )
+
                 log_trade("BUY with bracket", product, current_price, size)
 
             elif signal == "SELL":
