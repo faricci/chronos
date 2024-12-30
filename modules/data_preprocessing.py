@@ -1,3 +1,5 @@
+# modules/data_preprocessing.py
+
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
@@ -27,9 +29,8 @@ def normalize_data(df, columns=None, scaler=None):
     if columns is None:
         columns = ['price', 'volume', 'open', 'high', 'low', 'close']
 
-    # Filter out columns that do not exist
+    # Filter out any columns not present in df
     columns_to_scale = [col for col in columns if col in df.columns]
-
     if not columns_to_scale:
         # No valid columns to scale
         return df, None
@@ -41,42 +42,46 @@ def normalize_data(df, columns=None, scaler=None):
 
     return df, scaler
 
-def compute_indicators(df, ma_window=5, rsi_period=10):
+
+def compute_indicators(df, ma_window=5, rsi_period=14):
     """
-    Computes simple indicators like moving averages, RSI, etc.
-    
+    Computes simple indicators like moving averages (MA) and RSI using a classical approach.
+
     Args:
-        df (pd.DataFrame): Input DataFrame with a 'close' column.
-        ma_window (int): The window size for the moving average. Default = 5.
-        rsi_period (int): The period for RSI calculation. Default = 10.
-        
+        df (pd.DataFrame): Input DataFrame (must contain 'close').
+        ma_window (int): Window size for the moving average. Default = 5.
+        rsi_period (int): Period for the classical RSI calculation. Default = 14 (production).
+
     Returns:
-        pd.DataFrame: DataFrame with new columns ['ma_5', 'rsi'].
+        pd.DataFrame: DataFrame with new columns [f"ma_{ma_window}", 'rsi'].
     """
-    # 1) Moving average (e.g., 5-day)
-    if 'close' in df.columns:
-        ma_col = f'ma_{ma_window}'
-        df[ma_col] = df['close'].rolling(window=ma_window).mean()
+    if 'close' not in df.columns:
+        # If there's no 'close' column, nothing to compute
+        return df
 
-        # 2) RSI Calculation
-        # Using exponential moving average (ema) for smoothed RSI
-        delta = df['close'].diff()
-        gain = delta.where(delta > 0, 0)
-        loss = -delta.where(delta < 0, 0)
-        
-        # Adjusting min_periods
-        min_periods_adjusted = min(rsi_period, 10)
+    # 1) Moving Average
+    ma_col = f"ma_{ma_window}"
+    df[ma_col] = df['close'].rolling(window=ma_window).mean()
 
-        avg_gain = gain.ewm(span=rsi_period, min_periods=min_periods_adjusted, adjust=False).mean()
-        avg_loss = loss.ewm(span=rsi_period, min_periods=min_periods_adjusted, adjust=False).mean()
+    # 2) Classical RSI Calculation (simple moving average approach)
+    #    RSI = 100 - (100 / (1 + RS)), RS = avg_gain / avg_loss
+    #    avg_gain/avg_loss = simple rolling average of up/down moves
+    delta = df['close'].diff()
 
-        #avg_gain = gain.ewm(span=rsi_period, min_periods=rsi_period).mean()
-        #avg_loss = loss.ewm(span=rsi_period, min_periods=rsi_period).mean()
+    # Gains (positive deltas) and losses (negative deltas)
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
 
-        rs = avg_gain / avg_loss
-        df['rsi'] = 100 - (100 / (1 + rs))
+    # Simple rolling average of gains/losses
+    avg_gain = gain.rolling(window=rsi_period).mean()
+    avg_loss = loss.rolling(window=rsi_period).mean()
 
-        # Fill NaNs
-        df.fillna(method='bfill', inplace=True)
+    # Avoid division by zero
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    # Fill NaNs by backward fill
+    df.fillna(method='bfill', inplace=True)
 
     return df

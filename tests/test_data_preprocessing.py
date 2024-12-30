@@ -1,102 +1,98 @@
-# test_data_preprocessing.py
+# tests/test_data_preprocessing.py
 import unittest
 import pandas as pd
 import numpy as np
 
 from modules.data_preprocessing import normalize_data, compute_indicators
 
-"""
-This module contains unit tests for data_preprocessing.py, specifically testing:
-    1) normalize_data
-    2) compute_indicators
-
-Class-based tests for the data_preprocessing module.
-This class contains unit tests for the following functions:
-Methods
--------
-    setUpClass(cls):
-        Class-based tests for data_preprocessing module.
-    test_normalize_data(self):
-        Tests if normalize_data properly scales the desired columns to [0,1].
-    test_compute_indicators(self):
-        Tests if compute_indicators properly adds 'ma_5' and 'rsi' columns.
-    suite():
-        Optional static method to create a test suite for this class alone.
-"""
-
+'''
+Unit tests for the data_preprocessing module.
+This module contains class-based tests for the functions `normalize_data` and `compute_indicators`
+from the `data_preprocessing` module. The tests ensure that the data normalization and indicator
+computation functions work as expected.
+Classes:
+    TestDataPreprocessing: Contains unit tests for the data_preprocessing module.
+Methods:
+    setUpClass: Sets up a dummy DataFrame to be used across tests.
+    test_normalize_data: Tests that `normalize_data` scales the specified columns between [0,1].
+    test_compute_indicators: Tests that `compute_indicators` adds a moving average column and an RSI column.
+    suite: Creates a test suite for these tests alone.
+'''
 class TestDataPreprocessing(unittest.TestCase):
     """
-    Class-based tests for data_preprocessing module.
+    Class-based tests for the data_preprocessing module.
     """
 
     @classmethod
     def setUpClass(cls):
         """
-        Creates a dummy DataFrame to use across all tests.
+        Create a dummy DataFrame to use across tests.
+        We'll have more than 6 rows, so RSI(6) can compute.
         """
-        # Example dummy data for 10 rows
         data = {
-            "price":  [10, 12, 13, 15, 14, 20, 18, 22, 25, 30],
-            "volume": [100, 120, 80, 90, 110, 150, 130, 160, 200, 250],
-            "open":   [10, 11, 12, 14, 14, 19, 17, 21, 24, 28],
-            "high":   [11, 13, 14, 16, 15, 21, 19, 23, 26, 31],
-            "low":    [9,  10, 11, 13, 13, 18, 16, 20, 23, 27],
-            "close":  [10, 12, 13, 15, 14, 20, 18, 22, 25, 30],
+            "price":  [10, 12, 13, 15, 14, 20, 18, 22, 25],
+            "volume": [100,120, 80, 90, 110,150,130,160,200],
+            "open":   [10, 11, 12, 14, 14, 19,17,21,24],
+            "high":   [11, 13, 14, 16, 15, 21,19,23,26],
+            "low":    [9,  10, 11, 13, 13, 18,16,20,23],
+            "close":  [10, 12, 13, 15, 14, 20,18,22,25]
         }
         cls.df = pd.DataFrame(data)
 
     def test_normalize_data(self):
         """
-        Tests if normalize_data properly scales the desired columns to [0,1].
+        Tests that normalize_data scales the specified columns between [0,1].
         """
-        # Make a copy so we can check original vs scaled
         df_copy = self.df.copy()
-
         scaled_df, scaler = normalize_data(df_copy)
-        self.assertIsNotNone(scaler, "Scaler should be returned.")
+        self.assertIsNotNone(scaler, "Expected a scaler instance to be returned.")
 
-        # We expect columns: [price, volume, open, high, low, close] to be in [0,1] range
-        for col in ['price', 'volume', 'open', 'high', 'low', 'close']:
-            min_val = scaled_df[col].min()
-            max_val = scaled_df[col].max()
-            self.assertGreaterEqual(min_val, 0.0, f"{col} min should be >= 0")
-            self.assertLessEqual(max_val, 1.0, f"{col} max should be <= 1")
+        for col in ['price','volume','open','high','low','close']:
+            self.assertIn(col, scaled_df.columns, f"{col} column should exist.")
+            col_min = scaled_df[col].min()
+            col_max = scaled_df[col].max()
+            self.assertGreaterEqual(col_min, 0.0, f"{col} min should be >= 0 after scaling")
+            self.assertLessEqual(col_max, 1.0, f"{col} max should be <= 1 after scaling")
 
-        # Check if the shape is the same
-        self.assertEqual(scaled_df.shape, self.df.shape, "DataFrame shape should remain the same after scaling.")
+        # The shape should remain the same
+        self.assertEqual(scaled_df.shape, self.df.shape, "Data shape should not change.")
 
     def test_compute_indicators(self):
         """
-        Tests if compute_indicators properly adds 'ma_5' and 'rsi' columns.
+        Tests that compute_indicators adds a moving average column and an RSI column.
+        We use a smaller rsi_period so we don't need a large DataFrame to avoid all NaNs.
         """
         df_copy = self.df.copy()
 
-        result_df = compute_indicators(df_copy, ma_window=5, rsi_period=14)
-        self.assertIn('ma_5', result_df.columns, "Expected 'ma_5' column in result.")
+        result_df = compute_indicators(df_copy, ma_window=3, rsi_period=6)  
+        self.assertIn('ma_3', result_df.columns, "Expected moving average column in result.")
         self.assertIn('rsi', result_df.columns, "Expected 'rsi' column in result.")
 
-        # For a 5-day rolling average, first few rows may be NaN but we do fillna(bfill)
-        # So let's see if it's effectively filled.
-        self.assertFalse(result_df['ma_5'].isna().any(), "ma_5 should have been backfilled.")
-        self.assertFalse(result_df['rsi'].isna().any(),  "rsi should have been backfilled.")
+        # Verify we have no NaNs left in those columns after the fill
+        self.assertFalse(result_df['ma_3'].isna().any(), "All ma_3 values should be filled.")
+        self.assertFalse(result_df['rsi'].isna().any(), "All RSI values should be filled.")
 
-        # Basic check: 'ma_5' should be between min and max of 'close'
-        # (though it might be slightly beyond if there's a short initial window).
-        ma_min = result_df['ma_5'].min()
-        ma_max = result_df['ma_5'].max()
-        self.assertGreaterEqual(ma_min, result_df['close'].min(), "ma_5 min shouldn't be below close min.")
-        self.assertLessEqual(ma_max, result_df['close'].max(), "ma_5 max shouldn't be above close max.")
+        # Quick check: 'ma_3' should be an average of 'close' over 3 rows
+        # Just spot check last row (index=8) => average of close at [6,7,8] => (18+22+25)/3 = 21.666...
+        expected_ma = (18 + 22 + 25) / 3
+        self.assertAlmostEqual(result_df['ma_3'].iloc[-1], expected_ma, places=2,
+                               msg="Moving average calculation mismatch.")
+
+        # RSI is trickier to verify exactly, but we can ensure it's between 0 and 100
+        rsi_min = result_df['rsi'].min()
+        rsi_max = result_df['rsi'].max()
+        self.assertGreaterEqual(rsi_min, 0, "RSI should not go below 0.")
+        self.assertLessEqual(rsi_max, 100, "RSI should not exceed 100.")
 
     @staticmethod
     def suite():
         """
-        Optional static method to create a test suite for this class alone.
+        Creates a test suite for these tests alone.
         """
         suite = unittest.TestSuite()
         suite.addTest(TestDataPreprocessing("test_normalize_data"))
         suite.addTest(TestDataPreprocessing("test_compute_indicators"))
         return suite
-
 
 # If you want to run ONLY this file’s tests directly:
 # if __name__ == "__main__":
