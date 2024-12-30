@@ -46,6 +46,7 @@ scikit-learn
 torch
 transformers
 langchain
+langchain-community
 faiss-cpu
 requests
 beautifulsoup4
@@ -70,6 +71,8 @@ or for single class you can use:
 ```
 python -m unittest tests.test_data_fetch
 python -m unittest tests.test_data_preprocessing
+python -m unittest tests.test_sentiment_analysis.py
+python -m unittest tests.test_vector_storage.py
 ```
 
 ### Run:

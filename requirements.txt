@@ -4,6 +4,7 @@ scikit-learn
 torch
 transformers
 langchain
+langchain-community
 faiss-cpu
 requests
 beautifulsoup4
