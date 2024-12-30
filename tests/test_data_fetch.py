@@ -55,12 +55,12 @@ class TestDataFetcher(unittest.TestCase):
     #TODO @unittest.skipIf(CONDITION, "Sandbox not guaranteed to have data.")
     def test_fetch_realtime_data(self):
         """
-        Tests fetching real-time data for a product (e.g., BTC-USD).
+        Tests fetching real-time data for a product (e.g., XLM-EUR).
         Verifies the returned DataFrame structure.
         NOTE: The sandbox might have limited data, so if this test fails due 
               to empty results, you may need to skip or handle it.
         """
-        product_id = "BTC-USD"
+        product_id = "XLM-EUR"
         df = self.data_fetcher.fetch_realtime_data(product_id)
 
         self.assertIsInstance(df, pd.DataFrame, "Should return a Pandas DataFrame")
@@ -79,7 +79,7 @@ class TestDataFetcher(unittest.TestCase):
         Verifies the returned DataFrame structure and ordering.
         NOTE: The sandbox might have limited or no historical data.
         """
-        product_id = "BTC-USD"
+        product_id = "XLM-EUR"
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(hours=1)
         granularity = 60  # 1 minute

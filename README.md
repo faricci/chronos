@@ -69,6 +69,7 @@ python -m unittest discover -s tests
 or for single class you can use:
 ```
 python -m unittest tests.test_data_fetch
+python -m unittest tests.test_data_preprocessing
 ```
 
 ### Run:
