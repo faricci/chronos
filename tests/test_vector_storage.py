@@ -73,22 +73,19 @@ class TestFaissVectorStore(unittest.TestCase):
 
         # Save
         store.save_index()
-        self.assertTrue(os.path.exists(self.test_index_path), 
-                        "Index file should be created after save_index().")
+        self.assertTrue(os.path.exists(self.test_index_path))
 
         # Create new store => should load existing index
         store2 = FaissVectorStore(index_path=self.test_index_path, embedding_dim=2)
-        self.assertEqual(len(store2.vectors), 0, 
-                         "New store won't have vectors in memory but the index is loaded.")
-        # Test a search to confirm the loaded index works
+        
+        # Confirm we can do a similarity search
         query = np.array([1.0, 2.0])
         results = store2.similarity_search(query, k=1)
         self.assertEqual(len(results), 1)
         dist, m = results[0]
-        # Should be near zero distance to the first vector
-        self.assertAlmostEqual(dist, 0.0, places=5, 
-                               msg="Distance to identical vector should be near 0 after loading index.")
-        self.assertEqual(m["info"], "vec1", "Metadata should match the first vector's info.")
+        self.assertAlmostEqual(dist, 0.0, places=5)
+        self.assertEqual(m["info"], "vec1")
+
 
 # If you want to run ONLY this file’s tests directly:
 # if __name__ == "__main__":

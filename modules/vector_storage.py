@@ -1,5 +1,4 @@
 # modules/vector_storage.py
-
 import faiss
 import numpy as np
 import os
@@ -29,30 +28,32 @@ class FaissVectorStore:
         self.index_path = index_path
         self.embedding_dim = embedding_dim
 
+        self.vectors = []
+        self.metadata = []
+
         if os.path.exists(index_path):
-            # Load existing index
             with open(index_path, "rb") as f:
-                loaded_index = pickle.load(f)
+                data = pickle.load(f)
+            # 'data' is a dict with keys: 'faiss_index', 'vectors', 'metadata'
+            loaded_index = data["faiss_index"]
+            loaded_vectors = data["vectors"]
+            loaded_metadata = data["metadata"]
+
             # Optional dimension check
             if loaded_index.d == embedding_dim:
                 self.index = loaded_index
+                self.vectors = loaded_vectors
+                self.metadata = loaded_metadata
             else:
-                # Dimension mismatch: handle gracefully or raise an error
-                print(f"WARNING: Loaded index dimension ({loaded_index.d}) does not match {embedding_dim}. "
-                      f"Creating a new index.")
+                print(f"WARNING: Loaded index dimension ({loaded_index.d}) != {embedding_dim}. Creating new index.")
                 self.index = faiss.IndexFlatL2(embedding_dim)
         else:
-            # Create new
             self.index = faiss.IndexFlatL2(embedding_dim)
-
-        # Keep track of stored vectors
-        self.vectors = []
-        self.metadata = []
 
     def add_vectors(self, vectors, metadata):
         """
         vectors: list of np.array, shape = (N, embedding_dim)
-        metadata: list of dict or any identifier
+        metadata: list of dict (or any identifier) corresponding to each vector
         """
         if not vectors:
             return
@@ -66,9 +67,10 @@ class FaissVectorStore:
         query_vector: np.array (embedding_dim,)
         returns: list of (distance, metadata) pairs
         """
-        if query_vector is None or query_vector.shape[0] != self.embedding_dim:
+        if query_vector is None or len(query_vector) != self.embedding_dim:
             raise ValueError(f"Query vector must be of shape ({self.embedding_dim},).")
         query_vector = query_vector.astype(np.float32).reshape(1, -1)
+
         distances, indices = self.index.search(query_vector, k)
         results = []
         for dist, idx in zip(distances[0], indices[0]):
@@ -78,7 +80,12 @@ class FaissVectorStore:
 
     def save_index(self):
         """
-        Serialize the FAISS index to self.index_path.
+        Serialize the FAISS index + associated metadata to self.index_path.
         """
+        data = {
+            "faiss_index": self.index,
+            "vectors": self.vectors,
+            "metadata": self.metadata
+        }
         with open(self.index_path, "wb") as f:
-            pickle.dump(self.index, f)
+            pickle.dump(data, f)
