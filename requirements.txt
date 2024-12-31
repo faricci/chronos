@@ -4,9 +4,11 @@ scikit-learn
 torch
 transformers
 langchain
+langchain-community
 faiss-cpu
 requests
 beautifulsoup4
 schedule
 pyyaml
 coinbase-advanced-py
+sentence-transformers
