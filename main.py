@@ -18,7 +18,7 @@ def main():
     config = load_config()
     
     # Initialize data fetcher
-    fetcher = DataFetcher(config)
+    fetcher = DataFetcher(config)    
 
     # Initialize FAISS store
     faiss_store = FaissVectorStore(
@@ -37,6 +37,10 @@ def main():
     # Initialize coinbase client for OrderExecutor
     coinbase_client = fetcher.client
     executor = OrderExecutor(config, coinbase_client)
+
+    # Backfill older data once on startup
+    for product in config['trading']['products']:
+        fetcher.get_historical_data_past_dates(product_id=product)
 
     # Task 1: Real-Time Trading (runs every minute)
     def trading_task():
@@ -113,8 +117,14 @@ def main():
     # Schedule tasks
     schedule.every(config['schedule']['real_time_interval_minutes']).minutes.do(trading_task)
     schedule.every(config['schedule']['sentiment_interval_hours']).hours.do(sentiment_task)
-    schedule.every(config['schedule']['historical_interval_hours']).hours.do(historical_task)
-    schedule.every().day.at("23:59").do(performance_task)
+    #FIXME obsolete
+    #schedule.every(config['schedule']['sentiment_interval_hours']).hours.do(historical_task)
+    #to schedule get historical data every 8 hours
+    #schedule.every(config['schedule']['historical_interval_hours']).hours.do(
+    #    lambda: [fetcher.get_historical_data_past_dates(p) for p in config['trading']['products']]
+    #)
+
+    schedule.every().day.at("23:59").do(performance_task)    
 
     # Main loop
     while True:

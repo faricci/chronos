@@ -2,27 +2,13 @@ import os
 import pandas as pd
 from coinbase.rest import RESTClient
 from modules.utils import get_logger
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 logger = get_logger(__name__)
 
-"""
-DataFetcher is used to fetch data from data sources.
-
-Attributes:
-    config (dict): Configuration dictionary containing API keys and other settings.
-    client (RESTClient): Initialized Coinbase REST client for API interactions.
-
-Methods:
-    fetch_realtime_data(product_id):
-        Fetches current price and volume for the given product_id. 
-        Appends results to data/realtime_<product_id>.csv
-
-    fetch_historical_data(product_id, start, end, granularity=3600):
-        Fetches historical candle data for the given product_id within the specified time range
-        and granularity in seconds (default=3600=1 hour).
-        Appends results to data/historical_<product_id>.csv
-"""
+MINIMUM_DATE = datetime(2024, 12, 1, tzinfo=timezone.utc)  # Stop before 2020
+DEFAULT_INTERVAL_HOURS = 8  # if not in config, use 8
+DEFAULT_GRANULARITY_SECONDS = 60  # 1 minute
 
 def convert_granularity_to_coinbase_str(granularity_seconds: int) -> str:
     """
@@ -94,36 +80,29 @@ class DataFetcher:
         Also appends/creates a CSV file at data/realtime_<product_id>.csv
         """
         try:
-            #FIXME add pagination
             response = self.client.get_best_bid_ask(product_id)
 
             logger.debug(f"BID/ASK response for {product_id}: {response}")
 
-            # Now with the new structure:
             pricebooks = response['pricebooks']
             if not pricebooks:
                 logger.error("No pricebooks in best_bid_ask response")
-                return pd.DataFrame()  # or raise an exception
+                return pd.DataFrame()
 
             first_pb = pricebooks[0]
             bid = first_pb["bids"][0]
             ask = first_pb["asks"][0]
 
-            # We define "price" as the midpoint (your choice)
             mid_price = (float(bid["price"]) + float(ask["price"])) / 2.0
-
-            # Example "volume" as sum of top bid/ask sizes:
             volume = float(bid["size"]) + float(ask["size"])
 
-            # Or parse time from first_pb["time"] if you prefer that
             data = {
-                "time": datetime.utcnow(),  
+                "time": datetime.utcnow(),
                 "price": mid_price,
                 "volume": volume
             }
             df = pd.DataFrame([data])
             
-            # Append to local CSV
             file_path = f"data/realtime_{product_id}.csv"
             self._append_data_to_file(df, file_path=file_path, time_col="time")
 
@@ -144,7 +123,7 @@ class DataFetcher:
         Fetch historical candle data for the given product_id within [start, end].
         
         - start, end: Python datetime objects (UTC recommended).
-        - granularity: in seconds (defaults to 3600 = 1 hour). Mapped to a Coinbase string.
+        - granularity: in seconds (defaults = 3600 = 1 hour). Mapped to a Coinbase string.
 
         Returns: DataFrame with columns [time, open, high, low, close, volume]
                  sorted by time ascending.
@@ -159,7 +138,10 @@ class DataFetcher:
             logger.info(f"Fetching historical data for {product_id} from {start} to {end}, "
                         f"granularity={granularity} ({gran_str})")
 
-            #FIXME add pagination
+            # Pagination might be needed if the endpoint limits the # of results
+            # For Coinbase Advanced Trade, you can chunk the range into smaller slices or
+            # rely on a built-in pagination if available. This is a placeholder.
+            
             candles = self.client.get_candles(
                 product_id=product_id,
                 start=str(start_ts),
@@ -169,11 +151,9 @@ class DataFetcher:
 
             logger.debug(f"Candles response for {product_id}: {candles}")
 
-            logger.debug(f"[DEBUG] Checking candles validity: {candles}")
             if (not candles) or (not candles['candles']):
-                print("[DEBUG] Condition triggered => raising ValueError")
-                raise ValueError("Error evaluating candles")
-            logger.debug("PASSED the condition check!")
+                logger.debug("No candles returned, returning empty DataFrame.")
+                return pd.DataFrame()
 
             rows = []
             for c in candles['candles']:
@@ -191,13 +171,90 @@ class DataFetcher:
 
             logger.info(f"Fetched {len(df)} candle records for {product_id}.")            
 
-            # Append to local CSV
             file_path = f"data/historical_{product_id}.csv"
             self._append_data_to_file(df, file_path=file_path, time_col="time")
 
             return df
 
         except Exception as e:
-            print("Exception details:", e)
-            logger.exception("Error fetching historical data", exc_info=True)
+            logger.exception(f"Error fetching historical data for {product_id}", exc_info=True)
             return pd.DataFrame()
+
+    # -------------------------------------------------------------------------
+    # NEW METHOD: get_historical_data_past_dates
+    # -------------------------------------------------------------------------
+    def get_historical_data_past_dates(self, product_id: str):
+        """
+        Incrementally fetch older historical data (in 8-hour chunks, 1-minute granularity)
+        until reaching or crossing the date boundary or no more data is found.
+
+        Flow:
+          1) Determine the earliest 'time' we already have in data/historical_<product_id>.csv
+             If file doesn't exist or is empty, assume 'now' as earliest.
+          2) Start a loop that fetches data from (earliest - 8 hours) to earliest,
+             with 1-minute granularity.
+          3) Append results to the CSV, update 'earliest' to the new start,
+             keep going until we cross boundary or an empty response is returned.
+
+        The interval is read from config['historical']['past_interval_hours'] if present,
+        otherwise defaults to 8 hours.
+
+        In a real scenario, you might schedule this once at startup, or as needed
+        to backfill older data.
+        """
+        file_path = f"data/historical_{product_id}.csv"
+        interval_hours = self.config.get('historical', {}).get('past_interval_hours', DEFAULT_INTERVAL_HOURS)
+
+        # 1) Determine earliest time in CSV or use now
+        if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+            try:
+                existing_df = pd.read_csv(file_path, parse_dates=['time'])
+                if existing_df.empty:
+                    # If CSV has headers but no rows
+                    earliest_time = datetime.utcnow().replace(tzinfo=timezone.utc)
+                else:
+                    # earliest_time is the earliest row in ascending order
+                    earliest_time = existing_df['time'].min()
+            except Exception as e:
+                logger.error(f"Could not read {file_path}: {e}, defaulting to now.")
+                earliest_time = datetime.utcnow().replace(tzinfo=timezone.utc)
+        else:
+            earliest_time = datetime.utcnow().replace(tzinfo=timezone.utc)
+
+        # 2) Start loop going backwards in time
+        granularity_seconds = DEFAULT_GRANULARITY_SECONDS  # 1 min
+        while True:
+            if earliest_time <= MINIMUM_DATE:
+                logger.info(f"Earliest time {earliest_time} <= {MINIMUM_DATE}. Stopping backfill.")
+                break
+
+            # compute next time window [next_start, earliest_time]
+            next_start = earliest_time - timedelta(hours=interval_hours)
+            if next_start < MINIMUM_DATE:
+                # clamp to boundary
+                next_start = MINIMUM_DATE
+
+            logger.info(f"Backfilling older data for {product_id}: {next_start} -> {earliest_time} "
+                        f"(granularity=ONE_MINUTE)")
+
+            df = self.fetch_historical_data(
+                product_id=product_id,
+                start=next_start,
+                end=earliest_time,
+                granularity=granularity_seconds
+            )
+
+            # If no new data, break out
+            if df.empty:
+                logger.info("No (or empty) candle data returned. Stopping backfill.")
+                break
+
+            # Update earliest_time
+            earliest_time = next_start
+
+            # If we've reached or crossed 2020, break
+            if earliest_time <= MINIMUM_DATE:
+                logger.info(f"Reached the boundary ({MINIMUM_DATE}). Stopping.")
+                break
+
+        logger.info("Backfill of past dates completed.")
