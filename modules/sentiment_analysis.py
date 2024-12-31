@@ -2,8 +2,7 @@
 
 import requests
 from bs4 import BeautifulSoup
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.docstore.document import Document
+from langchain_community.embeddings import HuggingFaceEmbeddings
 import pandas as pd
 import numpy as np
 
@@ -12,16 +11,20 @@ SentimentAnalysis performs sentiment analysis on text data.
 
 Methods:
     scrape_news(config):
-        Scrapes example news data and returns a list of text snippets.
+        Scrapes a news site or forum specified in config['sentiment']['base_url']
+        and returns the entire page text as a single string.
 
     get_text_embeddings(texts, model_name="sentence-transformers/all-MiniLM-L6-v2"):
-        Converts a list of text snippets into their corresponding embeddings.
+        Converts a list of text snippets into their embeddings.
 
     analyze_sentiment(embeddings):
-        Analyzes sentiment based on the provided embeddings.
+        Simple placeholder: returns norm-based 'sentiment score'.
 
     get_sentiment_data(config):
-        Retrieves sentiment data by scraping news, generating embeddings, and analyzing sentiment.
+        1) scrape_news -> single string of page text
+        2) convert to one-element list for embeddings
+        3) generate embeddings, analyze sentiment
+        4) build a DataFrame
 """
 
 class SentimentAnalysis:
@@ -29,55 +32,49 @@ class SentimentAnalysis:
     @staticmethod
     def scrape_news(config):
         """
-        Placeholder function that simulates scraping a news site or forum
-        and returns a list of text snippets.
-        """
-        # Example for a more 'real' scenario (commented out):
-        try:
-            response = requests.get(config['sentiment'].get('base_url', 'https://www.coindesk.com'))
-            soup = BeautifulSoup(response.text, "html.parser")
-            #articles = soup.find_all("div", class_="article-content")
-            #texts = [article.get_text(strip=True) for article in articles]
+        Attempts to scrape the webpage specified by config['sentiment']['base_url'].
+        Returns the entire page text as a single string.
 
-            # Extract all text from the page, excluding script and style tags
+        If any error occurs, returns an empty string.
+        """
+        try:
+            url = config['sentiment'].get('base_url', 'https://www.coindesk.com')
+            response = requests.get(url)
+            soup = BeautifulSoup(response.text, "html.parser")
+
+            # Remove script/style tags
             for script in soup(["script", "style"]):
-                script.extract()    # rip it out
+                script.extract()
 
             text = soup.get_text()
-            # Remove extra whitespace and newlines
+            # Clean whitespace
             lines = (line.strip() for line in text.splitlines())
             chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
             text = '\n'.join(chunk for chunk in chunks if chunk)
-
             return text
+
         except Exception as e:
             print("Error scraping site:", e)
-            return []
+            return ""
 
     @staticmethod
     def get_text_embeddings(texts, model_name="sentence-transformers/all-MiniLM-L6-v2"):
         """
-        Converts a list of text snippets into their embeddings using LangChain's HuggingFaceEmbeddings.
+        Converts a list of text strings into embeddings using HuggingFaceEmbeddings.
+        (No longer passing Document objects.)
         """
         if not texts:
             return []
         embedder = HuggingFaceEmbeddings(model_name=model_name)
-        docs = [Document(page_content=txt) for txt in texts]
-        embeddings = embedder.embed_documents(docs)
+        # Directly pass a list of strings:
+        embeddings = embedder.embed_documents(texts)
         return embeddings
 
     @staticmethod
     def analyze_sentiment(embeddings):
         """
-        Simple placeholder: average embedding magnitude as a 'sentiment score'
-        (A real scenario could use a classification or regression model.)
-
-        # Example approach for a real scenario (commented):
-        # Suppose we had a logistic regression that outputs a sentiment label (pos/neg) based on embeddings.
-        # clf = joblib.load("sentiment_model.pkl")
-        # predictions = clf.predict(embeddings)
-        # return predictions
-
+        Placeholder sentiment analysis:
+        calculates the L2 norm of each embedding as a 'score'.
         """
         if not embeddings:
             return []
@@ -87,15 +84,22 @@ class SentimentAnalysis:
     @staticmethod
     def get_sentiment_data(config):
         """
-        Retrieves sentiment data by:
-          1) Scraping text snippets (scrape_news).
-          2) Generating embeddings (get_text_embeddings).
-          3) Calculating a basic sentiment score (analyze_sentiment).
-          4) Returning a DataFrame with columns ['text', 'embedding', 'score'].
+        Full pipeline:
+          1) Scrape webpage text (scrape_news) -> single string
+          2) Convert to a one-element list for embedding
+          3) Generate embeddings and sentiment scores
+          4) Return a DataFrame with ['text', 'embedding', 'score']
         """
-        texts = SentimentAnalysis.scrape_news(config)
+        page_text = SentimentAnalysis.scrape_news(config)  # single string
+        if not page_text:
+            # If scraping failed or returned nothing, return an empty DataFrame
+            return pd.DataFrame(columns=['text', 'embedding', 'score'])
+
+        # We'll treat the entire page as ONE "document"
+        texts = [page_text]  # single-element list
         embeddings = SentimentAnalysis.get_text_embeddings(texts)
         scores = SentimentAnalysis.analyze_sentiment(embeddings)
+
         sentiment_df = pd.DataFrame({
             'text': texts,
             'embedding': embeddings,

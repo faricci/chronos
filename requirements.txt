@@ -11,3 +11,4 @@ beautifulsoup4
 schedule
 pyyaml
 coinbase-advanced-py
+sentence-transformers

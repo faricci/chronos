@@ -53,6 +53,7 @@ beautifulsoup4
 schedule
 pyyaml
 coinbase-advanced-trade
+sentence-transformers
 ```
 Then run:
 ```
