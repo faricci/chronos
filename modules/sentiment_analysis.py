@@ -11,7 +11,7 @@ import numpy as np
 SentimentAnalysis performs sentiment analysis on text data.
 
 Methods:
-    scrape_example_news():
+    scrape_news(config):
         Scrapes example news data and returns a list of text snippets.
 
     get_text_embeddings(texts, model_name="sentence-transformers/all-MiniLM-L6-v2"):
@@ -20,34 +20,39 @@ Methods:
     analyze_sentiment(embeddings):
         Analyzes sentiment based on the provided embeddings.
 
-    get_sentiment_data():
+    get_sentiment_data(config):
         Retrieves sentiment data by scraping news, generating embeddings, and analyzing sentiment.
 """
 
 class SentimentAnalysis:
     
     @staticmethod
-    def scrape_example_news():
+    def scrape_news(config):
         """
         Placeholder function that simulates scraping a news site or forum
         and returns a list of text snippets.
-
-        # Example for a more 'real' scenario (commented out):
-        # try:
-        #     response = requests.get("https://cryptonews.example.com")
-        #     soup = BeautifulSoup(response.text, "html.parser")
-        #     articles = soup.find_all("div", class_="article-content")
-        #     texts = [article.get_text(strip=True) for article in articles]
-        #     return texts
-        # except Exception as e:
-        #     print("Error scraping site:", e)
-        #     return []
         """
-        texts = [
-            "Bitcoin price is rising, bullish momentum expected.",
-            "ETH developers share major update."
-        ]
-        return texts
+        # Example for a more 'real' scenario (commented out):
+        try:
+            response = requests.get(config['sentiment'].get('base_url', 'https://www.coindesk.com'))
+            soup = BeautifulSoup(response.text, "html.parser")
+            #articles = soup.find_all("div", class_="article-content")
+            #texts = [article.get_text(strip=True) for article in articles]
+
+            # Extract all text from the page, excluding script and style tags
+            for script in soup(["script", "style"]):
+                script.extract()    # rip it out
+
+            text = soup.get_text()
+            # Remove extra whitespace and newlines
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = '\n'.join(chunk for chunk in chunks if chunk)
+
+            return text
+        except Exception as e:
+            print("Error scraping site:", e)
+            return []
 
     @staticmethod
     def get_text_embeddings(texts, model_name="sentence-transformers/all-MiniLM-L6-v2"):
@@ -80,15 +85,15 @@ class SentimentAnalysis:
         return scores
 
     @staticmethod
-    def get_sentiment_data():
+    def get_sentiment_data(config):
         """
         Retrieves sentiment data by:
-          1) Scraping text snippets (scrape_example_news).
+          1) Scraping text snippets (scrape_news).
           2) Generating embeddings (get_text_embeddings).
           3) Calculating a basic sentiment score (analyze_sentiment).
           4) Returning a DataFrame with columns ['text', 'embedding', 'score'].
         """
-        texts = SentimentAnalysis.scrape_example_news()
+        texts = SentimentAnalysis.scrape_news(config)
         embeddings = SentimentAnalysis.get_text_embeddings(texts)
         scores = SentimentAnalysis.analyze_sentiment(embeddings)
         sentiment_df = pd.DataFrame({

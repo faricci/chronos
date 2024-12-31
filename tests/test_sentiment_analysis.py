@@ -2,14 +2,32 @@
 
 import unittest
 import pandas as pd
+import logging
+
 from modules.sentiment_analysis import SentimentAnalysis
+from modules.utils import load_config  # or wherever your load_config function is defined
 
 class TestSentimentAnalysis(unittest.TestCase):
 
-    def test_scrape_example_news(self):
-        texts = SentimentAnalysis.scrape_example_news()
-        self.assertIsInstance(texts, list, "scrape_example_news should return a list.")
-        self.assertTrue(len(texts) > 0, "scrape_example_news returned empty list unexpectedly.")
+    @classmethod
+    def setUpClass(cls):
+        """
+        setUpClass is called once before running any tests in this class.
+        Typically used to initialize shared resources, such as the DataFetcher.
+        Here, we specifically override the 'coinbase' config with 'coinbase_sandbox' settings.
+        """
+
+        logging.basicConfig(level=logging.DEBUG)
+
+        # Load your entire config from the YAML file
+        config = load_config()
+
+        cls.config = config
+
+    def test_scrape_news(self):
+        texts = SentimentAnalysis.scrape_news(self.config)
+        self.assertIsInstance(texts, list, "scrape_news should return a list.")
+        self.assertTrue(len(texts) > 0, "scrape_news returned empty list unexpectedly.")
 
     def test_get_text_embeddings(self):
         # Test normal input
@@ -52,6 +70,18 @@ class TestSentimentAnalysis(unittest.TestCase):
         for sc in df['score']:
             self.assertIsInstance(sc, float, "Sentiment score should be a float.")
 
+    @staticmethod
+    def suite():
+        """
+        Optional static method to create a test suite for this class alone.
+        You can call this if you want to run only these tests in isolation.
+        """
+        suite = unittest.TestSuite()
+        suite.addTest(TestSentimentAnalysis("test_scrape_news"))
+        suite.addTest(TestSentimentAnalysis("test_get_text_embeddings"))
+        suite.addTest(TestSentimentAnalysis("test_analyze_sentiment"))
+        suite.addTest(TestSentimentAnalysis("test_get_sentiment_data"))
+        return suite
 # If you want to run ONLY this file’s tests directly:
 # if __name__ == "__main__":
 #     runner = unittest.TextTestRunner(verbosity=2)
