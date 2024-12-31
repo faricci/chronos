@@ -55,38 +55,29 @@ def main():
             # 3) Check current market price
             current_price = df['price'].iloc[-1]
 
-            if signal == "BUY":                
-                size = 5  # e.g., 0.001 BTC
+            if signal == "BUY":
+                size = 5
                 order_id = executor.execute_order_with_risk_management(
                     product_id=product,
                     side="BUY",
                     current_price=current_price,
                     size=size
                 )
-
                 log_trade("BUY with bracket", product, current_price, size)
 
             elif signal == "SELL":
-                # Similarly place a bracket that triggers on the upside or further downside
-                # (Though for a short, your bracket logic might differ. 
-                #  Or you might bracket an existing long to close it.)
-                pass
+                # NEW SELL LOGIC
+                size = 5
+                order_id = executor.execute_order_with_risk_management(
+                    product_id=product,
+                    side="SELL",
+                    current_price=current_price,
+                    size=size
+                )
+                log_trade("SELL with bracket", product, current_price, size)
 
             # else: HOLD => do nothing
 
-    #def trading_task():
-    #    for product in config['trading']['products']:
-    #        # 1) Fetch real-time data
-    #        df = fetcher.fetch_realtime_data(product)
-    #        # 2) Generate signal
-    #        signal = trading_logic.generate_signal(df)
-    #        logger.info(f"Signal for {product}: {signal}")
-    #        # 3) Execute order if signal is buy or sell
-    #        if signal in ["BUY", "SELL"]:
-    #            current_price = df['price'].iloc[-1]
-    #            order_id = executor.execute_order(product, side=signal, price=current_price, size=0.001)
-    #            # 4) Log trade
-    #            log_trade(signal, product, current_price, 0.001)
 
     # Task 2: Fetch Sentiment Data and Store in FAISS (runs every 8 hours)
     def sentiment_task():

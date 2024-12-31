@@ -74,6 +74,7 @@ python -m unittest tests.test_data_fetch
 python -m unittest tests.test_data_preprocessing
 python -m unittest tests.test_sentiment_analysis.py
 python -m unittest tests.test_vector_storage.py
+python -m unittest tests.test_order_execution.py
 ```
 
 ### Run:
