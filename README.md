@@ -54,6 +54,9 @@ schedule
 pyyaml
 coinbase-advanced-trade
 sentence-transformers
+transformers
+accelerate 
+datasets
 ```
 Then run:
 ```
@@ -86,3 +89,61 @@ The script will:
 - **Every minute**: Fetch real-time data, generate trading signals, possibly place orders.
 - **Every 8 hours**: Scrape sentiment, store embeddings in FAISS, fetch historical data.
 - **Every day at 23:59**: Evaluate performance.
+
+
+# Workflow
+
+Below is a **high-level** overview of how your updated AI trading agent works, from **data collection** through to **trade execution** and **continuous improvement**. This summary is intended to be **clear and straightforward**, avoiding deep technical jargon.
+
+---
+
+## 1. Data Collection and Storage
+- **Real-Time Data**: The agent pulls up-to-the-minute prices and volumes (e.g., from Coinbase).  
+- **Historical Data**: The agent fetches past market data at regular intervals and appends it to local files (CSV). It also “backfills” older data so you have a continuous record from past to present.
+
+## 2. Sentiment Analysis (Optional Enhancement)
+- Periodically, the agent scrapes news and social media (or any relevant text sources).  
+- It converts this text into numerical “embeddings” (think of them as “topics in numbers”) and optionally stores them for quick retrieval in a **Vector Database**.  
+- Sentiment scores can also be included as an extra factor in the trading decision.
+
+## 3. Time-Series Forecasting (Hugging Face Transformer)
+- The agent uses a **Transformer** model (e.g., “Informer” or “Autoformer”) from Hugging Face, which is specifically designed for time-series forecasting.  
+- This model looks at a “window” of the most recent historical data (e.g., last 64 timesteps) and predicts the next few values.  
+- The model is **fine-tuned periodically** with new data to keep it accurate, saving these updates locally or to a Hugging Face model repository.
+
+## 4. Trading Logic (Generate BUY/SELL Signals)
+- **Sliding Window**: The latest chunk of historical + real-time data (e.g., last 64 data points) is fed into the time-series model.  
+- **Forecast Output**: The model predicts the next 1 or more future steps.  
+- **Signal Decision**: If the predicted future price is sufficiently **above** a threshold, the agent signals **BUY**; if it’s sufficiently **below** a threshold, it signals **SELL**; otherwise, it signals **HOLD**.
+
+## 5. Order Execution with Risk Management
+- When a BUY or SELL signal is triggered, the agent creates **bracket orders**:  
+  1. **Stop-Loss** to limit losses if the price drops.  
+  2. **Take-Profit** to automatically close a trade once it hits a target profit.  
+- These orders are placed through the trading platform API (Coinbase, etc.) using an **OrderExecutor** class.
+
+## 6. Scheduling & Automation
+- A simple scheduler (e.g., `schedule` or cron) runs tasks at set intervals:  
+  - **Real-Time Trading**: Every minute, fetch data, get a forecast, place trades if needed.  
+  - **Historical Updates**: Every 8 hours, backfill older data so the agent has a complete price history.  
+  - **Sentiment Data Updates**: Every 8 hours, gather new text data for embeddings (optional).  
+  - **Performance Evaluation**: Daily or weekly, check profit/loss, logs, and metrics like ROI or drawdown.
+
+## 7. Performance Tracking and Continuous Improvement
+- Each trade is logged, including price, size, profit/loss.  
+- Periodically, the agent:
+  1. Evaluates overall performance metrics (win/loss, total profit, etc.).  
+  2. **Retrains** the Transformer model with the newest market data if performance declines or enough new data arrives.  
+  3. Resaves the updated model so the next real-time forecast uses the latest knowledge.
+
+---
+
+### In Short
+1. **Collect** data (real-time + historical).  
+2. **Preprocess** (optionally add sentiment).  
+3. **Forecast** future prices with a **Transformer** model (updated regularly).  
+4. **Decide** on trades (BUY/SELL/HOLD).  
+5. **Execute** orders with built-in risk management.  
+6. **Monitor & Retrain** to keep the model aligned with market changes.
+
+The key idea: **Use the most recent data to forecast short-term price moves, then automatically place trades (with risk controls) based on those forecasts.** This workflow runs automatically, logs performance, and periodically improves the model to adapt to changing market conditions.

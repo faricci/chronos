@@ -12,3 +12,6 @@ schedule
 pyyaml
 coinbase-advanced-py
 sentence-transformers
+transformers
+accelerate 
+datasets
