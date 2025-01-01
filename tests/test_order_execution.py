@@ -32,6 +32,19 @@ class TestOrderExecutor(unittest.TestCase):
         # Just reset the mock in setUp, so each test sees a fresh call count
         self.mock_client.reset_mock()
 
+    def test_get_fills_for_order(self):
+        order_id = "mock_order_id"
+        expected_fills = [
+            {"trade_id": "1", "product_id": "DOGE-EUR", "price": "0.10", "size": "5"},
+            {"trade_id": "2", "product_id": "DOGE-EUR", "price": "0.11", "size": "5"}
+        ]
+
+        self.mock_client.get_fills.return_value = expected_fills
+
+        fills = self.mock_client.get_fills(order_id=order_id)
+        self.assertEqual(fills, expected_fills)
+
+        self.mock_client.get_fills.assert_called_once_with(order_id=order_id)
 
     def test_execute_market_order(self):
         # Simulate placing a market order
@@ -157,6 +170,7 @@ class TestOrderExecutor(unittest.TestCase):
         You can call this if you want to run only these tests in isolation.
         """
         suite = unittest.TestSuite()
+        suite.addTest(TestOrderExecutor("test_get_fills_for_order"))
         suite.addTest(TestOrderExecutor("test_execute_market_order"))
         suite.addTest(TestOrderExecutor("test_execute_limit_order"))
         suite.addTest(TestOrderExecutor("test_execute_stop_limit_order"))

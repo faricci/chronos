@@ -23,6 +23,33 @@ class OrderExecutor:
         self.config = config
         self.client = coinbase_client
 
+    def get_fills_for_order(self, order_id):
+        """
+        Retrieves fill details from Coinbase Advanced Trade for a specific order_id.
+        This might require filtering through all fills or using an endpoint that
+        directly references the order.
+
+        Return: A list of fill objects with fields like:
+          [
+            {
+              "trade_id": "...",
+              "product_id": "DOGE-EUR",
+              "price": "0.15",
+              "size": "50.0",
+              "fee": "0.1",
+              "side": "SELL",
+              "created_at": "...",
+              ...
+            },
+            ...
+          ]
+        """
+        logger.info(f"Fetching fills for order_id={order_id}")
+        # Hypothetical call (the exact coinbase-advanced-trade SDK usage might differ):
+        fills = self.client.get_fills(order_id=order_id)
+        # e.g. returns a dict or list
+        return fills.get("fills", [])
+
     def execute_market_order(self, product_id, side, size):
         """
         Places a simple MARKET order (immediate or cancel).

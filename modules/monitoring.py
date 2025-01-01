@@ -2,49 +2,89 @@ import os
 import logging
 import pandas as pd
 import numpy as np
-from datetime import datetime
+from datetime import datetime, timedelta
 from modules.utils import get_logger
 
 logger = get_logger(__name__)
 
 """
-Monitoring & Retraining Module
+Enhanced Monitoring & Retraining Module
 
-Logs trades to CSV, calculates performance metrics (PnL, ROI, drawdown),
-and optionally triggers model retraining if performance deteriorates.
+- Logs trades to CSV (rotates logs if needed).
+- Tracks open positions for unrealized PnL.
+- Calculates realized PnL, ROI, drawdown, etc.
+- Optionally triggers model retraining if performance is poor.
 """
 
-# FIXME add to config
-# Path to the trade log CSV
-TRADE_LOG_PATH = "data/trade_log.csv"
+# Paths (could move to config)
+TRADE_LOG_DIR = "data/trade_logs"  # We'll store multiple log files if rotating
+PERFORMANCE_LOG_PATH = "data/performance_log.csv"
 
-# Path to store performance metrics
-PERF_LOG_PATH = "data/performance_log.csv"
+# Thresholds for triggering retrain
+LOSS_THRESHOLD = -0.1
+DRAW_THRESHOLD = -0.2
 
-# Example thresholds for deciding to retrain or alert
-LOSS_THRESHOLD = -0.1    # e.g. -10% cumulative ROI
-DRAW_THRESHOLD = -0.2    # e.g. -20% maximum drawdown
+# Example: If logs exceed this many trades in a file, we rotate.
+MAX_TRADES_PER_FILE = 1000
 
-# A placeholder function you might implement to retrain the model
-# or call a separate script (train_timeseries_model.py).
+#####################
+# Rotating CSV Logic
+#####################
+def _get_current_trade_log_path():
+    """
+    Returns a log file path based on date or size-based rotation.
+    We'll do date-based: trade_log_YYYY-MM-DD.csv
+    """
+    today_str = datetime.utcnow().strftime("%Y-%m-%d")
+    filename = f"trade_log_{today_str}.csv"
+    if not os.path.exists(TRADE_LOG_DIR):
+        os.makedirs(TRADE_LOG_DIR, exist_ok=True)
+    return os.path.join(TRADE_LOG_DIR, filename)
+
+def _rotate_if_needed(current_path):
+    """
+    If the current file exceeds MAX_TRADES_PER_FILE, 
+    we rename it with a suffix and start a new file.
+    """
+    if not os.path.exists(current_path):
+        return  # no file yet, no rotation
+
+    df = pd.read_csv(current_path)
+    if len(df) >= MAX_TRADES_PER_FILE:
+        suffix = datetime.utcnow().strftime("%H%M%S")
+        rotated_name = current_path.replace(".csv", f"_{suffix}.csv")
+        os.rename(current_path, rotated_name)
+        logger.info(f"Rotated log file: {current_path} => {rotated_name}")
+
+###############################
+# Model Retraining Placeholder
+###############################
 def retrain_model():
-    logger.info("Retraining the model with new data...")
+    logger.info("Retraining the model with new data (coinbase advanced trade usage).")
     os.system("python script/train_timeseries_model.py")
     # or import train_informer_model(...) from your train script
     # and call it with fresh CSV data
     pass
 
-def log_trade(signal, product_id, price, size, realized_pnl=None):
+####################################
+# Log Trades, Realized/Unrealized
+####################################
+def log_trade(
+    signal, product_id, price, size, 
+    realized_pnl=None, 
+    unrealized_pnl=None, 
+    capital_used=None
+):
     """
-    Appends a row to 'trade_log.csv' or another persistent store.
+    Log a trade to CSV with optional realized/unrealized PnL.
 
-    Parameters:
-    - signal (str): "BUY" / "SELL" / "CLOSE" / etc.
-    - product_id (str): e.g. "BTC-USD"
-    - price (float): Fill or execution price
-    - size (float): Number of units traded (e.g., 5 tokens, or 0.01 BTC)
-    - realized_pnl (float, optional): Profit/Loss realized by this trade.
-      Could be 0 if it's an opening trade, or if you compute PnL only upon closing.
+    signal: e.g. "BUY", "SELL", "CLOSE"
+    product_id: e.g. "DOGE-EUR"
+    price: float fill price
+    size: float quantity
+    realized_pnl: profit/loss if closing a position
+    unrealized_pnl: optional field to track open position gain/loss
+    capital_used: optional notional cost of this trade (for ROI calc)
     """
     row = {
         "timestamp": pd.Timestamp.now(),
@@ -52,111 +92,121 @@ def log_trade(signal, product_id, price, size, realized_pnl=None):
         "product_id": product_id,
         "price": price,
         "size": size,
-        "realized_pnl": realized_pnl if realized_pnl is not None else np.nan
+        "realized_pnl": realized_pnl if realized_pnl is not None else np.nan,
+        "unrealized_pnl": unrealized_pnl if unrealized_pnl is not None else np.nan,
+        "capital_used": capital_used if capital_used is not None else np.nan
     }
 
-    if not os.path.exists(TRADE_LOG_PATH):
-        pd.DataFrame([row]).to_csv(TRADE_LOG_PATH, index=False)
+    current_path = _get_current_trade_log_path()
+    # Possibly rotate if needed
+    _rotate_if_needed(current_path)
+
+    if not os.path.exists(current_path):
+        pd.DataFrame([row]).to_csv(current_path, index=False)
     else:
-        df = pd.read_csv(TRADE_LOG_PATH)
+        df = pd.read_csv(current_path)
         df = df.append(row, ignore_index=True)
-        df.to_csv(TRADE_LOG_PATH, index=False)
+        df.to_csv(current_path, index=False)
 
     logger.info(f"Trade logged: {row}")
 
-def _compute_basic_metrics(df):
+###############################
+# Compute Performance Metrics
+###############################
+def _compute_metrics_from_df(df):
     """
-    Compute basic performance metrics from a trade DataFrame:
-      - cumulative_pnl: sum of realized PnL
-      - roi: ratio of cumulative_pnl to total capital used (toy approach)
-      - max_drawdown: the largest peak-to-trough decline in cumulative PnL
+    Given a DF of trades (with realized_pnl, unrealized_pnl, capital_used),
+    compute cumulative PnL, ROI, drawdown, etc.
     """
-    # We assume 'realized_pnl' is only recorded when a position is closed
-    # or partial realized. If your logic logs PnL differently, adjust accordingly.
 
+    # Realized PnL (sum of all closed trade PnL)
     if "realized_pnl" not in df.columns:
-        return {}
+        df["realized_pnl"] = 0.0
 
-    # If the strategy logs realized PnL at each trade close, we can just do:
-    df["cumulative_pnl"] = df["realized_pnl"].cumsum()
+    df["cumulative_realized"] = df["realized_pnl"].cumsum()
 
-    # ROI calculation is simplistic; in reality, you’d have a known capital base
-    # or track margin usage. For demonstration, assume an initial capital of e.g. 10000
-    initial_capital = 10000.0
-    final_pnl = df["cumulative_pnl"].iloc[-1] if not df.empty else 0.0
-    roi = final_pnl / initial_capital
+    # ROI calculation:
+    #  - If you log capital_used on each trade, sum that up or use the largest open capital
+    total_capital_used = df["capital_used"].fillna(0).sum()
+    # fallback if no capital_used => assume 10k
+    if total_capital_used <= 0:
+        total_capital_used = 10000.0
+    final_realized = df["cumulative_realized"].iloc[-1]
+    roi = final_realized / total_capital_used
 
-    # Max Drawdown calculation:
-    # 1) get the running maximum of cumulative pnl
-    # 2) compute drawdown = running_max - current_pnl
-    # 3) the maximum of that difference is the max drawdown
-    running_max = df["cumulative_pnl"].cummax()
-    drawdown_series = df["cumulative_pnl"] - running_max
-    max_drawdown = drawdown_series.min()  # negative value => e.g. -200 => -$200 from the peak
+    # Max drawdown on realized PnL
+    running_max = df["cumulative_realized"].cummax()
+    drawdown = df["cumulative_realized"] - running_max
+    max_drawdown = drawdown.min()  # negative number
 
-    metrics = {
-        "final_pnl": final_pnl,
+    return {
+        "final_realized_pnl": final_realized,
         "roi": roi,
-        "max_drawdown": max_drawdown
+        "max_drawdown": max_drawdown,
+        "number_of_trades": len(df)
     }
-    return metrics
 
 def evaluate_performance(trigger_retrain=False):
     """
-    Reads the trade_log and calculates performance metrics (PnL, ROI, drawdown).
-    Optionally triggers model retraining if performance is below thresholds.
-    Logs results to 'performance_log.csv' for historical record.
-
-    Parameters:
-    - trigger_retrain (bool): if True, will call retrain_model() if thresholds are exceeded.
+    Goes through *all* trade logs in TRADE_LOG_DIR, merges them, 
+    calculates PnL, ROI, drawdown, etc.
+    Optionally triggers retraining if thresholds are exceeded.
     """
-    if not os.path.exists(TRADE_LOG_PATH):
-        logger.info("No trades to evaluate yet.")
+    if not os.path.exists(TRADE_LOG_DIR):
+        logger.info("No trade logs directory found. No trades to evaluate.")
         return
 
-    df = pd.read_csv(TRADE_LOG_PATH, parse_dates=["timestamp"])
-    if df.empty:
-        logger.info("Trade log is empty. No performance to evaluate.")
+    # Gather all CSV files
+    files = [f for f in os.listdir(TRADE_LOG_DIR) if f.endswith(".csv")]
+    if not files:
+        logger.info("No trade log files found.")
         return
 
-    metrics = _compute_basic_metrics(df)
-    if not metrics:
-        logger.info("No realized PnL column found. Performance evaluation incomplete.")
+    # Merge all logs
+    dfs = []
+    for f in files:
+        path = os.path.join(TRADE_LOG_DIR, f)
+        df_temp = pd.read_csv(path, parse_dates=["timestamp"])
+        dfs.append(df_temp)
+    all_trades_df = pd.concat(dfs, ignore_index=True)
+    all_trades_df.sort_values("timestamp", inplace=True)
+
+    if all_trades_df.empty:
+        logger.info("Trade logs are empty. No performance to evaluate.")
         return
 
-    # Summarize performance
-    final_pnl = metrics["final_pnl"]
+    metrics = _compute_metrics_from_df(all_trades_df)
+
+    final_pnl = metrics["final_realized_pnl"]
     roi = metrics["roi"]
     max_dd = metrics["max_drawdown"]
+    n_trades = metrics["number_of_trades"]
 
-    logger.info(f"--- Performance Summary ---")
-    logger.info(f"Total trades so far: {len(df)}")
-    logger.info(f"Final PnL: {final_pnl:.2f}")
-    logger.info(f"ROI (assuming 10k initial capital): {roi:.2%}")
-    logger.info(f"Max Drawdown: {max_dd:.2f}")
+    logger.info("--- Performance Summary ---")
+    logger.info(f"Total trades so far: {n_trades}")
+    logger.info(f"Final Realized PnL: {final_pnl:.2f}")
+    logger.info(f"ROI: {roi:.2%} (relative to sum of 'capital_used' or 10k fallback)")
+    logger.info(f"Max Drawdown (realized): {max_dd:.2f}")
 
-    # Log the metrics to a separate CSV
-    perf_row = {
+    # Log metrics (timestamp-based) in performance CSV
+    perf_data = {
         "timestamp": datetime.utcnow().isoformat(),
-        "num_trades": len(df),
-        "final_pnl": final_pnl,
+        "num_trades": n_trades,
+        "final_realized_pnl": final_pnl,
         "roi": roi,
         "max_drawdown": max_dd
     }
-    if not os.path.exists(PERF_LOG_PATH):
-        pd.DataFrame([perf_row]).to_csv(PERF_LOG_PATH, index=False)
+    if not os.path.exists(PERFORMANCE_LOG_PATH):
+        pd.DataFrame([perf_data]).to_csv(PERFORMANCE_LOG_PATH, index=False)
     else:
-        perf_df = pd.read_csv(PERF_LOG_PATH)
-        perf_df = perf_df.append(perf_row, ignore_index=True)
-        perf_df.to_csv(PERF_LOG_PATH, index=False)
+        df_perf = pd.read_csv(PERFORMANCE_LOG_PATH)
+        df_perf = df_perf.append(perf_data, ignore_index=True)
+        df_perf.to_csv(PERFORMANCE_LOG_PATH, index=False)
 
-    # Optional: if performance is bad, we can retrain or alert.
+    # Optionally retrain if below thresholds
     if trigger_retrain:
-        # FIXME If your strategy hits a large drawdown, you might want instant alerts (Slack, email, etc.).
-        # Check if ROI < LOSS_THRESHOLD or max drawdown below DRAW_THRESHOLD
-        # e.g. if ROI = -0.12 => -12% => trigger
         if roi < LOSS_THRESHOLD or max_dd < DRAW_THRESHOLD:
-            logger.warning("Performance threshold exceeded! Initiating retrain workflow.")
+            logger.warning("Performance threshold exceeded! Retraining model.")
             retrain_model()
         else:
             logger.info("Performance within acceptable range. No retraining triggered.")
