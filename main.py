@@ -56,27 +56,15 @@ def main():
             # 3) Check current market price
             current_price = df['price'].iloc[-1]
 
-            if signal == "BUY":
-                size = 5
-                order_id = executor.execute_order_with_risk_management(
-                    product_id=product,
-                    side="BUY",
-                    current_price=current_price,
-                    size=size
-                )
-                log_trade("BUY with bracket", product, current_price, size)
-
-            elif signal == "SELL":
-                # NEW SELL LOGIC
-                size = 5
-                order_id = executor.execute_order_with_risk_management(
-                    product_id=product,
-                    side="SELL",
-                    current_price=current_price,
-                    size=size
-                )
-                log_trade("SELL with bracket", product, current_price, size)
-
+            size = 5
+            order_id = executor.execute_order_with_risk_management(
+                product_id=product,
+                side=signal,
+                current_price=current_price,
+                size=size
+            )
+                
+            log_trade(signal=signal, product_id=product, price=current_price, size=size, realized_pnl=0)
             # else: HOLD => do nothing
 
 
@@ -90,21 +78,9 @@ def main():
         faiss_store.save_index()
         logger.info("Sentiment data updated in FAISS.")
 
-    # Task 3: Fetch Historical Data (runs every 8 hours)
-    def historical_task():
-        # Example: last 24 hours
-        end = datetime.utcnow()
-        start = end - timedelta(hours=8)
-        for product in config['trading']['products']:
-            df = fetcher.fetch_historical_data(product, start, end)
-            # Save or do something with df
-            path = f"data/{product}_historical_data.csv"
-            df.to_csv(path, index=False)
-        logger.info("Historical data fetch completed.")
-
-    # Task 4: Evaluate Performance (daily, for instance)
+    # Task 3: Evaluate Performance (daily, for instance)
     def performance_task():
-        evaluate_performance()
+        evaluate_performance(trigger_retrain=True)
 
     # Schedule tasks
     schedule.every(config['schedule']['real_time_interval_minutes']).minutes.do(trading_task)
@@ -115,7 +91,6 @@ def main():
     #schedule.every(config['schedule']['historical_interval_hours']).hours.do(
     #    lambda: [fetcher.get_historical_data_past_dates(p) for p in config['trading']['products']]
     #)
-
     schedule.every().day.at("23:59").do(performance_task)    
 
     # Main loop
