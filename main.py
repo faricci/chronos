@@ -28,11 +28,12 @@ def main():
 
     # Initialize model
     # For demonstration, we are not loading pretrained weights
-    model = SimpleTransformer()
-    model.eval()  # set to eval mode
+    # FIXME use the same parameters as in the training script (retrieve it from config)
+    model = model = SimpleTransformer(input_dim=6, output_dim=1)
+    #model.eval()  # set to eval mode
 
     # Initialize trading logic
-    trading_logic = TradingLogic(config, model)
+    trading_logic = TradingLogic(config, local_model_path="./model_checkpoints")
 
     # Initialize coinbase client for OrderExecutor
     coinbase_client = fetcher.client
@@ -48,7 +49,7 @@ def main():
             # 1) Fetch real-time data
             df = fetcher.fetch_realtime_data(product)
 
-            # 2) Generate signal
+            # Now you have a data_df with columns [close, volume, ma_5, rsi] at least 30 rows
             signal = trading_logic.generate_signal(df)
             logger.info(f"Signal for {product}: {signal}")
 
