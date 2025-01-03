@@ -94,19 +94,18 @@ class TestTradingLogic(unittest.TestCase):
         """
         # Mock the HF model
         mock_informer = MagicMock()
-        # Suppose the model predictions => [0.02], which is above threshold_up=0.01
-        mock_informer.return_value = None
-        # We fake the output as if .predictions[0].numpy() => [0.02]
+        # We'll fake the model's predictions => 0.02
         mock_outputs = MagicMock()
         mock_outputs.predictions = torch.tensor([[0.02]])  # shape=(1,1)
-        # We'll mock .__call__ to return this
-        mock_informer.__call__.return_value = mock_outputs
+        
+        # Overwrite the entire __call__ method with a MagicMock that returns mock_outputs
+        mock_informer.__call__ = MagicMock(return_value=mock_outputs)
 
+        # from_pretrained(...) => mock_informer
         mock_informer_class.from_pretrained.return_value = mock_informer
 
         logic = TradingLogic(self.config, local_model_path="./fake_model_dir")
 
-        # Provide a DataFrame with at least 3 rows
         df_ok = pd.DataFrame({
             "close": [100.0, 101.0, 102.0, 103.0],
             "volume": [10, 12, 11, 9],
@@ -114,32 +113,40 @@ class TestTradingLogic(unittest.TestCase):
             "high": [102.5, 103.0, 103.5, 104.0],
             "low": [98.5, 100.0, 100.5, 101.5]
         })
-        # Ensure it's at least as long as context_length=3
         result = logic.generate_signal(df_ok)
         self.assertEqual(result, "BUY", "Model output above threshold => BUY signal")
-
+    
     def test_generate_signal_sell(self, mock_informer_class):
+
+        
         """
         If the model output is < threshold_down => SELL
         """
         mock_informer = MagicMock()
-        # We'll return a negative forecast => e.g. -0.05 => below threshold_down=-0.01
+
+        # -0.05 => below threshold_down=-0.01 => expecting "SELL"
         mock_outputs = MagicMock()
         mock_outputs.predictions = torch.tensor([[-0.05]])  # shape=(1,1)
-        mock_informer.__call__.return_value = mock_outputs
+
+        # Overwrite the entire __call__ method
+        mock_informer.__call__ = MagicMock(return_value=mock_outputs)
+
+        # from_pretrained => returns mock_informer
         mock_informer_class.from_pretrained.return_value = mock_informer
 
         logic = TradingLogic(self.config, local_model_path="./fake_model_dir")
 
         df_ok = pd.DataFrame({
-            "close": [100.0, 101.0, 102.0, 103.0],
+            "close":  [100.0, 101.0, 102.0, 103.0],
             "volume": [10, 12, 11, 9],
-            "open": [99.0, 101.5, 101.0, 102.5],
-            "high": [102.5, 103.0, 103.5, 104.0],
-            "low": [98.5, 100.0, 100.5, 101.5]
+            "open":   [99.0, 101.5, 101.0, 102.5],
+            "high":   [102.5, 103.0, 103.5, 104.0],
+            "low":    [98.5, 100.0, 100.5, 101.5]
         })
+
         result = logic.generate_signal(df_ok)
         self.assertEqual(result, "SELL", "Model output below threshold => SELL signal")
+
 
     def test_generate_signal_hold_in_between(self, mock_informer_class):
         """
@@ -149,7 +156,11 @@ class TestTradingLogic(unittest.TestCase):
         # Suppose the forecast is 0.0 => within [-0.01, 0.01]
         mock_outputs = MagicMock()
         mock_outputs.predictions = torch.tensor([[0.0]])  # shape=(1,1)
-        mock_informer.__call__.return_value = mock_outputs
+
+        # Overwrite the entire __call__ method with a MagicMock that returns mock_outputs
+        mock_informer.__call__ = MagicMock(return_value=mock_outputs)
+
+        # from_pretrained(...) => mock_informer
         mock_informer_class.from_pretrained.return_value = mock_informer
 
         logic = TradingLogic(self.config, local_model_path="./fake_model_dir")
