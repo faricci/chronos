@@ -109,7 +109,8 @@ class TradingLogic:
         # Suppose preds is next 1 or next N future steps
         # If prediction_length=1 => single-step
         final_value = float(preds.mean())  # if multiple steps, we do average
-
+        print("DEBUG final_value:", final_value, "threshold_up:", self.threshold_up, "threshold_down:", self.threshold_down)
+        
         # 3) Trading logic
         if final_value > self.threshold_up:
             return "BUY"

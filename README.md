@@ -78,6 +78,8 @@ python -m unittest tests.test_data_preprocessing
 python -m unittest tests.test_sentiment_analysis.py
 python -m unittest tests.test_vector_storage.py
 python -m unittest tests.test_order_execution.py
+python -m unittest tests.test_monitoring.py
+python -m unittest tests/test_trading_logic.py
 ```
 
 ### Run:

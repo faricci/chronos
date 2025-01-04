@@ -80,6 +80,7 @@ class DataFetcher:
         Also appends/creates a CSV file at data/realtime_<product_id>.csv
         """
         try:
+            # FIXME Use a WebSocket feed for real-time quotes to avoid delays between data, preprocessing and trading
             response = self.client.get_best_bid_ask(product_id)
 
             logger.debug(f"BID/ASK response for {product_id}: {response}")
