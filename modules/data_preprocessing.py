@@ -81,7 +81,7 @@ def compute_indicators(df, ma_window=5, rsi_period=14):
 
     df['rsi'] = 100 - (100 / (1 + rs))
 
-    # Fill NaNs by backward fill
-    df.fillna(method='bfill', inplace=True)
+    # Fill NaNs by backward fill (Pandas 2.x compatible)
+    df.bfill(inplace=True)
 
     return df

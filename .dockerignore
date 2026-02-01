@@ -1,0 +1,48 @@
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+.kiro
+
+# Python cache
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv
+.venv
+ENV
+
+# Data files (mounted as volume)
+data/*.csv
+data/*.index
+data/trade_logs/
+data/positions.json
+
+# Model checkpoints (mounted as volume)
+model_checkpoints/
+*.pt
+*.pth
+*.bin
+
+# Config with secrets
+config/config.yml
+
+# Documentation
+*.md
+!README.md
+
+# Tests (when building prod image)
+# tests/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

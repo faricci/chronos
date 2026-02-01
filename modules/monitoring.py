@@ -105,7 +105,9 @@ def log_trade(
         pd.DataFrame([row]).to_csv(current_path, index=False)
     else:
         df = pd.read_csv(current_path)
-        df = df.append(row, ignore_index=True)
+        # Pandas 2.x compatible - use pd.concat instead of df.append
+        new_row_df = pd.DataFrame([row])
+        df = pd.concat([df, new_row_df], ignore_index=True)
         df.to_csv(current_path, index=False)
 
     logger.info(f"Trade logged: {row}")

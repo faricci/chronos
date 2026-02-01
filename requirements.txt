@@ -1,17 +1,31 @@
+# Data handling
 pandas
 numpy
+
+# Machine Learning
 scikit-learn
-torch
+# torch - installed separately in Dockerfile (CPU-only)
 transformers
+sentence-transformers
+accelerate
+datasets
+
+# Vector storage
+faiss-cpu
+
+# LangChain (for embeddings)
 langchain
 langchain-community
-faiss-cpu
+
+# Web scraping
 requests
 beautifulsoup4
+
+# Scheduling
 schedule
+
+# Configuration
 pyyaml
+
+# Coinbase API
 coinbase-advanced-py
-sentence-transformers
-transformers
-accelerate 
-datasets

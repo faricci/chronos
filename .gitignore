@@ -1,3 +1,45 @@
+# Secrets - NEVER commit
 config/config.yml
-__pycache__
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+ENV/
+
+# IDE
+.idea/
+*.swp
+*.swo
+
+# Data files (keep structure, ignore content)
+data/*.csv
+data/*.index
+data/trade_logs/*.csv
+data/positions.json
+
+# Model checkpoints (large files)
+model_checkpoints/
+*.pt
+*.pth
+*.bin
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
 *.__py__

@@ -86,36 +86,61 @@ cp config/config.yml_template config/config.yml
 # NEVER commit config.yml to git!
 ```
 
-### 2. Build the Docker Image
+### 2. Using Docker Compose (Recommended)
 
 ```bash
+# Build the image
+docker compose build
+
+# Run the trading agent
+docker compose up chronos
+
+# Run in background (detached)
+docker compose up -d chronos
+
+# View logs
+docker compose logs -f chronos
+
+# Stop the agent
+docker compose down
+```
+
+### 3. Run Tests
+
+```bash
+# Run all tests
+docker compose run --rm test
+
+# Run tests with verbose output
+docker compose run --rm test python -m unittest discover -s tests -v
+
+# Run a single test file
+docker compose run --rm test python -m unittest tests.test_data_fetch -v
+```
+
+### 4. Interactive Development Shell
+
+```bash
+# Start a bash shell inside the container
+docker compose run --rm dev
+
+# Or with docker directly
+docker compose run --rm chronos bash
+```
+
+### 5. Alternative: Direct Docker Commands
+
+```bash
+# Build
 docker build -t chronos .
-```
 
-### 3. Run the Trading Agent
+# Run agent
+docker run --rm -v ${PWD}/config:/app/config -v ${PWD}/data:/app/data chronos
 
-```bash
-# Start Chronos
-docker run --rm \
-  -v ${PWD}/config:/app/config \
-  -v ${PWD}/data:/app/data \
-  chronos
-```
+# Run tests
+docker run --rm chronos python -m unittest discover -s tests -v
 
-### 4. Run Tests
-
-```bash
-# All tests
-docker run --rm chronos python -m unittest discover -s tests
-
-# Single test file
-docker run --rm chronos python -m unittest tests.test_trading_logic
-```
-
-### 5. Interactive Development
-
-```bash
-# Get a shell inside the container
+# Interactive shell
 docker run --rm -it -v ${PWD}:/app chronos bash
 ```
 

@@ -1,0 +1,61 @@
+# Chronos Trading Agent - Docker Compose
+# Use this for local development and testing
+
+services:
+  # Main trading agent
+  chronos:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chronos-agent
+    volumes:
+      # Mount config (contains secrets - never commit config.yml!)
+      - ./config:/app/config:ro
+      # Mount data for persistence (historical data, positions, logs)
+      - ./data:/app/data
+      # Mount model checkpoints
+      - ./model_checkpoints:/app/model_checkpoints
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TZ=Europe/Rome
+    restart: unless-stopped
+    # Healthcheck to ensure the agent is running
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Test runner service
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chronos-test
+    volumes:
+      - ./config:/app/config:ro
+      - ./data:/app/data
+      - ./tests:/app/tests:ro
+      - ./modules:/app/modules:ro
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: python -m unittest discover -s tests -v
+    profiles:
+      - test  # Only run when explicitly requested
+
+  # Development shell (for debugging)
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: chronos-dev
+    volumes:
+      # Mount entire project for live editing
+      - .:/app
+    environment:
+      - PYTHONUNBUFFERED=1
+    stdin_open: true
+    tty: true
+    command: bash
+    profiles:
+      - dev  # Only run when explicitly requested
