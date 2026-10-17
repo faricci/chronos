@@ -15,6 +15,12 @@ Se lo Sviluppatore (Sonnet) incontra un blocco logico, una contraddizione o ha b
 4. Attendi che `architetto-opus` riscriva le specifiche o risolva il dubbio nello stesso file.
 5. Leggi la soluzione, cancella il file `CONFLITTO.md` e riprendi l'implementazione del codice.
 
+
+## ⚠️ VINCOLI FINANZIARI ASSOLUTI (SCOPLITI NELLA PIETRA)
+1. **DIVIETO ASSOLUTO DI LEVA (NO LEVERAGE / NO MARGIN):** Il bot deve operare ESCLUSIVAMENTE sul mercato SPOT. È vietato l'utilizzo di contratti Futures, Margin Trading, Opzioni o qualsiasi strumento a leva. Ogni operazione deve essere coperta al 100% dal saldo reale.
+2. **COPERTURA TOTALE DEGLI ORDINI:** Prima di inviare qualsiasi ordine di acquisto o vendita a Coinbase, il bot deve verificare programmaticamente che il saldo disponibile (Available Balance) sia maggiore o uguale all'importo dell'ordine più le commissioni (fees). Se il saldo è insufficiente, l'ordine deve essere ABORTITO immediatamente, indipendentemente dal segnale dell'AI. Metti il valore in memoria e tieni aggiornato non deve influire sulla latenza dell'invio ordini.
+3. **PROTEZIONE DAL DEBITO:** Nessuna logica passata, presente o futura può esporre l'account a saldi negativi. Anche per micro-ordini (es. 5 euro), il rischio massimo deve essere limitato esclusivamente al capitale spot allocato a quell'ordine.
+
 ## Workflow Orchestration
 
 ### 1. Plan Mode Default

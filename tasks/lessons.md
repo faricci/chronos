@@ -10,3 +10,13 @@ Rules:
 - Before fixing strategy parameters in a spec, measure the market (spread, ATR, history depth) with a read-only probe and check them against the cost model.
 - When a parameter can be wrong in a way that kills the project (fees vs edge), add an explicit stop criterion instead of a default.
 - State the scope (per book, global) of every stateful component, and the decision rule (argmax vs score) of every derived value.
+
+## 2026-10-17 - Tooling run on the whole tree touched v1 files
+
+Pattern: `ruff check --fix modules` rewrote eight v1 modules that are not part of the task. Caught by `git status`, reverted with `git checkout`.
+
+Rules:
+- Run auto-fixers only on explicit file paths, never on a directory that contains code outside the task.
+- Check `git status` after any command with `--fix` or `--write`.
+- Keep v1 paths in the `exclude` lists of ruff and mypy until they are deleted.
+- The shell tool strips backslashes inside heredocs and inline scripts: write files containing `\` with the Write/Edit tools.

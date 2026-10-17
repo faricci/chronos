@@ -1,6 +1,6 @@
 # Chronos v2 — Specifica Tecnica "System 1" Decision Architecture
 
-Versione: 2.2-draft | Data: 2026-10-17 | Stato: proposta per implementazione
+Versione: 2.3-draft | Data: 2026-10-17 | Stato: proposta per implementazione
 Target implementatore: Sonnet 5.5 (ogni blocco "Linee Guida" e' scritto per essere usato come prompt diretto)
 
 Changelog 2.1: perimetro infrastrutturale a costo zero (locale, CPU-only, AWS fuori scope); nuova sez. 5 "Dry Run"; piano di rilascio riscritto; la sandbox Coinbase e' statica e non viene piu' usata per validare i payload.
@@ -16,6 +16,11 @@ Changelog 2.2 (risposta alla review di implementazione):
 - calibrazione del sentiment non bloccante e flusso di etichettatura a costo zero;
 - gate del dry run separato in operativo (G-DRY-OPS) ed economico (G-DRY-ECON);
 - `level2` verificato: funziona senza autenticazione.
+
+Changelog 2.3 (risoluzione del conflitto sul CostModel):
+- `script/probe_coinbase.py` usa `CostModel` senza calcoli di costo propri, si esegue con `python -m script.probe_coinbase` e legge le credenziali solo da env;
+- tabella dei lift della sez. 0.4 ricalcolata con `CostModel` (righe 1h e 6h);
+- EV a due esiti dichiarato limite inferiore dell'EV reale (sez. 0.3); `tune_policy` valuta le soglie con il backtest completo (sez. 3.1.6, 3.5); diagnostica VERTICAL nello studio di fattibilita' (sez. 3.1.3).
 
 ---
 
@@ -79,7 +84,7 @@ Dipendenze rimosse: `faiss-cpu`, `beautifulsoup4`, `langchain`, `langchain-commu
 
 ### 0.3 Modello di costo unico (`COST_V1`)
 
-Unica definizione dei costi nel sistema, implementata in `modules/risk/costs.py` (`CostModel`) e importata da: label di training (sez. 3.1.3), StateBuilder (sez. 2.2.1), RiskManager (sez. 4.1), FillModel (sez. 5.1.3). Nessun altro modulo calcola costi per conto proprio.
+Unica definizione dei costi nel sistema, implementata in `modules/risk/costs.py` (`CostModel`) e importata da: label di training (sez. 3.1.3), StateBuilder (sez. 2.2.1), RiskManager (sez. 4.1), FillModel (sez. 5.1.3). Nessun altro modulo calcola costi per conto proprio, compreso `script/probe_coinbase.py`, che importa `CostModel` per la tabella di fattibilita'. L'ingresso maker non paga spread ne' slippage per costruzione (post-only al `best_bid`, mai inseguito). La selezione avversa del fill maker non e' un costo in bps: e' contenuta in `p_edge`, perche' la domanda `edge` e' condizionata all'avvenuto fill (sez. 3.1.3, sample `NO_FILL` esclusi).
 
 Simboli (tutti in bps): `f_m`, `f_t` = fee maker/taker del tier dell'account (`FeeProvider`: `get_transaction_summary`, cache 1 h, fallback `dry_run.fill_model.fallback_fees`); `s` = spread corrente; `slip` = `risk.slippage_buffer_bps` (default 5); `x` = `dry_run.fill_model.stop_extra_slip_bps` (default 10).
 
@@ -103,6 +108,8 @@ EV(p)    =   p * (tp_bps - cost_tp) - (1 - p) * (sl_bps + cost_sl)
 p_breakeven = (sl_bps + cost_sl) / (tp_bps - cost_tp + sl_bps + cost_sl)
 EV gate:     EV(p_edge) > risk.ev_min_bps                                     (default 0)
 ```
+
+**EV a due esiti (limite inferiore).** `p = p_edge = P(UPPER)` (sez. 3.1.3). `1 - p` comprende LOWER e VERTICAL, ed entrambi sono valutati come uno SL. Un'uscita VERTICAL avviene con il prezzo strettamente dentro le barriere e costa `cost_mkt <= cost_sl`, quindi la sua perdita in bps e' sempre minore di `sl_bps + cost_sl`. Ne segue che `EV(p_edge)` e' un limite inferiore dell'EV reale e `p_breakeven` un limite superiore del breakeven reale. E' voluto: il gate e' prudenziale e usa solo la probabilita' calibrata della domanda `edge`. Il costo di questa prudenza e' misurato dallo studio di fattibilita' (`p_vertical`, `vert_mean_net_bps`, sez. 3.1.3) ed e' gia' incorporato nelle soglie, perche' `tune_policy` valuta ogni combinazione con il backtest completo, RiskManager incluso (sez. 3.1.6). Stimare `P(VERTICAL)` a runtime richiederebbe una nuova domanda (ad esempio `choice` UPPER/LOWER/VERTICAL), quindi una nuova versione di `QUESTIONS` e del modello: fuori scope v2.
 
 Le formule in bps sono approssimazioni da usare **solo** per gate e feature. Il PnL realizzato, simulato e delle label e' sempre esatto, calcolato sui prezzi di fill e sulle fee effettive di ciascuna gamba:
 
@@ -132,11 +139,14 @@ Misure dal probe di sola lettura `script/probe_coinbase.py` (endpoint pubblici, 
 
 | ATR | k_tp/k_sl | Ingresso | BTC lift | ETH lift | SOL lift |
 |-----|-----------|----------|----------|----------|----------|
-| 1h | 3/2, 4/2 | qualunque | TP non copre i costi | TP non copre i costi | quasi in pareggio |
-| 6h | 4/2 | taker | +0.29 | +0.20 | +0.17 |
-| 6h | 4/2 | maker | +0.22 | +0.14 | +0.12 |
+| 1h | 4/2 | taker | TP non copre i costi | +0.65 (sotto fee floor) | +0.54 |
+| 1h | 4/2 | maker | TP non copre i costi | +0.47 | +0.39 |
+| 6h | 4/2 | taker | +0.30 | +0.20 | +0.17 |
+| 6h | 4/2 | maker | +0.21 | +0.14 | +0.12 |
 | 1d | 4/2 | taker | +0.15 | +0.10 | +0.08 |
 | 1d | 4/2 | maker | **+0.11** | **+0.07** | **+0.06** |
+
+Valori calcolati con `CostModel` (sez. 0.3; fee presunte 60/120, `slip` = 5, `x` = 10) sugli spread e sugli ATR arrotondati della tabella precedente, riprodotti da `tests/test_costs.py`. Il probe li ricalcola sui valori non arrotondati e puo' differire di +-0.01. Con ATR 1h il rapporto 3/2 e' omesso perche' e' peggiore di 4/2 per tutti i prodotti.
 
 Decisioni v1:
 - **Prodotti:** BTC-EUR, ETH-EUR, SOL-EUR (quote EUR, `quote_min_size` = 1 EUR per tutti). Da confermare dall'utente.
@@ -157,7 +167,7 @@ Componenti trasversali che le sezioni 1–5 danno per esistenti. Sono il primo l
 | Percorsi | `state/news.db` (news e sentiment, condiviso tra modalita'), `state/chronos_live.db`, `state/chronos_dry.db`; `data/bars/1m/product=<id>/year=<y>/month=<m>.parquet`; `data/decisions/`, `data/live_labels/`, `data/ws_recordings/`, `data/reports/`, `data/probe/`; `models/registry/`. |
 | Chiavi Coinbase | Due API key CDP separate: **View** (dry, sviluppo, probe) e **Trade** (solo live, creata in P4). Nessuna con permesso Transfer. Selezionare l'algoritmo di firma supportato dall'SDK `coinbase-advanced-py` (ECDSA; da verificare nella console CDP al momento della creazione). Segreti solo da env. |
 | Market data | Endpoint pubblici e WebSocket `market_trades`, `ticker`, `level2`, `heartbeats` **senza autenticazione** (verificato per `level2` il 2026-10-17). La key View serve solo per fee, account e permessi. |
-| Probe | `script/probe_coinbase.py` (gia' nel repo): permessi della key, fee tier, metadati prodotto, spread, ATR 1h/6h/1d, profondita' dello storico 1m, `level2`, tabella di fattibilita'. Da rieseguire con la key View prima di fissare la config di rischio. |
+| Probe | `script/probe_coinbase.py` (gia' nel repo), eseguito dalla radice del repo come modulo: `python -m script.probe_coinbase`. Rileva permessi della key, fee tier, metadati prodotto, spread, ATR 1h/6h/1d, profondita' dello storico 1m, `level2` e la tabella di fattibilita', calcolata con `CostModel` (sez. 0.3). Credenziali solo da env (`COINBASE_API_KEY`, `COINBASE_API_SECRET`). Da rieseguire con la key View prima di fissare la config di rischio. |
 
 **Backfill storico** (`modules/market/backfill.py`, CLI `python -m modules.market.backfill --products BTC-EUR ETH-EUR SOL-EUR --start 2023-10-01`):
 - `RESTClient().get_public_candles(granularity="ONE_MINUTE")` senza chiavi, finestre di 300 minuti (limite API 350 candele), dalla data piu' recente gia' salvata in avanti, oppure da `--start` se non c'e' nulla; ripresa idempotente dopo interruzione;
@@ -711,7 +721,7 @@ net_ret    = exit_px * (1 - f_out) / (entry * (1 + f_in)) - 1                 # 
 
 La scansione e la stima dei costi chiamano gli stessi oggetti del runtime (`CostModel`, `BarFillModel`), non reimplementazioni. `s` (spread) per il training e' la mediana per prodotto e ora del giorno misurata dal recorder (sez. 5); finche' non ci sono registrazioni si usa il valore del probe. I parametri sono scritti nel `label_config` del model card e **devono** coincidere con quelli usati dal RiskManager (sez. 4), altrimenti `edge.noul` non ha significato in esecuzione.
 
-**Studio di fattibilita' (`training/feasibility.py`, prima del primo training).** Sullo storico backfillato e con le fee reali (o presunte, marcate come tali), valuta la griglia `atr_tf in {6h, 1d}`, `k_tp in {3, 4, 5}`, `k_sl in {1.5, 2}`, `entry_mode in {maker, taker}`, `H in {5, 10, 15} giorni` e per ogni combinazione calcola: frequenza storica di UPPER (`p_hist`), `p_breakeven` mediano, `lift richiesto = p_breakeven - p_hist`, quota di timestamp che passano il fee floor, tasso di fill dell'ingresso maker, numero atteso di trade indipendenti per anno. Regola di scelta: tra le combinazioni con fee floor superato in >= 80% dei timestamp e fill maker >= 50%, si prende quella con lift richiesto minimo, a parita' quella con piu' trade indipendenti. Output: `label_config.json` + tabella Markdown in `data/reports/feasibility.md`. **Se nessuna combinazione ha lift richiesto <= 0.10, il report lo dichiara e il progetto non procede al training:** a quel tier di fee la strategia non e' sostenibile e va rivista (prodotti, fee, orizzonte) prima di scrivere altro codice.
+**Studio di fattibilita' (`training/feasibility.py`, prima del primo training).** Sullo storico backfillato e con le fee reali (o presunte, marcate come tali), valuta la griglia `atr_tf in {6h, 1d}`, `k_tp in {3, 4, 5}`, `k_sl in {1.5, 2}`, `entry_mode in {maker, taker}`, `H in {5, 10, 15} giorni` e per ogni combinazione calcola: frequenza storica di UPPER (`p_hist`), `p_breakeven` mediano, `lift richiesto = p_breakeven - p_hist`, quota di timestamp che passano il fee floor, tasso di fill dell'ingresso maker, numero atteso di trade indipendenti per anno. Come sola diagnostica, che non entra nella regola di scelta, riporta anche la frequenza dell'esito VERTICAL (`p_vertical`) e il `net_ret` medio esatto dei soli esiti VERTICAL (`vert_mean_net_bps`): misurano quanto e' prudenziale l'EV a due esiti della sez. 0.3. Regola di scelta: tra le combinazioni con fee floor superato in >= 80% dei timestamp e fill maker >= 50%, si prende quella con lift richiesto minimo, a parita' quella con piu' trade indipendenti. Output: `label_config.json` + tabella Markdown in `data/reports/feasibility.md`. **Se nessuna combinazione ha lift richiesto <= 0.10, il report lo dichiara e il progetto non procede al training:** a quel tier di fee la strategia non e' sostenibile e va rivista (prodotti, fee, orizzonte) prima di scrivere altro codice.
 
 Label per domanda:
 
@@ -740,7 +750,7 @@ Le news RSS non hanno storico. Strategia:
 
 #### 3.1.6 Calibrazione post-training
 
-Temperature scaling **per domanda** (`T_action`, `T_edge`, `T_regime`) sul validation fold piu' recente. Le temperature sono salvate nel model card e applicate dal server. Dopo la calibrazione, `DecisionPolicy` viene tarata (grid search delle soglie `tau_buy`, `p_edge_min`, `c_min`) massimizzando il PnL netto simulato sul validation set, con vincolo `trade_count >= 30` per fold. L'output e' `policy.json`.
+Temperature scaling **per domanda** (`T_action`, `T_edge`, `T_regime`) sul validation fold piu' recente. Le temperature sono salvate nel model card e applicate dal server. Dopo la calibrazione, `DecisionPolicy` viene tarata (grid search delle soglie `tau_buy`, `p_edge_min`, `c_min`) massimizzando il PnL netto simulato sul validation set con `training/backtest.py`, cioe' con la stessa `DecisionPolicy` e lo stesso `RiskManager` del runtime (fee floor ed EV gate della sez. 0.3 attivi), con vincolo `trade_count >= 30` per fold. L'output e' `policy.json`.
 
 ### 3.2 Struttura dei Dati / Schema JSON
 
@@ -915,7 +925,7 @@ Se G3 fallisce, il sistema va in produzione con `BaselineDecider`. Il modello LL
 > 7. `training/calibrate.py` — inferenza sul validation set, ottimizzazione di `T_q` per domanda (NLL, `minimize_scalar`), ECE e Brier prima/dopo, reliability diagram PNG con matplotlib. Scrive `temperatures` nel model card.
 > 8. `training/backtest.py` — simulatore event-driven barra per barra che usa **la stessa** `DecisionPolicy` e lo **stesso** `RiskManager` del runtime (sez. 4) con un `SimulatedExchange` (fill del limit se `low <= limit` per BUY; bracket TP/SL simulati con la regola conservativa; fee maker/taker da config). Output: equity curve, trade list, Sharpe annualizzato, max drawdown, profit factor, turnover, fee pagate.
 > 9. `training/baseline_lgbm.py` — addestra tre LightGBM sugli stessi split usando `flatten_state()`, salva in `models/baseline/`.
-> 10. `training/tune_policy.py` — grid search delle soglie su validation -> `policy.json`.
+> 10. `training/tune_policy.py` — grid search delle soglie su validation -> `policy.json`. Ogni combinazione di soglie viene valutata eseguendo `training/backtest.py` (stessa `DecisionPolicy`, stesso `RiskManager`, quindi fee floor ed EV gate della sez. 0.3 attivi). E' vietata una simulazione semplificata che salti il RiskManager.
 > 11. `training/evaluate.py` — esegue G1–G4 della sez. 3.4 e stampa una tabella; exit code 1 se un gate fallisce.
 > 12. `decider/server.py` + `decider/Dockerfile` (base `nvidia/cuda` runtime + torch CUDA) secondo la sez. 3.3. Schemi request/response pydantic identici a `modules/decision/client.py` (pacchetto condiviso `modules/decision/protocol.py`). Merge dell'adapter in `decider/export.py`.
 >

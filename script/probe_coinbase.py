@@ -3,9 +3,9 @@
 It never places, previews or cancels orders. It prints a summary and writes
 data/probe/coinbase_probe.json, which contains no secrets.
 
-Usage (inside the dev container, keys from env):
+Usage (inside the dev container, from the repo root, keys from env only):
     docker compose run --rm -e COINBASE_API_KEY -e COINBASE_API_SECRET dev \
-        python script/probe_coinbase.py --products BTC-EUR ETH-EUR SOL-EUR XLM-EUR
+        python -m script.probe_coinbase --products BTC-EUR ETH-EUR SOL-EUR XLM-EUR
 
 Without keys (--public-only) it checks only public market data: spreads, min sizes,
 ATR on 1h/6h/1d, 1m history depth and unauthenticated level2.
@@ -13,20 +13,17 @@ ATR on 1h/6h/1d, 1m history depth and unauthenticated level2.
 
 import argparse
 import json
-import os
 import threading
-import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from coinbase.rest import RESTClient
 from coinbase.websocket import WSClient
+from pydantic import ValidationError
 
-# Cost assumptions shared with the spec (sez. 0.3): slippage buffer and extra stop slippage, in bps
-SLIP_BPS = 5.0
-STOP_EXTRA_SLIP_BPS = 10.0
-# Used only when the account fees cannot be read (no key): Coinbase lowest volume tier, to be confirmed
-ASSUMED_FEES = {"maker_bps": 60.0, "taker_bps": 120.0, "assumed": True}
+from modules.config import CoinbaseConfig, FallbackFees
+from modules.risk.costs import CostModel, FeeRates, round_bps
+
 # Barrier grid evaluated for the quick feasibility check, in ATR units of each timeframe
 BARRIER_GRID = [(3.0, 2.0), (4.0, 2.0)]
 # ATR timeframes: Coinbase granularity -> look-back window that stays under 350 candles
@@ -36,20 +33,6 @@ ATR_TIMEFRAMES = {"1h": ("ONE_HOUR", 12), "6h": ("SIX_HOUR", 60), "1d": ("ONE_DA
 def as_dict(obj):
     """SDK responses are objects in recent versions and dicts in older ones."""
     return obj.to_dict() if hasattr(obj, "to_dict") else obj
-
-
-def load_credentials(config_path):
-    key = os.getenv("COINBASE_API_KEY")
-    secret = os.getenv("COINBASE_API_SECRET")
-    if key and secret:
-        return key, secret.replace("\\n", "\n")
-    if os.path.exists(config_path):
-        import yaml
-
-        with open(config_path, "r") as f:
-            cfg = yaml.safe_load(f)
-        return cfg["coinbase"]["name"], cfg["coinbase"]["privateKey"]
-    return None, None
 
 
 def probe_permissions(client):
@@ -109,7 +92,7 @@ def atr_bps(candles, period=14):
 
 def probe_history_depth(client, product_id):
     """Checks whether 1m candles exist at several look-back depths (for the backfill plan)."""
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     depth = {}
     for days in (30, 365, 730, 1095):
         start = now - timedelta(days=days)
@@ -118,32 +101,41 @@ def probe_history_depth(client, product_id):
     return depth
 
 
-def feasibility(atrs, spread_bps, fees):
-    """Quick check of the asymmetric cost model of sez. 0.3 against ATR-based barriers.
+def fees_for_feasibility(account):
+    """Account fees if both maker and taker were read, otherwise the presumed lowest tier (flagged assumed)."""
+    if isinstance(account, dict) and account.get("maker_bps") is not None and account.get("taker_bps") is not None:
+        try:
+            return FeeRates(maker_bps=account["maker_bps"], taker_bps=account["taker_bps"], assumed=False)
+        except ValidationError:
+            pass  # e.g. maker above taker: unusable, fall back
+    fb = FallbackFees()
+    return FeeRates(maker_bps=fb.maker_bps, taker_bps=fb.taker_bps, assumed=True)
 
-    p_breakeven is the minimum P(TP first) for a positive expected value; None means
-    the take-profit does not even cover its own costs.
+
+def feasibility(atrs, spread_bps, fees):
+    """Quick check of the asymmetric cost model against ATR-based barriers.
+
+    Costs come only from modules.risk.costs.CostModel (spec sez. 0.3). p_breakeven is the minimum
+    P(TP first) for a positive expected value; None means the take-profit does not cover its own costs.
+    required_lift is p_breakeven minus the P(TP first) of a driftless random walk.
     """
-    maker, taker = fees["maker_bps"], fees["taker_bps"]
     rows = []
-    for entry_mode, entry_fee in (("taker", taker), ("maker", maker)):
-        cost_tp = entry_fee + maker + spread_bps / 2 + SLIP_BPS
-        cost_sl = entry_fee + taker + spread_bps / 2 + SLIP_BPS + STOP_EXTRA_SLIP_BPS
+    for entry_mode in ("taker", "maker"):
+        cm = CostModel(fees=fees, entry_mode=entry_mode, spread_bps=spread_bps)
         for tf, atr in atrs.items():
             if atr is None:
                 continue
             for k_tp, k_sl in BARRIER_GRID:
                 tp, sl = k_tp * atr, k_sl * atr
-                win, loss = tp - cost_tp, sl + cost_sl
-                p_be = round(loss / (win + loss), 3) if win > 0 else None
-                # P(TP first) of a driftless random walk: the model must lift it up to p_be
-                p_base = round(k_sl / (k_tp + k_sl), 3)
+                p_be = cm.p_breakeven(tp, sl)
+                lift = cm.required_lift(tp, sl)
                 rows.append({
                     "entry": entry_mode, "atr_tf": tf, "k_tp": k_tp, "k_sl": k_sl,
-                    "tp_bps": round(tp), "sl_bps": round(sl),
-                    "cost_tp_bps": round(cost_tp), "cost_sl_bps": round(cost_sl),
-                    "p_breakeven": p_be, "p_random": p_base,
-                    "required_lift": round(p_be - p_base, 3) if p_be is not None else None,
+                    "tp_bps": round_bps(tp), "sl_bps": round_bps(sl),
+                    "cost_tp_bps": round_bps(cm.cost_tp), "cost_sl_bps": round_bps(cm.cost_sl),
+                    "p_breakeven": None if p_be is None else round(p_be, 3),
+                    "p_random": round(k_sl / (k_tp + k_sl), 3),
+                    "required_lift": None if lift is None else round(lift, 3),
                 })
     return rows
 
@@ -199,26 +191,25 @@ def section(report, name, fn, *args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--products", nargs="+", default=["BTC-EUR", "ETH-EUR", "SOL-EUR", "XLM-EUR"])
-    ap.add_argument("--config", default="config/config.yml")
     ap.add_argument("--public-only", action="store_true")
     ap.add_argument("--out", default="data/probe/coinbase_probe.json")
     args = ap.parse_args()
 
-    key, secret = (None, None) if args.public_only else load_credentials(args.config)
-    authed = bool(key and secret)
+    creds = CoinbaseConfig()  # COINBASE_API_KEY / COINBASE_API_SECRET from env only
+    authed = creds.has_credentials and not args.public_only
+    key = creds.api_key.get_secret_value() if authed and creds.api_key else None
+    secret = creds.api_secret.get_secret_value() if authed and creds.api_secret else None
     public = RESTClient()
     private = RESTClient(api_key=key, api_secret=secret) if authed else None
 
-    report = {"generated_at": datetime.now(timezone.utc).isoformat(), "authenticated": authed}
+    report = {"generated_at": datetime.now(UTC).isoformat(), "authenticated": authed}
     if authed:
         section(report, "permissions", probe_permissions, private)
         section(report, "fees", probe_fees, private)
-    fees = report.get("fees")
-    if not isinstance(fees, dict) or fees.get("taker_bps") is None:
-        fees = ASSUMED_FEES
-    report["fees_used_for_feasibility"] = fees
+    fees = fees_for_feasibility(report.get("fees"))
+    report["fees_used_for_feasibility"] = fees.model_dump(mode="json", exclude={"as_of"})
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     report["products"] = {}
     for pid in args.products:
         entry = {}
@@ -232,8 +223,9 @@ def main():
                 entry[f"atr_{tf}_error"] = f"{type(e).__name__}: {e}"
         entry["atr_14_bps"] = atrs
         section(entry, "history_1m_candles_per_300min", probe_history_depth, public, pid)
-        spread = entry.get("meta", {}).get("spread_bps", 0.0) or 0.0
-        entry["feasibility"] = feasibility(atrs, spread, fees)
+        meta = entry.get("meta")
+        spread = meta.get("spread_bps") if isinstance(meta, dict) else None
+        entry["feasibility"] = feasibility(atrs, spread, fees) if spread is not None else None
         report["products"][pid] = entry
 
     probe_pid = args.products[0]

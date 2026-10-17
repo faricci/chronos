@@ -1,0 +1,8 @@
+-r requirements.txt
+pytest
+pytest-asyncio
+hypothesis
+mypy
+ruff
+types-PyYAML
+pandas-stubs

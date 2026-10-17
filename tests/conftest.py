@@ -1,0 +1,15 @@
+"""pytest configuration.
+
+The v1 test modules are unittest-based, import removed dependencies (faiss, langchain, ...) and are
+deleted together with the v1 module they cover (spec sez. 0.5). Until then they are not collected.
+"""
+
+collect_ignore = [
+    "test_data_fetch.py",
+    "test_data_preprocessing.py",
+    "test_monitoring.py",
+    "test_order_execution.py",
+    "test_sentiment_analysis.py",
+    "test_trading_logic.py",
+    "test_vector_storage.py",
+]

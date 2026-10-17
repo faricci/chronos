@@ -1,7 +1,7 @@
 # Chronos Trading Agent - Dockerfile
-# Python 3.11 slim for smaller image size
+# Python 3.12 slim for smaller image size
 
-FROM python:3.11-slim
+FROM python:3.12-slim
 
 # Set working directory
 WORKDIR /app

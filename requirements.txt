@@ -29,3 +29,11 @@ pyyaml
 
 # Coinbase API
 coinbase-advanced-py
+
+# v2 (P0 foundations, spec sez. 0.5 / Appendice B)
+pyarrow
+aiolimiter
+tenacity
+pydantic>=2
+pydantic-settings
+structlog

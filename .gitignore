@@ -43,3 +43,14 @@ Thumbs.db
 
 # Temporary files
 *.__py__
+
+# v2 runtime data (spec sez. 0.5)
+data/bars/
+data/probe/
+data/ws_recordings/
+data/decisions/
+data/live_labels/
+data/reports/
+data/backup/
+state/
+.venv/
