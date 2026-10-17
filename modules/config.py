@@ -205,6 +205,7 @@ class RiskConfig(_Section):
     risk_per_trade: float = Field(default=0.005, gt=0, le=0.1)
     p_edge_full: float = Field(default=0.60, gt=0, le=1)
     max_position_frac: float = Field(default=0.20, gt=0, le=1)
+    max_order_quote: Decimal = Field(default=Decimal("50.00"), gt=0)  # absolute cap per order, rises with the ramp
     max_total_exposure_frac: float = Field(default=0.50, gt=0, le=1)
     min_net_edge_bps: float = Field(default=30, ge=0)
     ev_min_bps: float = 0
@@ -245,6 +246,11 @@ class ExecutionConfig(_Section):
     reconcile_interval_s: float = Field(default=60, gt=0)
     fee_refresh_s: float = Field(default=3600, gt=0)
     product_meta_refresh_s: float = Field(default=3600, gt=0)
+    # Balance snapshot refresh; at most a third of the 120 s staleness limit of the BalanceGuard (sez. 4.1.6),
+    # so that at least three attempts happen before BUYs fail closed. There is NO switch to disable the guard.
+    balance_refresh_s: float = Field(default=30, gt=0, le=40)
+    entry_poll_s: float = Field(default=5, gt=0)
+    cancel_confirm_timeout_s: float = Field(default=10, gt=0)
 
 
 # ------------------------------------------------------------------------------------------------ dry run

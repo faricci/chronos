@@ -54,7 +54,10 @@ def probe_fees(client):
 def probe_product(client, product_id):
     p = as_dict(client.get_public_product(product_id=product_id))
     keys = ("status", "trading_disabled", "price", "base_increment", "quote_increment",
-            "base_min_size", "quote_min_size", "volume_24h", "approximate_quote_24h_volume")
+            "base_min_size", "quote_min_size", "volume_24h", "approximate_quote_24h_volume",
+            # inputs of the spot allowlists (spec sez. 4.1.6): the values seen here define SPOT_VENUES
+            "product_type", "product_venue", "future_product_details", "base_currency_id",
+            "quote_currency_id", "cancel_only", "view_only")
     out = {k: p.get(k) for k in keys}
 
     book = as_dict(client.get_public_product_book(product_id=product_id, limit=1))

@@ -111,6 +111,8 @@ def test_secrets_in_yaml_are_rejected(tmp_path: Path) -> None:
         ({"dry_run": {"learner": {"run_at_utc": "25:00"}}}, "run_at_utc"),
         ({"sentiment": {"sources": [{"name": "x", "kind": "rss", "interval_s": 30}]}}, "needs a url"),
         ({"decision": {"backend": "gpt"}}, r"decision\.backend"),
+        ({"risk": {"max_order_quote": 0}}, r"risk\.max_order_quote"),
+        ({"execution": {"balance_refresh_s": 60}}, r"execution\.balance_refresh_s"),
     ],
 )
 def test_validation_errors_are_readable(tmp_path: Path, override: dict[str, Any], fragment: str) -> None:
@@ -181,3 +183,12 @@ def test_resolve_mode_truth_table(cfg_mode: str, env: dict[str, str], expected: 
 
 def test_default_execution_mode_is_dry() -> None:
     assert resolve_mode(ExecutionConfig(), {LIVE_CONFIRM_ENV: CONFIRM}) == "dry"
+
+
+def test_coverage_settings_defaults_and_no_off_switch() -> None:
+    cfg = AppConfig()
+    assert cfg.risk.max_order_quote == 50
+    assert cfg.execution.balance_refresh_s * 3 <= 120  # at least three refresh attempts before the guard fails closed
+    # C11: the balance guard, the spot registry and the order whitelist cannot be turned off from the config
+    names = {n.lower() for section in (cfg.risk, cfg.execution) for n in type(section).model_fields}
+    assert not any(w in n for n in names for w in ("guard", "whitelist", "leverage", "margin", "disable_coverage"))

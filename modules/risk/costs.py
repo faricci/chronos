@@ -14,12 +14,13 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Literal
+from typing import Final, Literal
 
 import structlog
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from modules.config import AppConfig, FallbackFees
+from modules.execution.rounding import ceil_to, floor_to
 
 log = structlog.get_logger(__name__)
 
@@ -262,3 +263,41 @@ def net_pnl_quote(
     entry_cost = entry_px * size * (1 + _frac(f_in_bps))
     exit_value = exit_px * size * (1 - _frac(f_out_bps))
     return exit_value - entry_cost
+
+
+# ------------------------------------------------------------------------------------ spot coverage
+# Absolute financial constraint C11 (spec sez. 4.1.6). These are RESERVATION formulas, not costs: they are
+# deliberately pessimistic upper bounds and never enter EV, labels or the fee floor.
+
+COVERAGE_FEE_FLOOR_BPS: Final = Decimal(120)  # hard-coded on purpose: a floor for the reservation, not config
+
+
+def coverage_fee_rate(fees: FeeRates, fallback: FallbackFees) -> Decimal:
+    """Fee rate (fraction) used to reserve quote for a BUY: an upper bound of any fill's fee rate."""
+    bps = max(Decimal(str(fees.taker_bps)), Decimal(str(fallback.taker_bps)), COVERAGE_FEE_FLOOR_BPS)
+    return bps / _BPS
+
+
+def required_quote(limit_price: Decimal, base_size: Decimal, fee_rate: Decimal, quote_increment: Decimal) -> Decimal:
+    """Quote that must be free to place a limit BUY, one increment of cushion included.
+
+    Valid whether the exchange holds only the notional or notional plus fee: both are <= this amount.
+    """
+    return ceil_to(limit_price * base_size * (1 + fee_rate), quote_increment) + quote_increment
+
+
+def max_base_for_quote(
+    quote: Decimal,
+    limit_price: Decimal,
+    fee_rate: Decimal,
+    quote_increment: Decimal,
+    base_increment: Decimal,
+) -> Decimal:
+    """Largest base size whose :func:`required_quote` fits in ``quote`` (inverse used by the sizing)."""
+    budget = floor_to(quote, quote_increment) - quote_increment
+    if budget <= 0:
+        return Decimal(0)
+    size = floor_to(budget / (limit_price * (1 + fee_rate)), base_increment)
+    while size > 0 and required_quote(limit_price, size, fee_rate, quote_increment) > quote:
+        size -= base_increment  # only reachable through Decimal division rounding
+    return max(size, Decimal(0))

@@ -58,6 +58,7 @@ risk:
   risk_per_trade: 0.005
   p_edge_full: 0.60
   max_position_frac: 0.20
+  max_order_quote: "50.00"            # absolute cap per order (sez. 4.1.2); rises with the ramp
   max_total_exposure_frac: 0.50
   min_net_edge_bps: 30
   ev_min_bps: 0
@@ -81,6 +82,9 @@ execution:
   reconcile_interval_s: 60
   fee_refresh_s: 3600
   product_meta_refresh_s: 3600
+  balance_refresh_s: 30               # <= 40: three attempts before BUYs fail closed (sez. 4.1.6)
+  entry_poll_s: 5
+  cancel_confirm_timeout_s: 10
 
 dry_run:
   db_path: "state/chronos_dry.db"

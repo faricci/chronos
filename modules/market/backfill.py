@@ -186,12 +186,22 @@ def fill_flat_bars(real: pd.DataFrame, start: datetime | None = None, end: datet
 
 
 def load_bars(
-    root: Path, product_id: str, start: datetime | None = None, end: datetime | None = None
+    root: Path,
+    product_id: str,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    *,
+    store_complete_until_end: bool = False,
 ) -> pd.DataFrame:
     """Complete 1m OHLCV frame (UTC ``ts`` index) for ``[start, end]``, flat bars included.
 
     ``root`` is ``<data_dir>/bars/1m``. Open bounds default to the stored range. The last real bar before
     ``start`` is used as the previous close so that a range starting inside a quiet stretch is still exact.
+
+    ``end`` is clamped to the last stored real bar: past it we cannot tell a quiet market from data that was
+    never downloaded, and inventing flat bars there would silently corrupt features and labels. Pass
+    ``store_complete_until_end=True`` only when the caller knows the store is complete up to ``end`` (the live
+    recorder), to get trailing flat bars.
     """
     store = BarStore(root)
     months = store.months(product_id)
@@ -209,6 +219,10 @@ def load_bars(
     real = pd.concat(frames).drop_duplicates("ts").sort_values("ts")
     if end is not None:
         real = real[real["ts"] <= pd.Timestamp(end)]
+    if real.empty:
+        return fill_flat_bars(real)
+    if end is not None and not store_complete_until_end:
+        end = min(end, real["ts"].iloc[-1].to_pydatetime())
     return fill_flat_bars(real.reset_index(drop=True), start, end)
 
 

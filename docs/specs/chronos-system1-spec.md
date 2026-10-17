@@ -1,6 +1,6 @@
 # Chronos v2 — Specifica Tecnica "System 1" Decision Architecture
 
-Versione: 2.3-draft | Data: 2026-10-17 | Stato: proposta per implementazione
+Versione: 2.4-draft | Data: 2026-10-17 | Stato: proposta per implementazione
 Target implementatore: Sonnet 5.5 (ogni blocco "Linee Guida" e' scritto per essere usato come prompt diretto)
 
 Changelog 2.1: perimetro infrastrutturale a costo zero (locale, CPU-only, AWS fuori scope); nuova sez. 5 "Dry Run"; piano di rilascio riscritto; la sandbox Coinbase e' statica e non viene piu' usata per validare i payload.
@@ -22,6 +22,14 @@ Changelog 2.3 (risoluzione del conflitto sul CostModel):
 - tabella dei lift della sez. 0.4 ricalcolata con `CostModel` (righe 1h e 6h);
 - EV a due esiti dichiarato limite inferiore dell'EV reale (sez. 0.3); `tune_policy` valuta le soglie con il backtest completo (sez. 3.1.6, 3.5); diagnostica VERTICAL nello studio di fattibilita' (sez. 3.1.3).
 
+Changelog 2.4 (vincoli finanziari assoluti):
+- nuovo vincolo C11 (solo spot, copertura totale, nessun debito) e nuova sez. 4.1.6 "Copertura spot" (`BalanceBook`, `BalanceGuard`, `CoverageTicket`);
+- bracket sempre standalone dopo lo stato terminale dell'ingresso; `attached_order_configuration` non piu' usato;
+- `size_cap` (4.1.2) calcolato con la formula di copertura invece del cuscinetto 0.98; nuovo cap `risk.max_order_quote`;
+- arrotondamento del limite d'ingresso prima di SL/TP e del sizing (4.1.3);
+- riconciliazione dei saldi con regola `epoch` e staleness fail-closed per i BUY (4.1.5);
+- `VirtualAccount` compone lo stesso `BalanceBook` del live (5.3).
+
 ---
 
 ## 0. Vincoli trasversali (leggere prima di ogni sezione)
@@ -40,6 +48,7 @@ Questi vincoli valgono per tutte le sezioni. Sono il motivo di molte scelte che 
 | C8 | **Costo zero nella fase attuale.** L'infrastruttura AWS e' fuori scope di questa specifica e verra' progettata separatamente. | Tutto gira in Docker sulla macchina locale. Nessun servizio a pagamento (niente API LLM, niente GPU cloud, niente feed news a pagamento). Il codice resta **cloud-ready** senza dipendere da AWS: configurazione da env, segreti solo da env, container stateless salvo i volumi `data/` e `models/`, storage dietro interfacce (`NewsStore`, `PositionLedger`, `ModelRegistry`) cosi' che SQLite/filesystem possano essere sostituiti in seguito senza toccare la logica. Vietato importare `boto3` o SDK cloud in questa fase. |
 | C9 | **Dry mode di default.** Il bot deve poter girare in produzione senza inviare ordini reali, simulando gli esiti sul flusso di mercato reale. | `execution.mode: dry` e' il default. Il passaggio a `live` richiede una conferma esplicita (sez. 5). Pipeline unica: in dry cambia solo l'implementazione iniettata dell'`ExecutionGateway`. |
 | C10 | **Micro-capitale.** Il live parte con ordini minimi e cresce solo dopo evidenza netta di fee. | Le size sono vincolate da `base_min_size`/`quote_min_size` del prodotto (lette dall'API, mai hardcoded). Rampa di capitale a gradini con gate (sez. 5.1.7). Le fee sono percentuali, quindi gli ordini piccoli non peggiorano il costo in %, ma al tier di volume piu' basso le fee sono le piu' alte: ogni trade deve superare il fee floor della sez. 4.1. |
+| C11 | **Solo spot, copertura totale, nessun debito** (vincoli finanziari assoluti di CLAUDE.md). Vietati futures, margin, opzioni, leva. Ogni ordine e' coperto al 100% dal saldo reale; nessuna logica puo' rendere negativo un saldo. | Registro spot all'avvio (`product_type == "SPOT"`), whitelist del body d'ordine, nessun endpoint futures/perpetuals nel wrapper (`SpotViolation`, exit code 4). Ogni ordine passa da `BalanceGuard.authorize()` (sez. 4.1.6), che verifica in memoria `saldo disponibile >= importo + fee` e prenota l'importo; senza `CoverageTicket` nessun ordine puo' essere inviato, in live come in dry. Guard non disattivabile da config. Rischio massimo di un ordine = sua riserva. |
 
 ### 0.1 Difetti del codice attuale da NON riportare nella v2
 
@@ -946,25 +955,29 @@ Decision(BUY, p_edge, regime, conf)            # regime gia' ammesso dalla Decis
    -> RiskManager[book].plan_entry()
         1. quote: best_bid/best_ask/spread dal LocalOrderBook; product meta (increments, min size) cache 1h
         2. fees: FeeProvider (transaction summary, cache 1h)
-        3. A = ATR_14_<atr_tf>(t) dal label_config; entry_ref = best_bid (maker) | best_ask (taker)
-        4. SL = entry_ref - k_sl * A ; TP = entry_ref + k_tp * A           (k da label_config)
+        3. A = ATR_14_<atr_tf>(t) dal label_config; entry = floor_to(best_bid, quote_increment) (maker)
+                                                       | ceil_to(best_ask, quote_increment) (taker)
+        4. SL = entry - k_sl * A ; TP = entry + k_tp * A                  (k da label_config; arrotondati come 4.1.3)
         5. costs = CostModel(entry_mode, fees, spread)                    -> cost_tp, cost_sl (sez. 0.3)
         6. fee floor: tp_bps - cost_tp >= min_net_edge_bps                altrimenti SKIP(fee_floor)
         7. EV gate:   EV(p_edge) > ev_min_bps                              altrimenti SKIP(ev_negative)
-        8. sizing:    vedi 4.1.2                                          eventuale SKIP(below_min_size)
+        8. sizing:    vedi 4.1.2 (cap di copertura, sola lettura del BalanceBook)  eventuale SKIP(below_min_size)
         9. KillSwitch.check(book)                                          SKIP(kill_switch) se attivo
    -> OrderIntent (Decimal, gia' arrotondati agli increment)
    -> ExecutionGateway[book].submit_entry_with_bracket()
-        maker: limit_limit_gtc post_only=true al best_bid + attached trigger_bracket_gtc
-        taker: limit_limit_gtc al best_ask (marketable) + attached trigger_bracket_gtc
-        timeout ingresso (maker 30 min, taker 20 s) -> cancel residuo
+        BalanceGuard.authorize(BUY limit)                  SKIP(insufficient_balance | balance_stale | kill_switch)
+        maker: limit_limit_gtc post_only=true al best_bid ; taker: limit_limit_gtc al best_ask (marketable)
+        attesa dello stato terminale: FILLED, oppure timeout (maker 30 min, taker 20 s) -> cancel residuo -> conferma
+        filled > 0: LONG dal primo fill; al terminale BalanceGuard.authorize(SELL bracket, base_size = filled posseduto)
+                    -> trigger_bracket_gtc standalone (sez. 4.1.6)
    -> fills -> PositionLedger[book]
-   -> Watchdog: prezzo oltre lo SL di 1 x ATR_1h e posizione ancora aperta -> uscita d'emergenza
+   -> Watchdog: posizione con bracket: prezzo oltre lo SL di 1 x ATR_1h -> uscita d'emergenza
+                posizione senza bracket (finestra d'ingresso): prezzo <= SL -> uscita d'emergenza
 ```
 
 Ingresso maker: se l'exchange rifiuta il post-only perche' il prezzo nel frattempo incrocerebbe il book, l'intent viene ricalcolato al minuto successivo (nessun retry immediato). Un solo ingresso pendente per (book, prodotto) (sez. 0.6).
 
-Decision(SELL) su posizione LONG: cancella il bracket attivo, poi chiude con limit marketable `sell` a `best_bid` con timeout e fallback a `market_market_ioc`.
+Decision(SELL) su posizione LONG: cancella il bracket attivo e attende la conferma terminale (nessun rilascio ottimistico della base), poi chiude con limit marketable `sell` a `best_bid` con timeout e fallback a `market_market_ioc`. Ogni ordine della sequenza passa dal `BalanceGuard` (sez. 4.1.6).
 
 #### 4.1.1 Dove interviene "la volatilita' calcolata dall'AI"
 
@@ -986,13 +999,16 @@ Estensione v2.1 (opzionale): `k` dipendenti dal regime, ma solo con label genera
 #### 4.1.2 Position sizing
 
 ```
-equity          = quote_available + sum(mark_to_market posizioni del book)   # live: accounts API, cache 60 s; dry: VirtualAccount
+equity          = BalanceBook.total(quote) + sum(mark_to_market posizioni del book)   # in memoria, live e dry (sez. 4.1.6)
 risk_frac       = risk.risk_per_trade                                        # es. 0.005 = 0.5% equity
 scale_p         = clip((p_edge - p_edge_min) / (p_edge_full - p_edge_min), 0, 1)
 risk_eur        = equity * risk_frac * scale_p * m_reg
 loss_per_unit   = (entry - SL) + entry * cost_sl / 1e4                       # perdita per unita' a SL, fee e slippage inclusi
 size_raw        = risk_eur / loss_per_unit
-size_cap        = min(equity * max_position_frac, quote_available * 0.98) / entry
+f_cov           = coverage_fee_rate(fees, fallback_fees)                      # sez. 4.1.6, non e' un costo
+notional_cap    = min(equity * max_position_frac, max_order_quote) / entry
+cover_cap       = max_base_for_quote(BalanceBook.free(quote), entry, f_cov, quote_increment, base_increment)
+size_cap        = floor_to(min(notional_cap, cover_cap), base_increment)
 size            = floor_to_increment(min(size_raw, size_cap), base_increment)
 min_size        = max(base_min_size, ceil_to_increment(quote_min_size / entry, base_increment))
 if size < min_size:
@@ -1002,9 +1018,13 @@ if size < min_size:
         SKIP(reason="below_min_size")
 ```
 
+`entry` e' il prezzo limite gia' arrotondato (sez. 4.1.3). Il sizing usa le formule di copertura della sez. 4.1.6 solo per non produrre ordini che il guard rifiuterebbe; l'autorita' finale resta `BalanceGuard.authorize()`. `max_order_quote` (config `risk`, default 50 EUR) e' un cap assoluto per ordine che sale con la rampa (sez. 5.1.7).
+
 Esempio (sez. 0.3, book da 100 EUR, `p_edge_min` = 0.44, `p_edge_full` = 0.60, `p_edge` = 0.52, regime normal): `scale_p` = 0.5, `risk_eur` = 0.25 EUR, `loss_per_unit` = 8.46 + 1.81 = 10.27 EUR/SOL, `size` = 0.024 SOL (2.21 EUR di controvalore, sopra il minimo di 1 EUR). Con capitali piccoli e stop larghi (ATR giornaliero) le posizioni sono di pochi euro: e' voluto, e' la fase R0/R1 della sez. 5.1.7.
 
 #### 4.1.3 Arrotondamenti (Decimal, mai float in questo layer)
+
+Ordine: il prezzo limite d'ingresso si arrotonda per primo; SL, TP, costi, sizing e copertura si calcolano sul prezzo arrotondato.
 
 | Valore | Regola | Motivo |
 |--------|--------|--------|
@@ -1026,13 +1046,38 @@ Vincoli di validazione prima dell'invio: `SL < entry < TP`; `(TP-entry) >= 2 * q
 | Stale data | Globale | Ultima barra o ultimo ticker piu' vecchio di 90 s | Nessun ingresso in nessun book; i bracket esistenti restano. |
 | Decider health | Globale | > 20% di decisioni in fallback nell'ultima ora, oppure tasso di incoerenza action/edge > soglia | Passa a baseline o HOLD-only (config). |
 | Drift | Globale | PSI > 0.25 su `edge.noul` o sulle feature principali rispetto alla finestra di training | Alert + HOLD-only. |
-| Watchdog SL | Per posizione | `last_price <= SL - 1 x ATR_1h` e posizione ancora aperta dopo 10 s | Cancella bracket, `market_market_ioc` sell (in dry: walk dei bid). La doc Coinbase dichiara che l'esecuzione della protezione downside non e' garantita in alta volatilita'. |
+| Watchdog SL | Per posizione | Posizione con bracket: `last_price <= SL - 1 x ATR_1h` e posizione ancora aperta dopo 10 s. Posizione senza bracket (finestra d'ingresso o bracket rifiutato): `last_price <= SL`. | Cancella bracket, `market_market_ioc` sell (in dry: walk dei bid). La doc Coinbase dichiara che l'esecuzione della protezione downside non e' garantita in alta volatilita'. |
+| Coverage breach | Book | `reservation_overdraw`, `hold_exceeds_reservation`, oppure >= 3 `balance_drift` in 24 h (sez. 4.1.6) | Blocca i BUY del book fino a reset manuale; le uscite restano attive. |
 
 #### 4.1.5 Riconciliazione
 
-- Avvio: legge account, ordini aperti (`list_orders` con `order_status=OPEN`) e fill recenti; ricostruisce il ledger; un ordine con `client_order_id` di Chronos senza record locale viene importato; una posizione senza bracket attivo riceve un bracket standalone `trigger_bracket_gtc` sell.
-- Runtime: canale WS `user` per gli aggiornamenti degli ordini; polling REST di sicurezza ogni 60 s.
-- Idempotenza: `client_order_id = uuid5(NAMESPACE_CHRONOS, f"{decision_id}:{leg}")`. Un retry di rete non crea mai un secondo ordine.
+- Avvio: legge account (`get_accounts`: `available_balance`, `hold`), ordini aperti (`list_orders` con `order_status=OPEN`) e fill recenti; ricostruisce il ledger e il `BalanceBook`: per ogni ordine Chronos aperto ripristina la riserva (`BUY`: `required_quote(limit, leaves_size)`; `SELL`: `leaves_size`), poi applica lo snapshot. Un ordine con `client_order_id` di Chronos senza record locale viene importato; una posizione senza bracket attivo riceve un bracket standalone `trigger_bracket_gtc` sell con `base_size = floor_to(min(base_qty, sellable))`, oppure diventa dust se sotto il minimo vendibile.
+- Runtime ordini: canale WS `user` per gli aggiornamenti degli ordini e dei fill (aggiornano subito `BalanceBook`); `get_order` ogni `entry_poll_s` per l'ingresso non terminale; polling REST di sicurezza ogni `reconcile_interval_s`.
+- Runtime saldi: `LiveBalanceFeed` ogni `balance_refresh_s` (default 30 s) legge saldi e ordini aperti; lo snapshot viene scartato se il `BalanceBook` ha cambiato `epoch` durante la lettura; se accettato, `free = max(available - (reserved - H_credit), 0)` per valuta, con `H_credit = min(hold, reserved)` senza ordini estranei sulla valuta e `0` altrimenti. Drift fra totale locale e totale dell'exchange oltre `max(2 x increment, 1e-4 x totale)`: allarme `balance_drift`, il valore dell'exchange prevale. Il canale WS `user` non porta saldi spot.
+- Idempotenza: `client_order_id = uuid5(NAMESPACE_CHRONOS, f"{decision_id}:{leg}")`. Un retry di rete non crea mai un secondo ordine; un errore ambiguo lascia la riserva in stato UNKNOWN finche' la riconciliazione non trova o esclude l'ordine (rilascio dopo 2 cicli senza riscontro).
+
+#### 4.1.6 Copertura spot (vincolo C11)
+
+Componenti (`modules/execution/`): `BalanceBook` (saldi in memoria per book), `BalanceGuard` (unica autorita' di copertura), `CoverageTicket` (capacita' d'invio), `SpotRegistry` e `build_order_body` (divieto di leva). Formule in `modules/risk/costs.py` (sez. 0.3).
+
+Formule (Decimal):
+
+```
+f_cov          = max(f_t corrente, f_t fallback, 120 bps)            # tetto di prenotazione, non un costo
+required_quote = ceil_to(limit_price * base_size * (1 + f_cov), quote_increment) + quote_increment     # BUY
+required_base  = base_size                                                                           # SELL
+sellable       = min(position.base_qty - reserved_sell_base(book, product), free(base))
+BUY ammesso  se  free(quote) >= required_quote ; SELL ammessa se sellable >= base_size
+```
+
+Regole:
+1. Ogni ordine, live o shadow, e' inviabile solo con un `CoverageTicket` emesso da `BalanceGuard.authorize()`, che verifica e prenota nello stesso passo sincrono (nessuna chiamata di rete, nessun `await`). Il body JSON e' costruito dal ticket con `build_order_body`.
+2. BUY: solo `limit_limit_gtc`. Rifiutato se il saldo e' insufficiente (`insufficient_balance`), se l'ultimo snapshot dei saldi ha piu' di 120 s (`balance_stale`, solo live) o se `coverage_breach` e' attivo. SELL: `limit_limit_gtc`, `trigger_bracket_gtc`, `market_market_ioc`, solo su base posseduta da Chronos; mai bloccata dall'eta' dello snapshot.
+3. Riserve: al fill BUY si consuma `p*q + fee`, al terminale si rilascia il residuo; al fill SELL si consuma `q`. Nessun rilascio ottimistico: una cancellazione libera la riserva solo alla conferma terminale dell'exchange.
+4. Bracket: sempre standalone, piazzato dopo lo stato terminale dell'ingresso con `base_size = floor_to(min(filled, sellable), base_increment)`. Sotto il minimo vendibile (`base_min_size`, `quote_min_size`) la quantita' resta come dust e si fonde nel bracket dell'ingresso successivo sullo stesso prodotto.
+5. Rischio massimo di un ordine = sua riserva: la spesa d'ingresso non supera `required_quote` e il valore d'uscita non e' mai negativo.
+6. Non disattivabile: nessuna chiave di config; stesso codice in live, dry, backtest (`VirtualAccount` compone un `BalanceBook`). Violazioni di whitelist o prodotto non spot: `SpotViolation`, exit code 4.
+7. Verifiche continue delle ipotesi sull'exchange: `hold > reserved` senza ordini estranei, riserva consumata oltre il prenotato, drift ripetuti -> `coverage_breach` (sez. 4.1.4).
 
 ### 4.2 Struttura dei Dati / Schema JSON
 
@@ -1058,7 +1103,7 @@ Vincoli di validazione prima dell'invio: `SL < entry < TP`; `(TP-entry) >= 2 * q
 
 Tutti i numeri sono quelli dell'esempio di riferimento della sez. 0.3 e della sez. 4.1.2.
 
-**Payload Coinbase — ingresso con TP/SL allegato** (`POST /api/v3/brokerage/orders`):
+**Payload Coinbase — ingresso** (`POST /api/v3/brokerage/orders`):
 
 ```json
 {
@@ -1067,20 +1112,17 @@ Tutti i numeri sono quelli dell'esempio di riferimento della sez. 0.3 e della se
   "side": "BUY",
   "order_configuration": {
     "limit_limit_gtc": {"base_size": "0.024", "limit_price": "92.03", "post_only": true}
-  },
-  "attached_order_configuration": {
-    "trigger_bracket_gtc": {"limit_price": "108.96", "stop_trigger_price": "83.57"}
   }
 }
 ```
 
 Con `entry_mode: taker` cambiano solo `limit_price` (best ask, arrotondato per eccesso) e `post_only: false`.
 
-Note dalla documentazione Coinbase: nell'ordine allegato **non** si specifica la size (eredita quella dell'ordine originario); quando un fill avviene su uno dei due livelli l'altro lato viene disattivato automaticamente. La doc mostra l'esempio con `limit_limit_gtc`: il supporto con `market_market_ioc` come ordine originario non e' documentato, e la v2 non lo usa. Da verificare col primo ordine reale (o con `orders/preview`): che l'attached bracket sia accettato anche con `post_only: true`; in caso contrario si usa il percorso a due passi (bracket standalone dopo il fill).
+L'attached bracket (`attached_order_configuration`) non e' usato in v2.4: la sua semantica su fill parziali non e' verificata e un bracket piu' grande della quantita' fillata potrebbe vendere base non di Chronos (C11). Si potra' reintrodurre solo con una nuova versione della spec, dopo verifica documentata del comportamento su fill parziale.
 
-**Validazione dei payload:** la sandbox Advanced Trade (`api-sandbox.coinbase.com`) restituisce solo risposte statiche predefinite e non valida i payload, quindi non serve a verificare l'accettazione dell'attached bracket. La validazione avviene in due modi: (1) `POST /api/v3/brokerage/orders/preview` in produzione con lo stesso body, che non crea ordini (verificare quale permesso della API key richiede: se richiede `trade`, in dry mode resta disattivato, sez. 5); (2) il primo ordine reale della fase live-micro (sez. 5.1.7).
+**Validazione dei payload:** la sandbox Advanced Trade (`api-sandbox.coinbase.com`) restituisce solo risposte statiche predefinite e non valida i payload, quindi non serve a verificare l'accettazione dei payload. La validazione avviene in due modi: (1) `POST /api/v3/brokerage/orders/preview` in produzione con lo stesso body, che non crea ordini (verificare quale permesso della API key richiede: se richiede `trade`, in dry mode resta disattivato, sez. 5); (2) il primo ordine reale della fase live-micro (sez. 5.1.7).
 
-**Payload Coinbase — bracket standalone** (fallback a due passi, e riconciliazione):
+**Payload Coinbase — bracket standalone** (percorso unico e riconciliazione):
 
 ```json
 {
@@ -1100,6 +1142,7 @@ CREATE TABLE IF NOT EXISTS positions (
   book TEXT NOT NULL, product_id TEXT NOT NULL, side TEXT NOT NULL CHECK (side IN ('FLAT','LONG')),
   base_qty TEXT NOT NULL, avg_entry TEXT, opened_at TEXT, entry_decision_id TEXT,
   bracket_order_id TEXT, tp TEXT, sl TEXT, k_tp REAL, k_sl REAL, atr_at_entry TEXT,
+  dust_qty TEXT NOT NULL DEFAULT '0', dust_cost TEXT NOT NULL DEFAULT '0',
   PRIMARY KEY (book, product_id)
 );
 CREATE TABLE IF NOT EXISTS orders (
@@ -1128,6 +1171,7 @@ risk:
   risk_per_trade: 0.005
   p_edge_full: 0.60
   max_position_frac: 0.20
+  max_order_quote: "50.00"                # cap assoluto per ordine (sez. 4.1.2); sale con la rampa
   max_total_exposure_frac: 0.50
   min_net_edge_bps: 30
   ev_min_bps: 0
@@ -1150,6 +1194,9 @@ execution:
   reconcile_interval_s: 60
   fee_refresh_s: 3600
   product_meta_refresh_s: 3600
+  balance_refresh_s: 30                   # <= 40 (BALANCE_MAX_AGE_S / 3), sez. 4.1.6
+  entry_poll_s: 5
+  cancel_confirm_timeout_s: 10
 ```
 
 ### 4.3 Linee Guida per l'implementazione in Sonnet 5.5
@@ -1159,15 +1206,14 @@ execution:
 > Implementa `modules/risk/`, `modules/execution/`, `modules/ledger/` e l'orchestratore `modules/app.py` di Chronos v2. Python 3.12, asyncio, pydantic v2, `decimal.Decimal` con contesto a 28 cifre per **tutti** i prezzi e le size di questo layer (conversione da float solo tramite `Decimal(str(x))`).
 >
 > 1. `modules/config.py` — sostituisce `modules/utils.load_config`: `pydantic-settings` con modelli `SentimentConfig`, `DecisionConfig`, `RiskConfig`, `ExecutionConfig`, `CoinbaseConfig`; i segreti vengono **solo** da variabili d'ambiente (`COINBASE_API_KEY`, `COINBASE_API_SECRET`, `DECIDER_API_KEY`, `CRYPTOPANIC_TOKEN`), mai dal YAML. Validazione all'avvio; errori di config = exit code 2 con messaggio leggibile.
-> 2. `modules/execution/exchange.py` — `CoinbaseExchange`, wrapper async attorno a `coinbase.rest.RESTClient` (chiamate sincrone in `asyncio.to_thread`). Metodi: `get_product(product_id) -> ProductMeta` (`base_increment`, `quote_increment`, `base_min_size`, `quote_min_size`), `get_fee_rates() -> FeeRates` (da `get_transaction_summary`, campi del fee tier maker/taker), `get_best_bid_ask(product_id)`, `create_order(body: dict) -> CreateOrderResult`, `cancel_orders(order_ids)`, `list_open_orders()`, `get_fills(order_id)`, `get_accounts()`. Per `create_order` con `attached_order_configuration`: verifica con un test di introspezione se `RESTClient.create_order` della versione installata accetta il parametro; se no, usa `client.post("/api/v3/brokerage/orders", data=body)`. Gestisci `success: false` + `error_response` trasformandoli in `OrderRejected(reason, message)`. Rate limiting con `aiolimiter.AsyncLimiter` (configurabile, default 20 req/s privati).
+> 2. `modules/execution/exchange.py` — `CoinbaseExchange`, wrapper async attorno a `coinbase.rest.RESTClient` (chiamate sincrone in `asyncio.to_thread`). Metodi: `get_product(product_id) -> ProductMeta` (`base_increment`, `quote_increment`, `base_min_size`, `quote_min_size`), `get_fee_rates() -> FeeRates` (da `get_transaction_summary`, campi del fee tier maker/taker), `get_best_bid_ask(product_id)`, `create_order(ticket: CoverageTicket) -> CreateOrderResult`, `cancel_orders(order_ids)`, `list_open_orders()`, `get_fills(order_id)`, `get_accounts()`, `get_api_key_permissions()`. I metodi del `RESTClient` usabili sono limitati all'allowlist della sez. 4.1.6. Gestisci `success: false` + `error_response` trasformandoli in `OrderRejected(reason, message)`. Rate limiting con `aiolimiter.AsyncLimiter` (configurabile, default 20 req/s privati).
 > 3. `modules/execution/rounding.py` — `floor_to(x, inc)`, `ceil_to(x, inc)` con `Decimal.quantize`/divisione intera; test property-based con `hypothesis` (il risultato e' multiplo dell'increment ed entro un increment dall'input, nella direzione corretta).
 > 4. `modules/risk/sizing.py` — funzione pura `compute_size(...) -> SizingResult | SkipReason` secondo la sez. 4.1.2. Test con `hypothesis`: la perdita a SL (incluse le fee) non supera mai `risk_eur` + un increment.
 > 5. `modules/risk/risk_manager.py` — `RiskManager.plan_entry(decision, market, position) -> OrderIntent | Skip` implementa i passi 1–9 della sez. 4.1 e l'arrotondamento della sez. 4.1.3. Un'istanza per book (sez. 0.6). Legge `k_tp`, `k_sl`, `atr_tf`, `entry_mode`, `horizon_min` dal `label_config` del modello champion caricato all'avvio (e ricaricato allo swap notturno della sez. 5.1.6); se il `label_config` manca, rifiuta di avviarsi. Tutti i costi passano da `modules/risk/costs.py` (`CostModel`, `FeeProvider`, sez. 0.3): scrivi questo file per primo, con test che riproducono esattamente i numeri dell'esempio di riferimento della sez. 0.3 e della sez. 4.1.2. `plan_exit(decision, position) -> ExitIntent`. Ogni `Skip` ha un `reason` enumerato e viene loggato nel `DecisionRecord`.
 > 6. `modules/risk/kill_switch.py` — `KillSwitch` con le guardie della sez. 4.1.4, separate in `AccountGuards` (un'istanza per book) e `SystemGuards` (una sola istanza, condivisa). Stato persistito nella tabella `kill_switch_state` del DB della modalita' del book (sez. 0.6), cosi' sopravvive al riavvio del container; `check(book) -> KillState` combina le guardie del book con quelle globali.
 > 7. `modules/execution/gateway.py` — `ExecutionGateway(Protocol)` con `submit_entry_with_bracket`, `submit_exit`, `emergency_exit`, `cancel`; questa sezione implementa `LiveExecutionGateway`, la sez. 5 implementa `ShadowExecutionGateway` con la stessa interfaccia. `LiveExecutionGateway`:
->    - `submit_entry_with_bracket(intent)`: costruisce il payload JSON della sez. 4.2 (stringhe Decimal), `client_order_id` deterministico `uuid5`, invia, registra in `orders`; avvia un task di timeout che dopo `entry_timeout_s` cancella il residuo non fillato;
->    - se l'exchange rifiuta l'attached bracket (feature non disponibile per il prodotto), passa al percorso a due passi: ingresso limit, poi, al fill (evento dal canale `user`), bracket standalone `trigger_bracket_gtc` SELL con `base_size` = quantita' effettivamente fillata;
->    - `submit_exit(intent)`: cancella il bracket attivo, attende la conferma della cancellazione (o lo stato terminale), limit marketable sell a `best_bid`, timeout, fallback `market_market_ioc`;
+>    - `submit_entry_with_bracket(intent)`: `BalanceGuard.authorize` (BUY), invio, registrazione in `orders`; attesa dello stato terminale (WS `user` + `get_order` ogni `entry_poll_s`); timeout `entry_timeout_s` -> cancel del residuo con conferma; al terminale, se `filled > 0`, `BalanceGuard.authorize` (SELL bracket) e bracket standalone `trigger_bracket_gtc` con `base_size` = quantita' fillata posseduta, oppure dust (sez. 4.1.6);
+>    - `submit_exit(intent)`: cancella il bracket attivo, attende la conferma della cancellazione (o lo stato terminale); se il bracket risulta FILLED non vende; ogni ordine della sequenza passa da `BalanceGuard`; poi limit marketable sell a `best_bid`, timeout, fallback `market_market_ioc`;
 >    - `emergency_exit(product_id)` usato dal watchdog.
 > 8. `modules/execution/user_stream.py` — WS canale `user` (autenticato) -> eventi `OrderUpdate` -> aggiornamento `orders`, `fills`, `positions`. Bridge thread->asyncio come per il market stream.
 > 9. `modules/execution/reconciler.py` — `Reconciler.on_startup()` e loop periodico secondo la sez. 4.1.5.
@@ -1175,13 +1221,14 @@ execution:
 > 11. `modules/ledger/positions.py` — `PositionLedger` su `aiosqlite`, DDL della sez. 4.2, tutte le mutazioni in transazione; `view(product_id) -> PositionView` usato dallo StateBuilder.
 > 12. `modules/app.py` — orchestratore: costruisce i servizi, `async with asyncio.TaskGroup() as tg:` avvia market stream, bar aggregator, sentiment service, decision engine, risk/execution consumer, user stream, reconciler, watchdog, metriche. Gestione `SIGTERM`/`SIGINT` (Docker stop): smette di aprire posizioni, attende le operazioni in volo fino a 10 s, chiude WS e DB; **non** cancella i bracket esistenti (le posizioni restano protette lato exchange). `main.py` diventa `asyncio.run(app.main())`.
 > 13. `docker-compose.yml`: dichiara il named volume `chronos-state` e montalo su `/app/state` nei servizi `chronos`, `test` e `dev` (sez. 0.5); porta il `Dockerfile` a `python:3.12-slim`. Aggiungi il servizio `decider` con `profiles: [gpu]` (non parte di default; `build: ./decider`, `deploy.resources.reservations.devices: [{driver: nvidia, count: 1, capabilities: [gpu]}]`, porta esposta solo sulla rete interna, volume `./models/decider:/models:ro`, healthcheck su `/healthz`). `chronos` **non** dichiara `depends_on` verso `decider`: se `decision.backend != baseline` e il decider non risponde, il `DecisionEngine` usa il fallback baseline (sez. 2.1.2). Sostituisci l'healthcheck fittizio attuale di `chronos` con uno che verifica l'eta' dell'ultimo heartbeat scritto su file (`data/heartbeat`) < 120 s. Su Windows il servizio GPU richiede Docker Desktop con backend WSL2 e driver NVIDIA recenti.
+> 14. `modules/execution/balance.py`, `balance_guard.py`, `spot.py`, `balance_feed.py` secondo la sez. 4.1.6, con i test property-based: nessun ordine con `required > available`, riserve e saldi mai negativi, conservazione di `free + reserved`.
 >
 > Test:
 > - `SimulatedExchange` (condiviso con `training/backtest.py`) per test end-to-end: decisione BUY -> intent -> payload -> fill simulato -> posizione LONG con bracket -> TP colpito -> posizione FLAT, PnL corretto al centesimo con fee;
 > - payload snapshot test: il JSON prodotto per l'intent della sez. 4.2 coincide con il fixture;
 > - kill switch: daily loss raggiunta blocca nuovi ingressi ma non le uscite;
 > - reconciler: posizione presente su exchange senza bracket -> viene creato il bracket standalone;
-> - test marcato `@pytest.mark.preview` (eseguito solo manualmente) che invia il payload della sez. 4.2 a `orders/preview` in produzione, verifica `errs` vuoto e registra nel log la risposta; un secondo caso con `market_market_ioc` + attached documenta se la combinazione e' accettata. Non usare la sandbox per questo: e' statica.
+> - test marcato `@pytest.mark.preview` (eseguito solo manualmente) che invia il payload della sez. 4.2 a `orders/preview` in produzione, verifica `errs` vuoto e registra nel log la risposta; Non usare la sandbox per questo: e' statica.
 
 ---
 
@@ -1231,7 +1278,8 @@ t0+L    primo evento level2/ticker successivo a t0 + latency_ms (latenza simulat
 t0+L..  per ogni market_trade: il resting si filla solo se il trade passa ATTRAVERSO il limit (prezzo < limit
           per BUY), quantita' massima = queue_haircut x volume scambiato oltre il limit; fee maker
 t0+T    entry_timeout_s: cancella il residuo; se fill = 0 -> ordine scaduto, nessuna posizione
-fill    VirtualPosition(LONG) + VirtualBracket(TP, SL) con size = quantita' fillata
+fill    VirtualPosition(LONG) dal primo fill; VirtualBracket(TP, SL) creato allo stato terminale dell'ingresso con
+        size = quantita' fillata (stessa regola del live, sez. 4.1.6); prima del bracket vale lo stop virtuale allo SL
 ...     per ogni market_trade / ticker: BracketSimulator.evaluate()
           TP: si filla se un trade stampa > TP (strettamente), haircut sulla quantita', fee maker
           SL: trigger se last_trade <= stop_trigger_price -> uscita modellata come vendita a mercato:
@@ -1466,7 +1514,7 @@ live_ramp:
   },
   "decisions": {"total": 4320, "BUY": 2, "SELL": 0, "HOLD": 4318,
                 "skip_reasons": {"fee_floor": 0, "ev_negative": 3, "regime_veto": 0, "below_min_size": 0,
-                                 "kill_switch": 0, "entry_pending": 41}},
+                                 "kill_switch": 0, "entry_pending": 41, "insufficient_balance": 0, "balance_stale": 0}},
   "labels": {"resolved_total": 0, "first_resolution_expected": "2026-10-27"},
   "parity": {"decision_match": 1.0, "max_feature_psi": 0.04, "worst_feature": "liquidity.vol_z_1d"},
   "costs": {"median_spread_bps": {"BTC-EUR": 3, "ETH-EUR": 2, "SOL-EUR": 3}, "fee_maker_bps": 60, "fee_taker_bps": 120,
@@ -1487,14 +1535,14 @@ live_ramp:
 > 2. `modules/config.py` (modifica) — `ExecutionConfig.mode: Literal["dry", "live"] = "dry"`; funzione `resolve_mode(cfg, env) -> Literal["dry","live"]` che ritorna `"live"` solo se `cfg.mode == "live"` **e** `env.get("CHRONOS_LIVE_CONFIRM") == "I_ACCEPT_REAL_ORDERS"`; altrimenti `"dry"` con warning. Test della tabella di verita' completa.
 > 3. `modules/market/orderbook.py` — `LocalOrderBook` per prodotto, alimentato dal canale `level2` (snapshot + update), lati in `sortedcontainers.SortedDict` (bid in ordine decrescente tramite chiave negata), metodi `best_bid()`, `best_ask()`, `mid()`, `spread_bps()`, `walk(side, size, limit) -> WalkResult(filled, vwap, levels_consumed)`. Verifica di integrita': se `best_bid >= best_ask` o il sequence number salta -> risottoscrive e marca il book `stale` finche' non arriva un nuovo snapshot; con book `stale` lo `ShadowExecutionGateway` rimanda i fill.
 > 4. `modules/dryrun/fill_model.py` — `FillModel` con le regole della sez. 5.1.3 in due facce: `TickFillModel` (input: `LocalOrderBook`, eventi `market_trades`) e `BarFillModel` (input: barre OHLCV), stessi parametri da `FillModelParams` (pydantic, caricabile da `fill_model.json`). `training/backtest.py` e il `SimulatedExchange` dei test della sez. 4.3 devono importare `BarFillModel` da qui; rimuovi ogni logica di fill duplicata.
-> 5. `modules/dryrun/virtual_account.py` — `VirtualAccount(book, starting_quote)`: saldi quote/base per asset, `reserve()`/`release()` per gli ordini aperti (un ordine shadow blocca il capitale come farebbe l'exchange), `apply_fill()`, `equity(mark_prices)`. Invariante testato con `hypothesis`: `quote + sum(base_i * price_i) + fees_pagate_cumulative == starting_quote + pnl_realizzato + pnl_non_realizzato` (tolleranza 1e-12).
+> 5. `modules/dryrun/virtual_account.py` — `VirtualAccount(book, starting_quote, clock)`: compone un `BalanceBook(book, source="virtual")` (sez. 4.1.6), stessa classe del live; riserve, fill e rilasci passano dal `BalanceGuard` e dal `BalanceBook`, nessuna logica di riserva propria. Espone `equity(mark_prices)`, `fees_paid`, `realized_pnl`. Invarianti testati con `hypothesis`: `quote + sum(base_i * price_i) + fees_pagate_cumulative == starting_quote + pnl_realizzato + pnl_non_realizzato` (tolleranza 1e-12); riserve e saldi mai negativi; `free + reserved` invariato da reserve/release.
 > 6. `modules/dryrun/shadow_gateway.py` — `ShadowExecutionGateway(book, account, fill_model, ledger, clock)` che implementa `ExecutionGateway(Protocol)` della sez. 4.3:
->    - `submit_entry_with_bracket(intent)`: registra un `ShadowOrder`, prenota il capitale, programma l'arrivo a `now + latency_ms`; al primo evento di book successivo esegue `walk` per la parte marketable; il residuo resta resting e viene valutato su ogni `market_trade`; timeout con `entry_timeout_s`;
+>    - `submit_entry_with_bracket(intent)`: registra un `ShadowOrder`, ottiene un `CoverageTicket` da `BalanceGuard.authorize` (stessa prenotazione del live), programma l'arrivo a `now + latency_ms`; al primo evento di book successivo esegue `walk` per la parte marketable; il residuo resta resting e viene valutato su ogni `market_trade`; timeout con `entry_timeout_s`;
 >    - al fill crea la posizione `LONG` nel `PositionLedger` dry (stesso schema della sez. 4.2) e un `VirtualBracket`;
 >    - `submit_exit`, `emergency_exit`: walk dei bid;
 >    - nessun `sleep` reale: tutto guidato dagli eventi di mercato e dal `Clock` iniettato (in replay e test il clock e' simulato).
 > 7. `modules/dryrun/bracket_sim.py` — `BracketSimulator.on_trade(trade)` e `on_book(book)` per tutte le posizioni virtuali aperte del prodotto: regole TP/SL/"stesso evento -> SL"; gestione del gap di dati come in sez. 5.1.3 (download delle candele del gap via `RESTClient.get_candles`, lettura consentita).
-> 8. `modules/dryrun/books.py` — `ShadowBookManager`: istanzia un `ShadowExecutionGateway` + `VirtualAccount` + ledger per ogni book in config; fa fan-out degli eventi di mercato verso tutti i book; per `random_entry` usa un `RandomDecider(seed)` che emette BUY con probabilita' pari alla frequenza giornaliera di BUY osservata nel champion (aggiornata ogni ora); per `buy_and_hold` un `BuyAndHoldDecider` che compra una volta sola. I decider dei book passano tutti dalla stessa `DecisionPolicy` e dallo stesso `RiskManager` (tranne `buy_and_hold`, che salta il RiskManager per costruzione).
+> 8. `modules/dryrun/books.py` — `ShadowBookManager`: istanzia un `ShadowExecutionGateway` + `VirtualAccount` + ledger per ogni book in config; fa fan-out degli eventi di mercato verso tutti i book; per `random_entry` usa un `RandomDecider(seed)` che emette BUY con probabilita' pari alla frequenza giornaliera di BUY osservata nel champion (aggiornata ogni ora); per `buy_and_hold` un `BuyAndHoldDecider` che compra una volta sola. I decider dei book passano tutti dalla stessa `DecisionPolicy` e dallo stesso `RiskManager` (tranne `buy_and_hold`, che salta il RiskManager per costruzione ma non il `BalanceGuard`: size = `max_base_for_quote(free(quote), ...)`).
 > 9. `modules/dryrun/recorder.py` — `WsRecorder`: scrive ogni messaggio WS grezzo con timestamp di ricezione in `data/ws_recordings/YYYY-MM-DD/<channel>-<product>.jsonl.gz` (scrittura in un thread dedicato con buffer, flush ogni 5 s, rotazione giornaliera, retention). `modules/dryrun/replay.py` — `ReplayMarketStream` con la stessa interfaccia di `CoinbaseMarketStream`, che rilegge le registrazioni con clock simulato: consente di rieseguire offline e in modo deterministico una settimana di dry run con parametri diversi (what-if a costo zero). Test: lo stesso replay eseguito due volte produce ledger identici byte per byte.
 > 10. `modules/dryrun/label_resolver.py` — task ogni 60 s: seleziona i `DecisionRecord` con `ts_bar_close + T_in + H <= now` (parametri dal `label_config` del modello che ha preso la decisione) non ancora risolti, carica le barre 1m dal Parquet locale (alimentato dal `BarAggregator` live e dal backfill incrementale), chiama `training.labeling.triple_barrier` e `forward_rv_bucket` (stesso codice del dataset storico), scrive `ResolvedLabel`. Idempotente (tabella `resolved` con `decision_id` PK).
 > 11. `modules/dryrun/learner.py` — `NightlyLearner` con gli step L0–L5 della sez. 5.1.6 e le rispettive frequenze (L0 e L4 ogni notte; L3, L1, L2, L5 il giorno `refit_day_of_month`), con soglie in `n_eff` (somma dei pesi di unicita' di `training/sampling.py`), eseguito con `asyncio.create_subprocess_exec(sys.executable, "-m", "modules.dryrun.learner", ...)` e `os.nice(10)` nel figlio dove supportato, per non rallentare il loop di trading. Ogni step controlla la propria soglia minima e, in sotto-soglia, registra `skipped: insufficient_samples` invece di produrre artefatti.
@@ -1526,7 +1574,7 @@ Perimetro: fase locale a costo zero (C8). L'infrastruttura cloud e il fine-tunin
 | P1 Fattibilita', dati e baseline | `training/feasibility.py` **per primo**; poi sez. 1 (sentiment live, in raccolta) + sez. 3 parte CPU: label triple-barrier, split purgati, `BaselineDecider` LightGBM, backtest con `BarFillModel`. | Lo studio di fattibilita' trova una combinazione con lift richiesto <= 0.10 (altrimenti stop, sez. 3.1.3); backtest walk-forward con PnL netto > 0 su >= 3/5 fold e sull'holdout. |
 | P2 Decision + Risk | Sez. 2 e sez. 4 completi, con `ShadowExecutionGateway` come unico gateway istanziabile. | Test e2e verdi; `test_dry_never_writes` verde. |
 | P3 Dry run | Sez. 5: book paralleli, label resolver, learner notturno, report. Esecuzione continua in locale. Etichettatura del sentiment (sez. 1.1.2) a meta' della prima settimana. | G-DRY-OPS superato (minimo 7 giorni). G-DRY-ECON continua a maturare. |
-| P4 Live-micro (R0) | Key con permesso Trade, `CHRONOS_LIVE_CONFIRM`, size minime, shadow twin + parity report. Primo ordine = validazione reale del payload con attached bracket post-only. | Condizioni R0 della sez. 5.1.7. |
+| P4 Live-micro (R0) | Key con permesso Trade, `CHRONOS_LIVE_CONFIRM`, size minime, shadow twin + parity report. Prima di P4: probe esteso con `product_type`, `product_venue`, `future_product_details`, `portfolio_type`, `can_transfer` (allowlist della sez. 4.1.6). Primo ordine = validazione reale dell'ingresso post-only e del bracket standalone. | Condizioni R0 della sez. 5.1.7. |
 | P5 Rampa | Gradini R1, R2, ... | R1 richiede G-DRY-ECON; poi condizioni per gradino, con discesa automatica in caso di violazioni. |
 | P6 (fuori scope) | Migrazione cloud, `chronos-decider` LLM fine-tuned su GPU, che entra come book `challenger` in dry prima di qualunque promozione. | Gate sez. 3.4 + G-DRY-OPS + regola L5. |
 

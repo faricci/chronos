@@ -319,3 +319,20 @@ def test_live_public_candles_parse() -> None:
     )
     df = candles_to_frame(raw(), sec(start), sec(end))
     assert len(df) > 0 and df["ts"].is_monotonic_increasing and (df["high"] >= df["low"]).all()
+
+
+def test_load_bars_does_not_invent_bars_past_the_stored_data(tmp_path: Path) -> None:
+    """A backfill still in progress must not look like a quiet market."""
+    store = BarStore(tmp_path)
+    store.write(PRODUCT, candles_to_frame([candle(T0), candle(T0 + timedelta(minutes=2))], sec(T0), sec(T0) + 600))
+    far = T0 + timedelta(days=3)
+    clamped = load_bars(tmp_path, PRODUCT, start=T0, end=far)
+    assert len(clamped) == 3 and clamped.index[-1] == pd.Timestamp(T0 + timedelta(minutes=2))
+    extended = load_bars(tmp_path, PRODUCT, start=T0, end=far, store_complete_until_end=True)
+    assert len(extended) == 3 * 24 * 60 + 1 and set(extended["volume"][3:]) == {0.0}
+
+
+def test_load_bars_start_after_all_stored_data_is_empty(tmp_path: Path) -> None:
+    store = BarStore(tmp_path)
+    store.write(PRODUCT, candles_to_frame([candle(T0)], sec(T0), sec(T0) + 60))
+    assert load_bars(tmp_path, PRODUCT, start=T0 + timedelta(hours=5), end=T0 + timedelta(hours=6)).empty

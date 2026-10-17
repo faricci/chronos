@@ -32,7 +32,8 @@ Branch: `reachitect/v2-opus55-spec` (resta questo; il rename a `v2` della sez. 0
   - [x] test con sorgente finta (26) + test `live` manuale; prova reale su BTC-EUR e SOL-EUR (6 h): 352/347 righe, seconda esecuzione +0 righe
 - [x] 4. Verifica: `pytest` 124 passati (1 `live` escluso di default, passato a mano), `mypy --strict` e `ruff` puliti sui file del modulo
 - [x] 5. Conflitto CostModel risolto da architetto-opus e applicato (vedi sotto)
-- [ ] 6. Aperti: verifica nel container Python 3.12 (Docker spento); backfill completo a 3 anni; `docker-compose.yml` con named volume `chronos-state`
+- [x] 6. `docker-compose.yml` con named volume `chronos-state` (chronos, test, dev)
+- [ ] 7. Aperti: verifica nel container Python 3.12 (Docker spento); esito del backfill completo a 3 anni (in corso)
 
 ## Vincoli per P1 (dalla risoluzione architetto-opus, spec v2.3)
 
@@ -54,3 +55,37 @@ Note per chi riprende:
 - Il backfill parte dall'ultimo minuto salvato: se un'interruzione cade in un tratto senza scambi e nulla e' ancora salvato, la ripartenza rifa' quelle finestre vuote (costo solo di tempo).
 - `ruff --fix` lanciato per errore su `modules/` ha toccato 8 file v1; ripristinati con `git checkout` (lezione in `tasks/lessons.md`). `git status` conferma che nessun file v1 e' modificato.
 - Non toccati: `docker-compose.yml`, `main.py`, moduli v1, `config/config.yml_template`.
+
+
+# Vincoli finanziari assoluti (CLAUDE.md) - copertura spot, 2026-10-17
+
+Risoluzione di architetto-opus in `docs/decisions/2026-10-17-copertura-spot.md`; spec portata a v2.4 (C11, sez. 4.1.6).
+Attenzione: la risoluzione ELIMINA l'attached bracket. Il bracket e' sempre standalone, dopo lo stato terminale dell'ingresso.
+
+## Fatto
+
+- [x] `modules/execution/rounding.py` (floor_to, ceil_to, is_multiple_of) + test hypothesis
+- [x] `modules/risk/costs.py`: `coverage_fee_rate`, `required_quote`, `max_base_for_quote` (T5, T6)
+- [x] `modules/config.py`: `risk.max_order_quote`, `execution.balance_refresh_s/entry_poll_s/cancel_confirm_timeout_s`; nessuna chiave disattiva il guard
+- [x] `modules/execution/orders.py` (ProductMeta, OrderSpec), `balance.py` (BalanceBook), `spot.py` (SpotRegistry, build_order_body, validate_body, permessi chiave), `balance_guard.py` (BalanceGuard, CoverageTicket)
+- [x] Test: unitari + property-based T1, T2, T3, T5, T6, T7, T8, T9, T10, T12, T16; mutation check: 6 bug introdotti a mano sono tutti intercettati
+- [x] `script/probe_coinbase.py` registra i campi per le allowlist (H5). Dati reali: `product_type=SPOT`, `product_venue=CBE`
+- [x] Spec v2.4: tutta la PARTE C applicata
+
+## Da fare (ordine B.3 dell'architetto)
+
+- [ ] `modules/risk/sizing.py` (T4: il sizing non produce mai un ordine che il guard rifiuta) -> `risk_manager.py`
+- [ ] `modules/dryrun/virtual_account.py` compone `BalanceBook("virtual")` (T17: parita' live/dry)
+- [ ] `modules/execution/exchange.py`: `create_order(ticket)`, allowlist dei metodi del client, `get_accounts() -> AccountSnapshot` (T11)
+- [ ] `gateway.py` / `shadow_gateway.py`: ordine E1-E4 e X1-X5 (T13, T14, T15), dust, stop virtuale
+- [ ] `balance_feed.py`, `reconciler.py`, `PositionCache` e colonne `dust_*` nel ledger, KillSwitch `coverage_breach`
+- [ ] T18: i costruttori dei gateway richiedono `BalanceGuard`
+- [ ] Prima di P4: eseguire il probe con la key View per confermare `portfolio_type` e `can_transfer` (H5)
+
+## Note di implementazione (deviazioni minime dalla risoluzione)
+
+- `OrderSpec` e `ProductMeta` stanno in `execution/orders.py`, non in `balance_guard.py`, per evitare un import circolare con `spot.py`.
+- `BalanceBook.apply_fill` accetta `trade_id` opzionale: lo stesso fill arriva da WS e da polling e va applicato una volta sola.
+- Un fill per un ordine senza riserva non modifica i saldi (non se ne conosce il lato): scatta solo l'allarme, il prossimo snapshot corregge.
+- Il drift non viene valutato sul primo snapshot (non c'e' un valore locale con cui confrontarlo).
+- `DEFAULT_SPOT_VENUES={"CBE"}` e `DEFAULT_PORTFOLIO_TYPES={"DEFAULT","CONSUMER"}`: il primo e' confermato dal probe, il secondo no.

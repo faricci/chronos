@@ -15,6 +15,9 @@ services:
       - ./data:/app/data
       # Mount model checkpoints
       - ./model_checkpoints:/app/model_checkpoints
+      # SQLite state lives on a named volume: WAL is not reliable on NTFS bind mounts (spec sez. 0.5)
+      - chronos-state:/app/state
+      - ./models:/app/models
     environment:
       - PYTHONUNBUFFERED=1
       - TZ=Europe/Rome
@@ -37,6 +40,7 @@ services:
       - ./data:/app/data
       - ./tests:/app/tests:ro
       - ./modules:/app/modules:ro
+      - chronos-state:/app/state
     environment:
       - PYTHONUNBUFFERED=1
     command: python -m unittest discover -s tests -v
@@ -52,6 +56,7 @@ services:
     volumes:
       # Mount entire project for live editing
       - .:/app
+      - chronos-state:/app/state
     environment:
       - PYTHONUNBUFFERED=1
     stdin_open: true
@@ -59,3 +64,6 @@ services:
     command: bash
     profiles:
       - dev  # Only run when explicitly requested
+
+volumes:
+  chronos-state:
