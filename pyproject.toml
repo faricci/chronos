@@ -7,9 +7,10 @@ requires-python = ">=3.12"
 testpaths = ["tests"]
 pythonpath = ["."]
 asyncio_mode = "auto"
-addopts = "-m \"not live\""
+addopts = "-m \"not live and not data\" -rs"
 markers = [
     "live: needs network access to Coinbase public endpoints (run manually)",
+    "data: needs the backfilled Parquet history, takes minutes (run for the P0 exit criterion)",
 ]
 
 [tool.mypy]
@@ -47,6 +48,13 @@ extend-exclude = [
     "main.py",
     "test.py",
     "script/train_timeseries_model.py",
+    "tests/test_data_fetch.py",
+    "tests/test_data_preprocessing.py",
+    "tests/test_monitoring.py",
+    "tests/test_order_execution.py",
+    "tests/test_sentiment_analysis.py",
+    "tests/test_trading_logic.py",
+    "tests/test_vector_storage.py",
     "utils",
 ]
 
@@ -54,5 +62,5 @@ extend-exclude = [
 select = ["E", "F", "I", "UP", "B"]
 
 [[tool.mypy.overrides]]
-module = ["coinbase.*"]
+module = ["coinbase.*", "sortedcontainers"]
 ignore_missing_imports = true

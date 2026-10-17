@@ -17,11 +17,13 @@ import threading
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 from coinbase.rest import RESTClient
 from coinbase.websocket import WSClient
 from pydantic import ValidationError
 
 from modules.config import CoinbaseConfig, FallbackFees
+from modules.market.indicators_batch import wilder_atr
 from modules.risk.costs import CostModel, FeeRates, round_bps
 
 # Barrier grid evaluated for the quick feasibility check, in ATR units of each timeframe
@@ -78,19 +80,14 @@ def get_candles(client, product_id, start, end, granularity):
 
 
 def atr_bps(candles, period=14):
-    """Wilder ATR on the given candles, in bps of the last close."""
-    trs, prev_close = [], None
-    for c in candles:
-        high, low, close = float(c["high"]), float(c["low"]), float(c["close"])
-        tr = high - low if prev_close is None else max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-        prev_close = close
-    if len(trs) < period:
+    """Wilder ATR in bps of the last close. The definition is modules.market.indicators_batch.wilder_atr
+    (SMA seed, TR_0 = H-L): the same one the features and the labels use (spec sez. 2.2.1.b)."""
+    if len(candles) < period:
         return None
-    atr = sum(trs[:period]) / period
-    for tr in trs[period:]:
-        atr = (atr * (period - 1) + tr) / period
-    return round(atr / prev_close * 1e4, 1)
+    high = np.array([float(c["high"]) for c in candles])
+    low = np.array([float(c["low"]) for c in candles])
+    close = np.array([float(c["close"]) for c in candles])
+    return round(float(wilder_atr(high, low, close, period)[-1] / close[-1] * 1e4), 1)
 
 
 def probe_history_depth(client, product_id):

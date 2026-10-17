@@ -320,3 +320,9 @@ def test_vertical_exit_is_never_worse_than_the_modelled_stop(
     r_bps = -sl + u * (tp + sl)  # vertical close strictly above lower, not above upper
     assert m.c_mkt_out <= m.c_sl_out
     assert m.cost_mkt - r_bps < m.sl_loss_bps(sl) + 1e-9
+
+
+def test_round_bps_accepts_numpy_scalars() -> None:
+    import numpy as np
+
+    assert round_bps(np.float64(196.5)) == 197  # type: ignore[arg-type]

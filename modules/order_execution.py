@@ -3,6 +3,15 @@ from modules.utils import get_logger
 
 logger = get_logger(__name__)
 
+# C11 (CLAUDE.md, vincoli finanziari assoluti): every order must be fully covered by real spot balance and must
+# pass BalanceGuard.authorize(). This v1 executor sends orders with no such check, so it is disabled. It is
+# replaced by modules/execution/ (exchange.py, gateway.py) and deleted together with it (spec sez. 0.5).
+# tests/test_c11_wiring.py fails if this block is removed or if a v2 module imports this file.
+raise RuntimeError(
+    "modules/order_execution.py (v1) is disabled: it places orders without the spot-coverage check (C11). "
+    "Use the v2 ExecutionGateway in modules/execution/."
+)
+
 """
 A class to handle the execution of different types of orders on a trading platform.
 Attributes:

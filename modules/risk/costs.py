@@ -38,7 +38,7 @@ def utc_now() -> datetime:
 
 def round_bps(x: float) -> int:
     """Round half up for display and persisted features (196.5 -> 197); ``round()`` would give 196."""
-    return int(Decimal(repr(x)).quantize(Decimal(1), rounding=ROUND_HALF_UP))
+    return int(Decimal(repr(float(x))).quantize(Decimal(1), rounding=ROUND_HALF_UP))  # float(): numpy scalars too
 
 
 # ----------------------------------------------------------------------------------------------- fees

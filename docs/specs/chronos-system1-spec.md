@@ -1,6 +1,6 @@
 # Chronos v2 — Specifica Tecnica "System 1" Decision Architecture
 
-Versione: 2.4-draft | Data: 2026-10-17 | Stato: proposta per implementazione
+Versione: 2.5-draft | Data: 2026-10-17 | Stato: proposta per implementazione
 Target implementatore: Sonnet 5.5 (ogni blocco "Linee Guida" e' scritto per essere usato come prompt diretto)
 
 Changelog 2.1: perimetro infrastrutturale a costo zero (locale, CPU-only, AWS fuori scope); nuova sez. 5 "Dry Run"; piano di rilascio riscritto; la sandbox Coinbase e' statica e non viene piu' usata per validare i payload.
@@ -29,6 +29,12 @@ Changelog 2.4 (vincoli finanziari assoluti):
 - arrotondamento del limite d'ingresso prima di SL/TP e del sizing (4.1.3);
 - riconciliazione dei saldi con regola `epoch` e staleness fail-closed per i BUY (4.1.5);
 - `VirtualAccount` compone lo stesso `BalanceBook` del live (5.3).
+
+Changelog 2.4.1 (allineamento all'implementazione, nessun cambio di comportamento):
+- `load_bars()` taglia `end` all'ultima barra reale salvata (0.5); nuovo `modules/market/timeframes.py` (2.3-A);
+- tipi condivisi in `modules/execution/orders.py`, fill idempotenti per `trade_id`, test di collegamento `tests/test_c11_wiring.py`, v1 `order_execution.py` disattivato (4.1.6).
+
+Changelog 2.5 (definizione esatta delle feature): nuova sez. 2.2.1.b (formule, minimi storici, unita'; serie HTF solo su barre chiuse; ancora unica dello storico); rimosso `liquidity.trades_z_1d` (non ricostruibile dallo storico OHLCV); `vol_z_1d` su `ln(1 + quote volume)`; warm-up del runtime = replay completo (2.3 A.4); label `vol_regime` con la stessa `RVd` dello stato e quantili su finestre concluse (3.1.3).
 
 ---
 
@@ -182,7 +188,7 @@ Componenti trasversali che le sezioni 1–5 danno per esistenti. Sono il primo l
 - `RESTClient().get_public_candles(granularity="ONE_MINUTE")` senza chiavi, finestre di 300 minuti (limite API 350 candele), dalla data piu' recente gia' salvata in avanti, oppure da `--start` se non c'e' nulla; ripresa idempotente dopo interruzione;
 - rate limit client-side configurabile (default 5 req/s) con `aiolimiter`, retry `tenacity` su 429/5xx;
 - scrittura Parquet partizionata per prodotto/anno/mese, schema `ts (UTC, inizio minuto), open, high, low, close, volume`; dedup su `ts`;
-- i minuti senza candela non sono errori (nessuno scambio): **non** vengono scritti; il loader (`load_bars()`) li ricostruisce come barre piatte (`OHLC = close precedente`, `volume = 0`), con la stessa regola del `BarAggregator` live;
+- i minuti senza candela non sono errori (nessuno scambio): **non** vengono scritti; il loader (`load_bars()`) li ricostruisce come barre piatte (`OHLC = close precedente`, `volume = 0`), con la stessa regola del `BarAggregator` live. `load_bars(end=...)` taglia `end` all'ultima barra reale salvata: oltre quel punto non si distingue un mercato fermo da dati mai scaricati, e inventare barre piatte falserebbe feature e label. Il parametro `store_complete_until_end=True` esiste solo per chi sa che lo store e' completo fino a `end` (recorder live);
 - report finale per prodotto: righe, intervallo, percentuale di minuti coperti, buchi piu' lunghi di 60 min;
 - ordine di grandezza: ~1.6 M righe e ~5.300 richieste per prodotto per 3 anni (~20 min per prodotto a 5 req/s).
 
@@ -517,7 +523,7 @@ Forma "pretty" (documentazione):
     "rv_ratio_1d_30d": 0.89,
     "atr_1d_pctile_365d": 38
   },
-  "liquidity": {"spread_bps": 3, "vol_z_1d": 0.6, "trades_z_1d": 0.4},
+  "liquidity": {"spread_bps": 3, "vol_z_1d": 0.6},
   "sentiment": {
     "asset": {"ewm": 0.38, "ewm_slow": 0.21, "mass": 2.71, "mass_slow": 9.40, "disp": 0.22, "shock_15m": 0.30,
               "n_1h": 3, "n_24h": 14, "last_choice": 2, "last_age_min": 3},
@@ -540,6 +546,61 @@ Note sui campi:
 - `btc_context`: per prodotti non-BTC, BTC e' il driver di regime dominante. Per `BTC-*` il blocco e' `null`.
 - `costs`: calcolati dal `CostModel` della sez. 0.3 con fee, spread e ATR correnti. Il modello deve "vedere" i costi perche' le label sono nette di fee (sez. 3).
 - `sentiment: null` quando il servizio sentiment non ha dati (avvio a freddo, outage): il modello e' addestrato anche su questo caso (feature dropout, sez. 3.1.5).
+
+#### 2.2.1.b Definizione esatta delle feature di mercato
+
+Unica definizione delle feature prodotte dall'`IndicatorEngine`. Costanti e nomi delle colonne in
+`modules/market/indicator_defs.py`; due implementazioni: `indicators_batch.compute_indicators` (training) e
+`indicators.IndicatorEngine` (runtime), verificate dal test di parita' della sez. 2.3 A.3.
+
+Convenzioni:
+- Riga `i` = barra 1m con inizio `ts_i` sulla griglia contigua di `load_bars` (barre piatte incluse). Istante di decisione
+  `t_i = ts_i + 1 min`. La riga `i` usa solo barre 1m con indice `<= i`. `c_i, h_i, l_i, v_i` = OHLCV della barra 1m.
+- Barre HTF (`tf` in 1h, 6h, 1d; bucket UTC di `modules/market/timeframes.py`): una barra con inizio `B` e' visibile dalla
+  riga `i` se e solo se `B + tf <= t_i`. `K = K(i, tf)` = ultima barra visibile; `C_k, H_k, L_k` = OHLC della barra HTF `k`.
+  La barra in formazione non entra in nessuna serie.
+- `tp_j = (h_j + l_j + c_j) / 3`; `pv_j = tp_j * v_j` (quote, EUR).
+- Ancora: tutte le serie partono dalla prima riga di `load_bars(root, product)` senza `start`, in batch e a runtime.
+- Valore non disponibile = `NaN` nell'indicatore, `null` nello stato. Storico sotto il minimo o denominatore nullo -> `NaN`.
+- Gli indicatori restituiscono float gia' in bps (non frazioni); arrotondamento e clamp solo nello `StateBuilder`.
+
+Ricorrenze (identiche su ogni timeframe):
+- `Wilder(n)`: primo valore = media dei primi `n` input; poi `x_k = (x_{k-1} * (n-1) + u_k) / n`.
+- `EMA(N)`: valore all'indice `N-1` = media dei primi `N` input; poi `e_k = alpha * x_k + (1 - alpha) * e_{k-1}`, `alpha = 2/(N+1)`.
+- `TR_0 = H_0 - L_0`; `TR_k = max(H_k - L_k, |H_k - C_{k-1}|, |L_k - C_{k-1}|)`; `ATR = Wilder(14)` su `TR_0..` (primo valore a `k = 13`).
+- `d_k = C_k - C_{k-1}` (`k >= 1`), `G = max(d, 0)`, `P = max(-d, 0)`; `avgG = Wilder(14)` su `G_1..`, `avgP = Wilder(14)` su
+  `P_1..` (primo valore a `k = 14`); `RSI = 100 - 100 / (1 + avgG/avgP)`; se `avgP == 0`: `RSI = 100` se `avgG > 0`, altrimenti `50`.
+- `MACD_k = EMA12_k - EMA26_k` (da `k = 25`); `SIG = EMA(9)` sulla serie `MACD_25..` (primo valore a `k = 33`); `HIST_k = MACD_k - SIG_k`.
+- `r_k = ln(C_k / C_{k-1})` su barre 1h; `RVd(m, k) = 1e4 * sqrt((24/m) * fsum(r_{k-m+1..k}^2))`, definita per `k >= m`.
+  `RVd` e' l'unica funzione di volatilita' realizzata del sistema (stato e label `vol_regime`, sez. 3.1.3).
+
+| Campo stato | Formula (riga `i`) | Minimo storico | Unita' |
+|-------------|--------------------|----------------|--------|
+| `clock.hour_utc` | `t_i.hour` | - | ora 0..23 |
+| `clock.dow` | `t_i.weekday()` (lunedi' = 0) | - | 0..6 |
+| `price.ret_bps[w]` | `1e4 * (c_i / c_{i-w} - 1)`, `w` = 15, 60, 360, 1440, 4320, 10080 min per 15m, 1h, 6h, 1d, 3d, 7d | `w + 1` barre 1m | bps |
+| `price.seq_1h_bps` | `[1e4 * (C_k / C_{k-1} - 1) for k in K-11..K]`, 1h, dal piu' vecchio | 13 barre 1h chiuse | bps x 12 |
+| `price.seq_1d_bps` | come sopra su 1d, `k in K-6..K` | 8 barre 1d chiuse | bps x 7 |
+| `price.dist_vwap_1d_bps` | `VWAP = fsum(pv_j) / fsum(v_j)`, `j = i-1439..i`; `1e4 * (c_i / VWAP - 1)`; NaN se nessun `v_j > 0` (contatore intero) | 1440 barre 1m | bps |
+| `price.bb_pos_1d` | su `C_{K-19..K}` 1d: `m = fsum/20`, `sd = sqrt(fsum((C - m)^2)/20)`; `(c_i - (m - 2 sd)) / (4 sd)`; NaN se `sd == 0`; non clampato | 20 barre 1d | rapporto |
+| `price.hh_ll_pos_30d` | `HH = max h_j`, `LL = min l_j`, `j = i-43199..i`; `(c_i - LL) / (HH - LL)`; NaN se `HH == LL` | 43200 barre 1m | rapporto in [0, 1] |
+| `momentum.rsi_14_<tf>` (1h, 6h, 1d) | `RSI_K` | 15 barre `tf` | 0..100 |
+| `momentum.macd_hist_1d_bps` | `1e4 * HIST_K / C_K` su 1d | 34 barre 1d | bps |
+| `volatility.atr_14_<tf>_bps` (1h, 6h, 1d) | `1e4 * ATR_K / C_K` | 14 barre `tf` | bps |
+| `volatility.rv_1d_bps` | `RVd(24, K)` su 1h | 25 barre 1h | bps/giorno |
+| `volatility.rv_ratio_1d_30d` | `RVd(24, K) / RVd(720, K)`; NaN se il denominatore e' 0 | 721 barre 1h | rapporto |
+| `volatility.atr_1d_pctile_365d` | `a_k = atr_14_1d_bps` della barra 1d `k`; `Prev = {a_{K-365..K-1}}` disponibili, `N = len(Prev)`; `100 * #{p in Prev : p <= a_K} / N`; NaN se `N < 90` | 104 barre 1d | 0..100 |
+| `liquidity.vol_z_1d` | `QV_D = fsum(pv_j)` sui minuti del giorno 1d `D`; `y_D = ln(1 + QV_D)`; `(y_K - m) / s`, `m`, `s` (ddof=1, due passate) su `y_{K-30..K-1}`; NaN se `s == 0` | 31 barre 1d | z-score |
+| `liquidity.spread_bps` | non prodotto dall'`IndicatorEngine` (LocalOrderBook live) | - | bps |
+| `btc_context.ret_1d_bps`, `btc_context.rv_ratio_1d_30d` | stesse formule sulla serie BTC-EUR alla stessa riga `ts_i`; blocco `null` per `BTC-*` o se la riga BTC manca | come sopra | come sopra |
+
+Colonne esportate non presenti nello stato (consumatori: label, RiskManager, watchdog, CUSUM, feasibility):
+`atr_14_1h`, `atr_14_6h`, `atr_14_1d` = `ATR_K` in unita' di prezzo (quote); `rv_30d_bps = RVd(720, K)`.
+Label e RiskManager usano sempre l'ATR in prezzo della riga della decisione: `upper = entry + k_tp * atr_14_<atr_tf>`,
+mai `bps * prezzo`.
+
+Visibilita' (C7): ogni valore della riga `i` e' funzione delle sole barre 1m `<= i`. Test di troncamento obbligatorio
+(sez. 2.3 A.3): `compute_indicators(bars[:i+1])` all'ultima riga coincide con `compute_indicators(bars)` alla riga `i`.
 
 #### 2.2.2 Richiesta al decider (`POST /v1/systemone`)
 
@@ -650,13 +711,14 @@ Il `DecisionEngine` rifiuta di caricare un `policy.json` il cui `label_config_sh
 >
 > **A. `modules/market/`**
 > 1. `ws_feed.py` — `CoinbaseMarketStream`: usa `coinbase.websocket.WSClient` (da `coinbase-advanced-py`) sui canali `market_trades`, `ticker`, `level2`, `heartbeats` (`level2` alimenta il `LocalOrderBook` usato per spread, stima dello slippage e simulatore di fill della sez. 5; verificare se il canale richiede autenticazione JWT e, nel caso, usare la stessa key read-only). Il WSClient lavora con callback in un thread proprio: fai il bridge verso asyncio con `loop.call_soon_threadsafe(queue.put_nowait, msg)`. Riconnessione automatica con backoff; rileva gap tramite `sequence_num` e, in caso di gap, segnala `BarAggregator.mark_dirty(product)`. Non usare il canale `candles` (granularita' 5 min): le barre 1m si costruiscono dai trade.
+> 1b. `timeframes.py` — aggregazione di barre 1m contigue in barre 1h/6h/1d allineate all'epoca UTC (1d chiude alle 00:00 UTC): `aggregate_bars` (vettoriale) e `TimeframeAggregator` (incrementale) con la stessa regola; una barra HTF esiste solo quando tutti i suoi minuti sono arrivati (mai la barra in formazione, vincolo C7); input non contiguo -> `BarGapError`. Usato da `IndicatorEngine` e `indicators_batch`.
 > 2. `bars.py` — `BarAggregator`: costruisce barre OHLCV 1m dai trade (bucket = `floor(trade_time, 1min)`), emette `BarClosed(product, bar)` su una queue alla chiusura del minuto (timer allineato al wall-clock + 2 s di grazia per trade tardivi). Barre senza trade = barra piatta con `volume=0` e `close` precedente. Su `mark_dirty` riallinea con `RESTClient.get_candles(granularity="ONE_MINUTE")` in `to_thread`. Aggrega anche 15m e 1h dalle barre 1m.
-> 3. `indicators.py` — `IndicatorEngine`, **incrementale O(1) per barra**, uno stato per (product, timeframe) con timeframe 1h, 6h, 1d aggregati dalle barre 1m (barre 1d con chiusura alle 00:00 UTC): ATR di Wilder (14), RSI di Wilder (14), EMA per MACD (12/26/9), Bollinger (20, 2), VWAP rolling 1d, realized vol = `sqrt(sum(r^2))` su finestra, z-score rolling di volume e numero di trade (finestra 30 giorni sulle barre 1d), percentile dell'ATR 1d su 365 giorni (`sortedcontainers.SortedList` con finestra scorrevole) e i campi di prezzo dello stato della sez. 2.2.1. Fornisci anche la versione vettoriale degli stessi indicatori in `indicators_batch.py` (polars o pandas). Un test deve verificare che batch e incrementale coincidano (tolleranza 1e-9) su >= 5.000 barre 1m per ciascun prodotto, lette dallo storico backfillato in Parquet (sez. 0.5); `data/historical_*.csv` della v1 non va usato. La versione batch e' quella usata per costruire il dataset di training.
-> 4. All'avvio, warm-up dal Parquet locale: ultimi 30 giorni di barre 1m (per 1h e 6h) e ultimi 400 giorni aggregati in barre 1d (per ATR 1d, percentile 365 giorni, `seq_1d_bps`). Se il Parquet non copre il periodo, il processo esegue prima il backfill incrementale (sez. 0.5) e solo dopo apre gli stream.
+> 3. `indicators.py` — `IndicatorEngine`, **incrementale O(1) per barra**, uno stato per (product, timeframe) con timeframe 1h, 6h, 1d aggregati dalle barre 1m (barre 1d con chiusura alle 00:00 UTC): ATR di Wilder (14), RSI di Wilder (14), EMA per MACD (12/26/9), Bollinger (20, 2), VWAP rolling 1d, volatilita' realizzata `RVd`, z-score di `ln(1 + quote volume)` giornaliero (30 giorni), percentile dell'ATR 1d su 365 giorni (`sortedcontainers.SortedList`) e i campi di prezzo, con le definizioni esatte della sez. 2.2.1.b. Fornisci anche la versione vettoriale degli stessi indicatori in `indicators_batch.py` (polars o pandas). Un test deve verificare che batch e incrementale coincidano (tolleranza `|a-b| <= 1e-9 * max(1, |b|)`, maschere NaN identiche; test T1-T10 della risoluzione indicatori, `docs/decisions/2026-10-17-indicatori.md`) su >= 5.000 barre 1m per ciascun prodotto, lette dallo storico backfillato in Parquet (sez. 0.5); `data/historical_*.csv` della v1 non va usato. La versione batch e' quella usata per costruire il dataset di training.
+> 4. All'avvio, warm-up: `load_bars` sull'intero storico del prodotto (ancora della sez. 2.2.1.b) e replay di tutte le barre 1m nello stesso `IndicatorEngine` (`warm_up`, senza snapshot). Un warm-up parziale non e' ammesso: le ricorrenze di Wilder ed EMA dipendono dal punto di partenza. Budget <= 120 s per prodotto. Se il Parquet non copre il periodo, il processo esegue prima il backfill incrementale (sez. 0.5) e solo dopo apre gli stream.
 >
 > **B. `modules/features/`**
 > 1. `schemas.py` — pydantic `DecisionState` con i sotto-modelli della sez. 2.2.1. Campi interi dichiarati `int`, i decimali con validator che arrotonda (`round(x, 2)`). Ordine dei campi = ordine di dichiarazione.
-> 2. `state_builder.py` — `StateBuilder.build(product, as_of, indicators, sentiment, position, costs) -> DecisionState`. Funzione pura. Conversione in bps: `int(round(x * 10_000))`. Clamp dei valori estremi (`ret_bps` in [-5000, 5000], z-score in [-6, 6]) per evitare token fuori distribuzione.
+> 2. `state_builder.py` — `StateBuilder.build(product, as_of, indicators, sentiment, position, costs) -> DecisionState`. Funzione pura. Gli indicatori sono gia' in bps: conversione `int(round(x))` (non `x * 10_000`); `NaN -> None`. Clamp: `ret_bps`, `seq_1h_bps`, `seq_1d_bps`, `dist_vwap_1d_bps`, `macd_hist_1d_bps` in [-5000, 5000]; `vol_z_1d` in [-6, 6]; `bb_pos_1d` in [-1.0, 2.0]; `hh_ll_pos_30d` e rapporti con `round(x, 2)`. Per evitare token fuori distribuzione.
 > 3. `serializer.py` — `serialize_state(state: DecisionState) -> str` = `state.model_dump_json()` con ordine stabile e senza spazi; `state_sha256(s: str) -> str`. **Unico punto di serializzazione** del sistema: lo importano sia il runtime sia `training/build_dataset.py`. Golden test: 3 stati fissi in `tests/golden/state_*.json` devono serializzarsi byte per byte uguali.
 >
 > **C. `modules/decision/`**
@@ -739,7 +801,7 @@ Label per domanda:
 | `action` | FLAT | `BUY` se esito = UPPER **e** `net_ret > 0`, altrimenti `HOLD` (compreso `NO_FILL`). |
 | `action` | LONG (sintetico, vedi sotto) | `SELL` se, uscendo ora a mercato (costo `c_mkt_out`), il risultato e' migliore di quello del bracket ancora attivo: cioe' esito futuro del bracket = LOWER, oppure VERTICAL con `exit_px * (1 - f_t)` < valore di uscita immediata. Altrimenti `HOLD`. |
 | `edge` | FLAT e LONG | `true` se esito = UPPER, `false` se LOWER o VERTICAL. I sample `NO_FILL` vengono esclusi per questa domanda (la domanda e' condizionata all'apertura). |
-| `vol_regime` | FLAT e LONG | Bucket 0..4 di `rv_forward(t, t+H)` rispetto ai quantili 20/40/60/80 della distribuzione di `rv` sullo stesso orizzonte nei **365 giorni precedenti a t** (quantili point-in-time). |
+| `vol_regime` | FLAT e LONG | Bucket 0..4 di `fwd(t) = R(E_t + H)` rispetto ai quantili 20/40/60/80 (`np.quantile`, `method="linear"`) di `ref(t) = {R(E) : F_t - 365 d < E <= F_t}`, con `R = RVd(H/60, .)` della sez. 2.2.1.b, `E_t = ceil_to_hour(t)`, `F_t = floor_to_hour(t)`; `bucket = searchsorted(q, fwd, side="right")`. Nessuna label se `fwd` o uno dei valori di `ref` e' NaN (quindi le label `vol_regime` esistono solo da circa 375 giorni dopo l'inizio dello storico). |
 
 **Sample LONG sintetici:** per ogni `t` campionato si genera anche uno stato con `position.side = LONG`, dove l'ingresso fittizio e' a `t - U`, con `U ~ Uniform{60..H}` minuti. Si calcolano `unreal_bps`, `dist_sl_atr`, `dist_tp_atr` coerenti con quell'ingresso e si scartano i sample in cui il bracket fittizio sarebbe gia' stato chiuso prima di `t`. In questo modo il modello vede entrambe le condizioni di posizione e impara il mascheramento.
 
@@ -882,7 +944,7 @@ Perche' `restricted_label_ce` invece della CE standard sul vocabolario: la CE st
                    "slip_bps": 5, "stop_extra_slip_bps": 10, "sha256": "a41c..."},
   "label_token_ids": {"action": [362, 425, 356], "edge": [809, 451], "vol_regime": [220, 16, 17, 18, 19]},
   "temperatures": {"action": 1.31, "edge": 1.12, "vol_regime": 1.07},
-  "data": {"products": ["BTC-EUR", "ETH-EUR", "SOL-EUR"], "train_range": ["2023-10-01", "2026-04-30"],
+  "data": {"products": ["BTC-EUR", "ETH-EUR", "SOL-EUR"], "indicator_anchor": {"BTC-EUR": "2023-10-01T00:00:00Z"}, "train_range": ["2023-10-01", "2026-04-30"],
            "n_samples": 210000, "holdout": ["2026-06-01", "2026-09-30"]},
   "metrics_holdout": {"action_logloss": 0.0, "edge_brier": 0.0, "edge_ece": 0.0, "net_pnl_bps": 0, "sharpe": 0.0,
                       "vs_baseline_lgbm": {"net_pnl_bps_delta": 0}},
@@ -923,12 +985,12 @@ Se G3 fallisce, il sistema va in produzione con `BaselineDecider`. Il modello LL
 >
 > 1. `training/labeling.py`
 >    - `triple_barrier(open, high, low, close, atr, t_idx, label_config: LabelConfig, costs: CostParams) -> (outcome: int8, fill_idx: int32, exit_idx: int32, net_ret: float64)` con l'algoritmo della sez. 3.1.3 (ingresso maker/taker, `NO_FILL`, regola conservativa "entrambe le barriere nella stessa barra -> LOWER", `net_ret` esatto). Kernel interno compilato con `@numba.njit` che riceve solo array e scalari; `CostParams` e' la vista numerica del `CostModel` della sez. 0.3 (`modules/risk/costs.py`), non una copia delle formule;
->    - `forward_rv_bucket(...)` con quantili calcolati sui 365 giorni **precedenti** a ogni t (rolling, nessun dato futuro);
+>    - `forward_rv_bucket(...)` con la definizione della sez. 3.1.3, usando `indicators_batch.rv_per_day_bps` (quantili sui 365 giorni **precedenti** a ogni t, nessun dato futuro);
 >    - test con serie sintetiche costruite a mano per ogni esito (UPPER, LOWER, VERTICAL, NO_FILL, stessa barra) e un test che ricalcola a mano il `net_ret` dell'esempio della sez. 0.3.
 > 2. `training/sampling.py` — `cusum_events(log_ret, h)` e griglia oraria; `uniqueness_weights(t0, t1)`.
 > 2b. `training/feasibility.py` — CLI `python -m training.feasibility --products BTC-EUR ETH-EUR SOL-EUR [--fees-from-probe data/probe/coinbase_probe.json]`, studio della sez. 3.1.3 con la regola di scelta e lo stop esplicito se nessuna combinazione e' sostenibile. Produce `label_config.json` (con `sha256`) e `data/reports/feasibility.md`. Va eseguito **prima** di `build_dataset.py`.
 > 3. `training/splits.py` — `purged_walk_forward(timestamps, t1, n_folds=5, embargo=timedelta(hours=24))` che produce indici; test che verifica l'assenza di sovrapposizione tra intervalli `[t, t1]` di train e di test.
-> 4. `training/build_dataset.py` — CLI: `python -m training.build_dataset --config config/train.yml`. Passi: carica candele 1m da Parquet -> calcola indicatori con `modules.market.indicators_batch` -> ricostruisce sentiment storico da `data/news_history.db` con `modules.sentiment.aggregator` (stesso codice del runtime) -> costruisce `DecisionState` con `modules.features.state_builder` e serializza con `modules.features.serializer.serialize_state` (stesso codice del runtime) -> genera sample FLAT e LONG sintetici -> label -> feature dropout 25% sul blocco sentiment nel solo train -> scrive `data/datasets/<run_id>/{train,val,test}.jsonl` e `label_config.json`. Fallisce se un token di etichetta non e' single-token.
+> 4. `training/build_dataset.py` — CLI: `python -m training.build_dataset --config config/train.yml`. Passi: carica candele 1m da Parquet -> calcola indicatori con `modules.market.indicators_batch.compute_indicators` sull'intero storico del prodotto (ancora sez. 2.2.1.b), poi seleziona i timestamp (sample con `atr_14_<atr_tf>` NaN esclusi) -> ricostruisce sentiment storico da `data/news_history.db` con `modules.sentiment.aggregator` (stesso codice del runtime) -> costruisce `DecisionState` con `modules.features.state_builder` e serializza con `modules.features.serializer.serialize_state` (stesso codice del runtime) -> genera sample FLAT e LONG sintetici -> label -> feature dropout 25% sul blocco sentiment nel solo train -> scrive `data/datasets/<run_id>/{train,val,test}.jsonl` e `label_config.json`. Fallisce se un token di etichetta non e' single-token.
 > 5. `training/prompting.py` — `PROMPT_TEMPLATE_V1`, `render_prompt(state, question) -> str`, `label_token_ids(tokenizer, question) -> list[int]`. Importato sia dal trainer sia dal server.
 > 6. `training/train_lora.py` — carica il base model (4-bit NF4 se `quantization.load_in_4bit`), `prepare_model_for_kbit_training`, `get_peft_model(LoraConfig(...))` dai parametri della sez. 3.2.3. Collator: tokenizza `prompt` (senza token di etichetta), registra la posizione dell'ultimo token e gli id dei token di etichetta della domanda. `compute_loss`: `logits_last = outputs.logits[arange(B), last_pos]`, `restricted = logits_last.gather(1, label_ids_padded)` con mascheramento `-inf` dove le domande hanno meno opzioni, `loss = (F.cross_entropy(restricted, target_index, reduction="none") * weight).mean()`. Valutazione ogni 500 step con log-loss ristretta e accuracy per domanda. Salva adapter e tokenizer.
 > 7. `training/calibrate.py` — inferenza sul validation set, ottimizzazione di `T_q` per domanda (NLL, `minimize_scalar`), ECE e Brier prima/dopo, reliability diagram PNG con matplotlib. Scrive `temperatures` nel model card.
@@ -955,7 +1017,7 @@ Decision(BUY, p_edge, regime, conf)            # regime gia' ammesso dalla Decis
    -> RiskManager[book].plan_entry()
         1. quote: best_bid/best_ask/spread dal LocalOrderBook; product meta (increments, min size) cache 1h
         2. fees: FeeProvider (transaction summary, cache 1h)
-        3. A = ATR_14_<atr_tf>(t) dal label_config; entry = floor_to(best_bid, quote_increment) (maker)
+        3. A = `atr_14_<atr_tf>` (in prezzo) dello snapshot della barra della decisione, lo stesso valore usato dalla label, mai riletto al momento dell'invio; timeframe dal label_config; entry = floor_to(best_bid, quote_increment) (maker)
                                                        | ceil_to(best_ask, quote_increment) (taker)
         4. SL = entry - k_sl * A ; TP = entry + k_tp * A                  (k da label_config; arrotondati come 4.1.3)
         5. costs = CostModel(entry_mode, fees, spread)                    -> cost_tp, cost_sl (sez. 0.3)
@@ -1058,7 +1120,7 @@ Vincoli di validazione prima dell'invio: `SL < entry < TP`; `(TP-entry) >= 2 * q
 
 #### 4.1.6 Copertura spot (vincolo C11)
 
-Componenti (`modules/execution/`): `BalanceBook` (saldi in memoria per book), `BalanceGuard` (unica autorita' di copertura), `CoverageTicket` (capacita' d'invio), `SpotRegistry` e `build_order_body` (divieto di leva). Formule in `modules/risk/costs.py` (sez. 0.3).
+Componenti (`modules/execution/`): `BalanceBook` (saldi in memoria per book), `BalanceGuard` (unica autorita' di copertura), `CoverageTicket` (capacita' d'invio), `SpotRegistry` e `build_order_body` (divieto di leva). Formule in `modules/risk/costs.py` (sez. 0.3). I tipi condivisi `OrderSpec` e `ProductMeta` stanno in `modules/execution/orders.py`.
 
 Formule (Decimal):
 
@@ -1078,6 +1140,8 @@ Regole:
 5. Rischio massimo di un ordine = sua riserva: la spesa d'ingresso non supera `required_quote` e il valore d'uscita non e' mai negativo.
 6. Non disattivabile: nessuna chiave di config; stesso codice in live, dry, backtest (`VirtualAccount` compone un `BalanceBook`). Violazioni di whitelist o prodotto non spot: `SpotViolation`, exit code 4.
 7. Verifiche continue delle ipotesi sull'exchange: `hold > reserved` senza ordini estranei, riserva consumata oltre il prenotato, drift ripetuti -> `coverage_breach` (sez. 4.1.4).
+8. `BalanceBook.apply_fill` e' idempotente per `trade_id` (lo stesso fill arriva dal WS e dal polling); un fill per un ordine senza riserva non modifica i saldi e segnala `reservation_overdraw`.
+9. Il collegamento e' imposto da test (`tests/test_c11_wiring.py`): solo `exchange.py`, `user_stream.py`, `ws_feed.py`, `backfill.py` importano l'SDK Coinbase, i metodi d'ordine dell'SDK solo in `exchange.py`, gateway senza `BalanceGuard` obbligatorio non passano. Il vecchio `modules/order_execution.py` (v1) e' disattivato e viene cancellato quando nasce `gateway.py`.
 
 ### 4.2 Struttura dei Dati / Schema JSON
 

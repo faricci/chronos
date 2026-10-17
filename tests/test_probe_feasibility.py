@@ -62,3 +62,19 @@ def test_account_fees_are_used_when_complete() -> None:
 def test_incomplete_account_fees_fall_back_to_assumed(account: Any) -> None:
     fees = fees_for_feasibility(account)
     assert (fees.maker_bps, fees.taker_bps, fees.assumed) == (60.0, 120.0, True)
+
+
+def test_probe_atr_uses_the_feature_definition() -> None:
+    """O2 of the indicator resolution: one ATR definition for probe, features and labels."""
+    import numpy as np
+
+    from modules.market.indicators_batch import wilder_atr
+    from script.probe_coinbase import atr_bps
+
+    rng = np.random.default_rng(2)
+    close = 100 + np.cumsum(rng.normal(0, 1, 40))
+    high, low = close + rng.uniform(0.1, 2, 40), close - rng.uniform(0.1, 2, 40)
+    candles = [{"high": str(h), "low": str(lo), "close": str(c)} for h, lo, c in zip(high, low, close, strict=True)]
+    expected = round(float(wilder_atr(high, low, close)[-1]) / close[-1] * 1e4, 1)
+    assert atr_bps(candles) == expected
+    assert atr_bps(candles[:13]) is None
