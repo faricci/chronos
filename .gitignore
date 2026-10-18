@@ -57,3 +57,10 @@ state/
 
 # Secrets
 .env
+
+# Local model artifacts and datasets (large, regenerable)
+models/sentiment/
+data/datasets/
+data/labels/
+models/baseline/
+data/backtest_cache/

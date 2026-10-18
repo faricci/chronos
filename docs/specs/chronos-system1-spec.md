@@ -1,6 +1,6 @@
 # Chronos v2 — Specifica Tecnica "System 1" Decision Architecture
 
-Versione: 2.6.1-draft | Data: 2026-10-18 | Stato: proposta per implementazione
+Versione: 2.8-draft | Data: 2026-10-18 | Stato: proposta per implementazione
 Target implementatore: Sonnet 5.5 (ogni blocco "Linee Guida" e' scritto per essere usato come prompt diretto)
 
 Changelog 2.1: perimetro infrastrutturale a costo zero (locale, CPU-only, AWS fuori scope); nuova sez. 5 "Dry Run"; piano di rilascio riscritto; la sandbox Coinbase e' statica e non viene piu' usata per validare i payload.
@@ -39,6 +39,21 @@ Changelog 2.5 (definizione esatta delle feature): nuova sez. 2.2.1.b (formule, m
 Changelog 2.6 (fonte canonica delle barre 1m): le barre 1m del runtime sono le candele REST `get_public_candles` lette `S` secondi dopo la chiusura del minuto (`BarService`, sez. 2.3 A.2), la stessa fonte dello storico; i trade WebSocket non costruiscono piu' barre (`BarAggregator` eliminato); la decisione si calcola a `t + S` con `ts_bar_close = t`; nuova sezione `market.bars` della config; guardia stale separata per barre (`stale_bar_s`) e ticker; audit notturno delle revisioni REST (L0) e criterio G-DRY-OPS relativo; replay delle barre dallo store (`StoreCandleSource`).
 
 Changelog 2.6.1 (taratura di S, misure del 2026-10-18): le candele REST cambiano fino a ~92 s dopo la chiusura (0 su 70 dopo 120 s; nessuna revisione sulle candele con eta' >= 1 h): `market.bars.rest_delay_s` = 120 s (validator 60..300) e valori derivati `rest_max_delay_s` = 180, `decision_max_lag_s` = 240, `stale_bar_s` = 270; nuovo validator `decision_max_lag_s < stale_bar_s`; scala di taratura di S guidata da `rest_revision_ratio` (sez. 2.3 A.2).
+
+Changelog 2.7 (studio di fattibilita' con fee reali 25/50 bps e regole del trader-quant):
+- parametri di barriera: fonte di verita' unica `data/datasets/label_config.json` scritto da `training/feasibility.py`; la sez. 0.4 non contiene piu' valori normativi (i default 1d / 4-2 / 10 giorni non sono sostenibili: `p_vertical` 0.60);
+- studio di fattibilita': finestra di selezione pre-holdout, `lift_0` senza drift (detrend solo per la scelta, mai in stato o label), eleggibilita' `p_vertical <= 0.05` con il piu' piccolo H, `H <= 15` giorni, pareggio entro 0.01 risolto con `N_eff`, jackknife semestrale e guardia per prodotto nel GO, diagnostiche (chi2 di omogeneita', H = 20, durate reali);
+- campioni indipendenti: somma dei pesi di unicita' sulla durata reale `[t, exit]`, corretta per la correlazione fra prodotti;
+- label: `entry_first_bar` F = 1 + ceil(S/60) = 3 per maker e taker, limite al `close[t+F-1]`, finestra d'ingresso di `T_in` barre, nella barra di fill solo lo SL; spread di label `max(probe, 3 bps)` incluso nello `sha256`; `label_window_end(t)` unica fine finestra per purge, selezione e LabelResolver;
+- holdout: inizio congelato nel `label_config` (`selection.holdout_start`), `purged_walk_forward(..., holdout_start=...)`; embargo 2 giorni uniformato (3.5);
+- valutazione: nuovi gate G0 (cambio di regime sull'holdout) e GE (evidenza assoluta E1-E5) con esito GO / INCONCLUSO / NO-GO; la rampa R0 richiede GE = GO; ECE nella regione di decisione solo diagnostica;
+- tabella 5.1.3 allineata a 3.1.3.
+
+Changelog 2.8 (spread e costi dello stato, backtest, baseline):
+- lo stato non contiene piu' lo spread vivo (`liquidity.spread_bps` rimosso): il blocco `costs` e' calcolato dal `label_config` (fee, slippage e spread di label via `spread_for`) e dall'ATR dello snapshot, identico in training e serving; fee e spread vivi li usa solo il `RiskManager`; `StateBuilder.build(*, snapshot, btc, sentiment, position, close_t)` senza parametri di costo; lo schema resta `chronos.state.v1` perche' nessun dataset o modello era stato rilasciato;
+- backtest (sez. 3.5 punto 8): cadenza di 1 minuto per i gate e per il backtest di riferimento, 15 minuti solo nella ricerca di `tune_policy`; un solo book con equity comune, ordini tutti autorizzati dal `BalanceGuard` su un `VirtualAccount`, kill switch reale; fill dell'ingresso maker tutto-o-niente con haircut sul volume della barra; uscita per orizzonte come nella label;
+- baseline LightGBM: iperparametri fissi, pesi di unicita' normalizzati a media 1, sottocampionamento di HOLD con correzione del prior, LONG sintetici dal kernel delle label, calibrazione Platt/temperatura sul validation del proprio fold, soglie della policy per fold, split finale `final_fit_split`;
+- l'uscita per orizzonte `H` deve essere implementata nel watchdog (buco della sez. 5.1.2).
 
 ---
 
@@ -142,6 +157,8 @@ net_ret          = exit_value_quote / entry_cost_quote - 1
 dove `entry_px` ed `exit_px` includono gia' spread e slippage della gamba taker (e `x` per lo SL).
 
 **Esempio di riferimento** (usato in tutti gli esempi del documento, fee presunte 60/120): SOL-EUR, `best_bid = 92.03`, `s = 3`, `ATR_14_1d = 460 bps` (4.2334 EUR), ingresso maker a 92.03, `k_tp = 4`, `k_sl = 2`.
+
+L'esempio usa parametri 1d / 4-2 e fee presunte 60/120 solo come illustrazione numerica, ripresa nelle sez. 4.1.2 e 4.2: i parametri in vigore sono quelli del `label_config.json` (sez. 0.4).
 TP = 108.96 (`tp_bps` = 1840), SL = 83.57 (`sl_bps` = 920); `cost_tp` = 120, `cost_sl` = 60 + 120 + 1.5 + 5 + 10 = 197; fee floor 1720 >= 30, ok; `p_breakeven` = 1117 / 2837 = **0.39**. Con `p_edge` = 0.52: EV = 0.52 x 1720 - 0.48 x 1117 = **+358 bps**.
 
 ### 0.4 Parametri di barriera v1 e prodotti (dati reali del 2026-10-17)
@@ -155,9 +172,9 @@ Misure dal probe di sola lettura `script/probe_coinbase.py` (endpoint pubblici, 
 | SOL-EUR | 3.3 | 1.0 M | 61 | 222 | 460 | ~64% (~97% a 2 anni) |
 | XLM-EUR | 5.9 | 0.08 M | 50 | 221 | 585 | ~30%: **escluso** (minuti senza scambi, book sottile) |
 
-`p_breakeven` e **lift richiesto** (= `p_breakeven` meno la probabilita' di toccare prima il TP in un random walk senza drift, `k_sl / (k_tp + k_sl)`), cioe' di quanto il modello deve battere il caso:
+`p_breakeven` e `lift_rw` (= `p_breakeven` meno `k_sl / (k_tp + k_sl)`, probabilita' di toccare prima il TP in un random walk senza drift). Non e' il criterio dello studio di fattibilita', che usa `lift_0` (sez. 3.1.3): serve solo come ordine di grandezza.
 
-| ATR | k_tp/k_sl | Ingresso | BTC lift | ETH lift | SOL lift |
+| ATR | k_tp/k_sl | Ingresso | BTC lift_rw | ETH lift_rw | SOL lift_rw |
 |-----|-----------|----------|----------|----------|----------|
 | 1h | 4/2 | taker | TP non copre i costi | +0.65 (sotto fee floor) | +0.54 |
 | 1h | 4/2 | maker | TP non copre i costi | +0.47 | +0.39 |
@@ -170,10 +187,11 @@ Valori calcolati con `CostModel` (sez. 0.3; fee presunte 60/120, `slip` = 5, `x`
 
 Decisioni v1:
 - **Prodotti:** BTC-EUR, ETH-EUR, SOL-EUR (quote EUR, `quote_min_size` = 1 EUR per tutti). Da confermare dall'utente.
-- **Barriere:** `atr_tf = 1d`, `k_tp = 4.0`, `k_sl = 2.0`, `entry_mode = maker`, orizzonte `H = 14400 min` (10 giorni; tempo atteso di uscita di un random walk con barriere +4/-2 ATR giornalieri ~ 8 giorni).
-- Questi sono **default di partenza**, non verita': la scelta finale la fa lo studio di fattibilita' su 3 anni di storico con le fee reali (`training/feasibility.py`, sez. 3.1.3), che puo' sostituirli.
-- Conseguenza da accettare: a questo tier di fee Chronos e' un sistema **swing multi-giorno**. Le label si risolvono dopo 10 giorni e un trade dura in media piu' di una settimana. La prova statistica dell'edge viene dal backtest walk-forward sullo storico; il dry run verifica che il sistema reale si comporti come il backtest (sez. 5.1.6–5.1.7).
-- Il tier migliora solo con il volume a 30 giorni, che con micro-capitale non cambia: i parametri vanno ricalcolati se le fee reali lette dal probe sono diverse da quelle presunte.
+- **Barriere:** `atr_tf`, `k_tp`, `k_sl`, `entry_mode`, `horizon_min`, `entry_timeout_min` (30), `entry_first_bar` e lo spread di label sono quelli di `data/datasets/label_config.json`, scritto da `training/feasibility.py` (sez. 3.1.3), verificato con `sha256` da `load_label_config` e copiato nel model card. Nessun altro file li definisce; label, RiskManager, backtest e dry run li leggono da li'.
+- **Esito del 2026-10-18** (studio v2.7, fee reali 25/50 bps, finestra pre-holdout fino al 2026-06-18, holdout dal 2026-06-20): `6h`, 3/1.5, maker, H = 15 giorni, `entry_first_bar` 3, spread di label 3 bps; `lift_0` +0.074, lift grezzo +0.058, `N_eff` 665 (`rho` 0.54), jackknife semestrale massimo +0.089, durata mediana dei trade 48 h (p95 257 h). Pareggio entro 0.01 con 4/1.5 e 3/2, risolto con `N_eff`. I default precedenti (1d, 4/2, H = 10 giorni) sono scartati: `p_vertical` 0.60, UPPER solo nel 10% dei casi. Dettagli in `data/reports/feasibility.md` e `docs/decisions/2026-10-18-fattibilita.md`.
+- **Vincoli della griglia:** `atr_tf in {6h, 1d}` (1h escluso dal fee floor); `H <= 15` giorni (= holdout / 8); H = 20 solo diagnostica.
+- Conseguenza da accettare: a questo tier di fee Chronos e' un sistema **swing multi-giorno**: barriere di alcuni ATR a 6h, durata reale di alcuni giorni (misurata dallo studio, `dur_*`), tetto H di 15 giorni. La prova statistica dell'edge viene dal backtest walk-forward (gate GE, sez. 3.4); il dry run verifica che il sistema reale si comporti come il backtest (sez. 5.1.6-5.1.7).
+- Il tier migliora solo con il volume a 30 giorni, che con micro-capitale non cambia: lo studio va rieseguito se le fee reali lette dal probe cambiano. Un nuovo `label_config` e' una nuova versione del modello.
 
 ### 0.5 Fondamenta (fase P0)
 
@@ -463,7 +481,7 @@ bar_closed(product, t)                             # pubblicata dal BarService a
   -> DecisionRecord -> data/decisions/YYYY-MM-DD.jsonl (audit, replay, dataset futuro)
 ```
 
-**Istante logico e istante di calcolo.** `t` = chiusura del minuto (`ts_bar_close`); la decisione si calcola a `t + S` (`market.bars.rest_delay_s`, default 120 s), quando la candela REST del minuto e' definitiva. Tutto lo stato usa l'istante logico `t`: barre fino al minuto che chiude in `t`, `clock` da `t`, sentiment con `as_of = t` (`ingested_at <= t`). Fanno eccezione, perche' descrivono l'esecuzione, `position` e `costs`/`spread_bps`, letti al momento del calcolo. Il ritardo `S` e' irrilevante a questo orizzonte: 120 s sono lo 0.014% di `H`, la finestra di fill maker reale `[t+S, t+S+T_in]` copre il 93% di quella della label, e lo scarto fra il limite reale (best_bid a `t+S`) e quello della label e' una deriva di prezzo di 2 minuti a media nulla, piccola rispetto a barriere di piu' ATR giornalieri. Il prezzo dell'ordine viene comunque dal `LocalOrderBook` all'invio. Una barra pubblicata con ritardo oltre `market.bars.decision_max_lag_s` aggiorna indicatori e store ma non produce decisione ne' `DecisionRecord` (contatore `decisions.skipped_late`).
+**Istante logico e istante di calcolo.** `t` = chiusura del minuto (`ts_bar_close`); la decisione si calcola a `t + S` (`market.bars.rest_delay_s`, default 120 s), quando la candela REST del minuto e' definitiva. Tutto lo stato usa l'istante logico `t`: barre fino al minuto che chiude in `t`, `clock` da `t`, sentiment con `as_of = t` (`ingested_at <= t`). Fa eccezione solo `position` (lato, ingresso, SL/TP e ATR d'ingresso dal ledger al momento del calcolo), con `unreal_bps` e distanze calcolate su `close[t]`. `costs` e' funzione del `label_config` e dello snapshot: fee e spread vivi li usa solo il RiskManager (sez. 4.1). Il ritardo `S` e' irrilevante a questo orizzonte: 120 s sono lo 0.014% di `H`, la finestra di fill maker reale `[t+S, t+S+T_in]` copre il 93% di quella della label, e lo scarto fra il limite reale (best_bid a `t+S`) e quello della label e' una deriva di prezzo di 2 minuti a media nulla, piccola rispetto a barriere di piu' ATR giornalieri. Il prezzo dell'ordine viene comunque dal `LocalOrderBook` all'invio. Una barra pubblicata con ritardo oltre `market.bars.decision_max_lag_s` aggiorna indicatori e store ma non produce decisione ne' `DecisionRecord` (contatore `decisions.skipped_late`).
 
 Le tre domande condividono lo stesso stato: sul server il prefisso di stato viene calcolato una volta sola (prefix/KV caching) e le domande vengono lette in un'unica forward pass batch. Questo e' cio' che rende la decisione "System 1": nessuna generazione autoregressiva di testo, solo lettura dei logit sui token di etichetta.
 
@@ -533,7 +551,7 @@ Forma "pretty" (documentazione):
     "rv_ratio_1d_30d": 0.89,
     "atr_1d_pctile_365d": 38
   },
-  "liquidity": {"spread_bps": 3, "vol_z_1d": 0.6},
+  "liquidity": {"vol_z_1d": 0.6},
   "sentiment": {
     "asset": {"ewm": 0.38, "ewm_slow": 0.21, "mass": 2.71, "mass_slow": 9.40, "disp": 0.22, "shock_15m": 0.30,
               "n_1h": 3, "n_24h": 14, "last_choice": 2, "last_age_min": 3},
@@ -554,7 +572,7 @@ Forma canonica inviata al modello (una riga, ~200–300 token Qwen):
 Note sui campi:
 - `seq_1h_bps` (ultime 12 ore) e `seq_1d_bps` (ultimi 7 giorni): sostituiscono la finestra grezza che il Transformer v1 riceveva; danno contesto temporale con 19 numeri alla scala dell'orizzonte (sez. 0.4).
 - `btc_context`: per prodotti non-BTC, BTC e' il driver di regime dominante. Per `BTC-*` il blocco e' `null`.
-- `costs`: calcolati dal `CostModel` della sez. 0.3 con fee, spread e ATR correnti. Il modello deve "vedere" i costi perche' le label sono nette di fee (sez. 3).
+- `costs`: calcolati dal `CostModel` con fee, `slip`, `x` e spread del `label_config` (`spread_for`) e con `atr_14_<atr_tf>_bps` dello snapshot; identici in training e serving. Il modello deve "vedere" i costi perche' le label sono nette di fee (sez. 3).
 - `sentiment: null` quando il servizio sentiment non ha dati (avvio a freddo, outage): il modello e' addestrato anche su questo caso (feature dropout, sez. 3.1.5).
 
 #### 2.2.1.b Definizione esatta delle feature di mercato
@@ -602,7 +620,6 @@ Ricorrenze (identiche su ogni timeframe):
 | `volatility.rv_ratio_1d_30d` | `RVd(24, K) / RVd(720, K)`; NaN se il denominatore e' 0 | 721 barre 1h | rapporto |
 | `volatility.atr_1d_pctile_365d` | `a_k = atr_14_1d_bps` della barra 1d `k`; `Prev = {a_{K-365..K-1}}` disponibili, `N = len(Prev)`; `100 * #{p in Prev : p <= a_K} / N`; NaN se `N < 90` | 104 barre 1d | 0..100 |
 | `liquidity.vol_z_1d` | `QV_D = fsum(pv_j)` sui minuti del giorno 1d `D`; `y_D = ln(1 + QV_D)`; `(y_K - m) / s`, `m`, `s` (ddof=1, due passate) su `y_{K-30..K-1}`; NaN se `s == 0` | 31 barre 1d | z-score |
-| `liquidity.spread_bps` | non prodotto dall'`IndicatorEngine` (LocalOrderBook live) | - | bps |
 | `btc_context.ret_1d_bps`, `btc_context.rv_ratio_1d_30d` | stesse formule sulla serie BTC-EUR alla stessa riga `ts_i`; blocco `null` per `BTC-*` o se la riga BTC manca | come sopra | come sopra |
 
 Colonne esportate non presenti nello stato (consumatori: label, RiskManager, watchdog, CUSUM, feasibility):
@@ -742,7 +759,7 @@ Il `DecisionEngine` rifiuta di caricare un `policy.json` il cui `label_config_sh
 >
 > **B. `modules/features/`**
 > 1. `schemas.py` — pydantic `DecisionState` con i sotto-modelli della sez. 2.2.1. Campi interi dichiarati `int`, i decimali con validator che arrotonda (`round(x, 2)`). Ordine dei campi = ordine di dichiarazione.
-> 2. `state_builder.py` — `StateBuilder.build(product, as_of, indicators, sentiment, position, costs) -> DecisionState`. Funzione pura. Gli indicatori sono gia' in bps: conversione `int(round(x))` (non `x * 10_000`); `NaN -> None`. Clamp: `ret_bps`, `seq_1h_bps`, `seq_1d_bps`, `dist_vwap_1d_bps`, `macd_hist_1d_bps` in [-5000, 5000]; `vol_z_1d` in [-6, 6]; `bb_pos_1d` in [-1.0, 2.0]; `hh_ll_pos_30d` e rapporti con `round(x, 2)`. Per evitare token fuori distribuzione.
+> 2. `state_builder.py` — `StateBuilder(label: LoadedLabelConfig).build(*, snapshot: IndicatorSnapshot, btc: IndicatorSnapshot | None, sentiment: SentimentSnapshot | None, position: PositionInput, close_t: float) -> DecisionState`. Funzione pura, senza parametri di spread, fee o quote (garantito dalla firma): `position` e' l'unico input vivo e usa `close_t`, mai il mid del book. Per `BTC-*` `btc` deve essere `None`. Gli indicatori sono gia' in bps: conversione `int(round(x))` (non `x * 10_000`); `NaN -> None`. Clamp: `ret_bps`, `seq_1h_bps`, `seq_1d_bps`, `dist_vwap_1d_bps`, `macd_hist_1d_bps` in [-5000, 5000]; `vol_z_1d` in [-6, 6]; `bb_pos_1d` in [-1.0, 2.0]; `hh_ll_pos_30d` e rapporti con `round(x, 2)`. Per evitare token fuori distribuzione.
 > 3. `serializer.py` — `serialize_state(state: DecisionState) -> str` = `state.model_dump_json()` con ordine stabile e senza spazi; `state_sha256(s: str) -> str`. **Unico punto di serializzazione** del sistema: lo importano sia il runtime sia `training/build_dataset.py`. Golden test: 3 stati fissi in `tests/golden/state_*.json` devono serializzarsi byte per byte uguali.
 >
 > **C. `modules/decision/`**
@@ -791,34 +808,47 @@ Verificare la licenza dei pesi scelti prima del deploy (i pesi Clef non sono ele
 
 #### 3.1.3 Costruzione delle label (triple-barrier, nette di fee)
 
-Per ogni prodotto e ogni timestamp di campionamento `t` (chiusura barra 1m), con i parametri del `label_config` (default sez. 0.4) e i costi del `CostModel` (sez. 0.3):
+Per ogni prodotto e ogni timestamp di campionamento `t` (chiusura barra 1m), con i parametri del `label_config` (`label_config.json`, sez. 0.4) e i costi del `CostModel` (sez. 0.3):
 
 ```
-A          = ATR_14_<atr_tf>(t)                             # noto al tempo t (default atr_tf = 1d)
-# ingresso: stessa regola del BarFillModel (sez. 5.1.3)
+F          = entry_first_bar                                # 1 + ceil(S/60) = 3 con S = 120 s
+A          = ATR_14_<atr_tf>(t)                             # noto al tempo t; atr_tf dal label_config
+# l'ordine e' prezzato alla chiusura della barra t+F-1 (istante t + S) e vive dalla barra t+F (BarFillModel, sez. 5.1.3)
 if entry_mode == maker:
-    limit  = close[t] * (1 - s/2/1e4)                       # stima del best_bid al tempo t
-    fill   = prima barra k in (t+1, t+T_in] con low[k] < limit   # T_in = entry_timeout (default 30 min)
-    se nessun fill -> esito = NO_FILL (nessun trade)
+    limit  = close[t+F-1] * (1 - s/2/1e4)                   # stima del best_bid all'invio
+    fill   = prima barra k in [t+F, t+F+T_in-1] con low[k] < limit   # T_in = entry_timeout (30 barre)
+    nessun fill con finestra osservata -> esito = NO_FILL (nessun trade)
     entry  = limit ; f_in = f_m
 if entry_mode == taker:
-    entry  = open[t+1] * (1 + (s/2 + slip)/1e4) ; f_in = f_t
+    fill   = t+F ; entry = open[t+F] * (1 + (s/2 + slip)/1e4) ; f_in = f_t
 upper      = entry + k_tp * A
 lower      = entry - k_sl * A
-vertical   = t_fill + H                                     # default H = 14400 min (10 giorni)
-scan 1m bars in (t_fill, vertical]:
-    if low <= lower and high >= upper nella stessa barra -> esito = LOWER   (conservativo)
-    elif high > upper  -> esito = UPPER, exit_px = upper,                      f_out = f_m
-    elif low  <= lower -> esito = LOWER, exit_px = min(lower, open) * (1 - (s/2 + slip + x)/1e4), f_out = f_t
-se nessuna barriera  -> esito = VERTICAL, exit_px = close[vertical] * (1 - (s/2 + slip)/1e4),  f_out = f_t
+vertical   = fill + H
+barra fill:  low <= lower -> esito = LOWER (watchdog: il bracket non e' ancora piazzato, il TP non vale)
+scan 1m bars in (fill, vertical]:
+    if   low  <= lower -> esito = LOWER (anche se high > upper nella stessa barra: conservativo)
+    elif high >  upper -> esito = UPPER, exit_px = upper, f_out = f_m
+LOWER: exit_px = min(lower, open) * (1 - (s/2 + slip + x)/1e4), f_out = f_t
+nessuna barriera   -> esito = VERTICAL, exit_px = close[vertical] * (1 - (s/2 + slip)/1e4), f_out = f_t
+finestra non osservata o A non valido -> UNRESOLVED (non e' una label)
 net_ret    = exit_px * (1 - f_out) / (entry * (1 + f_in)) - 1                 # formula esatta della sez. 0.3
+label_window_end(t) = max(t + (F + T_in - 1) min, ceil_to_hour(t)) + H        # fine dei dati usati da tutte le label di t
 ```
 
-La scansione e la stima dei costi chiamano gli stessi oggetti del runtime (`CostModel`, `BarFillModel`), non reimplementazioni. `s` (spread) per il training e' la mediana per prodotto e ora del giorno misurata dal recorder (sez. 5); finche' non ci sono registrazioni si usa il valore del probe. I parametri sono scritti nel `label_config` del model card e **devono** coincidere con quelli usati dal RiskManager (sez. 4), altrimenti `edge.noul` non ha significato in esecuzione.
+La scansione e la stima dei costi chiamano gli stessi oggetti del runtime (`CostModel`, `BarFillModel`), non reimplementazioni. `s` (spread) per il training e' la mediana per prodotto e ora del giorno misurata dal recorder (sez. 5); finche' non ci sono registrazioni si usa `max(spread del probe, 3 bps)` per prodotto. Lo spread fa parte della label ed entra nello `sha256` del `label_config`. Lo stesso valore (`spread_for`) e' l'unico spread usato nel blocco `costs` dello stato; lo stato non contiene lo spread vivo. I parametri sono scritti nel `label_config` del model card e **devono** coincidere con quelli usati dal RiskManager (sez. 4), altrimenti `edge.noul` non ha significato in esecuzione.
 
-`t` e' l'istante logico di chiusura della barra (`ts_bar_close`), non l'istante di calcolo `t + S` (sez. 2.1): le label non dipendono da `S`. Lo scarto tra l'ingresso simulato a barre e l'ingresso reale a `t + S` rientra nella parita' misurata dal dry run (sez. 5.1.7).
+`t` e' l'istante logico di chiusura della barra (`ts_bar_close`), non l'istante di calcolo `t + S` (sez. 2.1). La label dipende da `S` solo attraverso `entry_first_bar`, registrato nel `label_config`: e' la prima barra in cui l'ordine reale, inviato a `t + S`, puo' essere eseguito. Se `1 + ceil(market.bars.rest_delay_s / 60) != entry_first_bar`, il runtime logga `label_exec_delay_mismatch` (non bloccante); lo scarto residuo rientra nella parita' misurata dal dry run (sez. 5.1.7).
 
-**Studio di fattibilita' (`training/feasibility.py`, prima del primo training).** Sullo storico backfillato e con le fee reali (o presunte, marcate come tali), valuta la griglia `atr_tf in {6h, 1d}`, `k_tp in {3, 4, 5}`, `k_sl in {1.5, 2}`, `entry_mode in {maker, taker}`, `H in {5, 10, 15} giorni` e per ogni combinazione calcola: frequenza storica di UPPER (`p_hist`), `p_breakeven` mediano, `lift richiesto = p_breakeven - p_hist`, quota di timestamp che passano il fee floor, tasso di fill dell'ingresso maker, numero atteso di trade indipendenti per anno. Come sola diagnostica, che non entra nella regola di scelta, riporta anche la frequenza dell'esito VERTICAL (`p_vertical`) e il `net_ret` medio esatto dei soli esiti VERTICAL (`vert_mean_net_bps`): misurano quanto e' prudenziale l'EV a due esiti della sez. 0.3. Regola di scelta: tra le combinazioni con fee floor superato in >= 80% dei timestamp e fill maker >= 50%, si prende quella con lift richiesto minimo, a parita' quella con piu' trade indipendenti. Output: `label_config.json` + tabella Markdown in `data/reports/feasibility.md`. **Se nessuna combinazione ha lift richiesto <= 0.10, il report lo dichiara e il progetto non procede al training:** a quel tier di fee la strategia non e' sostenibile e va rivista (prodotti, fee, orizzonte) prima di scrivere altro codice.
+**Studio di fattibilita' (`training/feasibility.py`, prima del primo training).** Sullo storico backfillato e con le fee reali (o presunte, marcate come tali) valuta la griglia `atr_tf in {6h, 1d}`, `k_tp in {3, 4, 5}`, `k_sl in {1.5, 2}`, `entry_mode in {maker, taker}`, `H in {5, 10, 15, 20} giorni` (H = 20 solo diagnostica) sui sample della griglia oraria, con i prodotti in pool (un solo `label_config`).
+- **Finestra di selezione:** `holdout_start` = giorno UTC dell'ultima barra meno 120 giorni; si usano solo le barre con chiusura < `holdout_start - embargo` e i sample con `label_window_end` (calcolato con H = 20) < `holdout_start - embargo`. L'holdout non entra mai nella scelta; `holdout_start` viene scritto nel `label_config` (sez. 3.1.4).
+- **Lift senza drift:** ogni prodotto viene detrendizzato sulla finestra (`mu = (ln C[T1] - ln C[T0]) / (T1 - T0)`, `X~ = X * exp(-mu (i - i0))` su open, high, low, close); ATR e label si ricalcolano sulla serie detrendizzata; `lift_0 = p_breakeven - p_hist_0`, con `p_hist_0` = frequenza di UPPER sui sample con fill. La serie detrendizzata esiste solo dentro lo studio: non entra nello stato, nelle label di training ne' nello `sha256` (C7). Il lift grezzo e `lift_rw` sono riportati come informazione.
+- **Campioni indipendenti:** `N_p` = somma dei pesi di unicita' (sez. 3.1.4) dei sample con fill sul loro intervallo reale `[t, exit]`; `N_eff = sum_p N_p / (1 + (K-1) rho)`, con `rho` = correlazione media a coppie degli indicatori UPPER a stesso `t` (troncata in [0, 1]); `indep/yr = N_eff / anni`; `SE = sqrt(p (1-p) / N_eff)`.
+- **Eleggibilita':** fee floor superato in >= 80% dei sample, fill maker >= 50%, `p_vertical <= 0.05`, `H <= 15` giorni; per ogni (atr_tf, k_tp, k_sl, entry_mode) conta solo il piu' piccolo H eleggibile.
+- **Scelta:** `lift_0` minimo. Le combinazioni entro 0.01 dal minimo sono equivalenti: si sceglie quella con `N_eff` massimo, poi H minore, poi l'ordine lessicografico.
+- **GO** se `lift_0 <= 0.10` sul pool, `max_s lift_0(-s) <= 0.10` (jackknife: ricalcolo escludendo un semestre di calendario alla volta, `mu` invariato) e, per ogni prodotto, `lift_0,p <= 0.10 + 2 SE_p`. Altrimenti il report dichiara NO-GO con i motivi, `label_config.json` non viene scritto, l'exit code e' 3 e il progetto non procede al training.
+- **Diagnostiche senza soglia:** `p_vertical` e `vert_mean_net_bps` (prudenza dell'EV a due esiti, sez. 0.3), durate reali `exit - fill`, `p_hist` e lift per semestre e anno con SE, test chi2 di omogeneita' fra semestri, saturazione in H (flag `drift_dominated` se il lift grezzo a H = 20 scende di oltre 0.02 rispetto a H = 15), `sigma_r`, `W + L` e `N_min` per edge 0.05/0.08/0.10/0.15, ATR_6h mediano in bps per prodotto.
+
+Output: `label_config.json` (con `sha256`, `selection`, spread di label e metriche dello studio) + `data/reports/feasibility.md`.
 
 Label per domanda:
 
@@ -833,10 +863,10 @@ Label per domanda:
 
 #### 3.1.4 Campionamento, bilanciamento, split
 
-- **Campionamento:** non ogni minuto (autocorrelazione estrema, label quasi duplicate). Si usa l'unione di (a) una griglia oraria e (b) eventi del filtro CUSUM simmetrico sui log-rendimenti 1m con soglia `h = 1.0 * ATR_1h%`. Ordine di grandezza atteso: ~10–15k timestamp per prodotto per anno. Con un orizzonte di 10 giorni le label si sovrappongono molto: i pesi di unicita' (sotto) sono obbligatori, e il numero di **finestre indipendenti** (~36 per prodotto per anno) e' quello da usare quando si giudica la significativita' statistica.
-- **Bilanciamento:** `HOLD` domina. Sottocampionamento di `HOLD` a un rapporto massimo 3:1 rispetto alla classe di minoranza **solo nel train**; validation e test restano con la distribuzione naturale (necessaria per la calibrazione). Pesi per sample = unicita' media della label (inverso del numero di label concorrenti che si sovrappongono nel tempo), alla Lopez de Prado.
-- **Split:** walk-forward con espansione, 5 fold. Tra train e validation/test: **purge** dei sample la cui finestra `[t, t+T_in+H]` interseca il periodo di test + **embargo** di 2 giorni. Nessuno split casuale.
-- **Holdout finale:** ultimi 120 giorni, non toccati fino al gate finale.
+- **Campionamento:** non ogni minuto (autocorrelazione estrema, label quasi duplicate). Si usa l'unione di (a) una griglia oraria e (b) eventi del filtro CUSUM simmetrico sui log-rendimenti 1m con soglia `h = 1.0 * ATR_1h%`. Ordine di grandezza atteso: ~10–15k timestamp per prodotto per anno. Le label si sovrappongono molto: i pesi di unicita' (sotto) sono obbligatori, e per giudicare la significativita' statistica si usa `N_eff` dello studio di fattibilita' (sez. 3.1.3; `indep/yr` nel report), non il numero di righe.
+- **Bilanciamento:** `HOLD` domina. Sottocampionamento di `HOLD` a un rapporto massimo 3:1 rispetto alla classe di minoranza **solo nel train**; validation e test restano con la distribuzione naturale (necessaria per la calibrazione). Pesi per sample = unicita' media della label sul suo intervallo reale, alla Lopez de Prado: `[t, exit_idx]` per `edge` e `action` con fill, `[t, t+F+T_in-1]` per i `NO_FILL`, `[t, label_window_end(t)]` per `vol_regime`.
+- **Split:** walk-forward con espansione, 5 fold. Tra train e validation/test: **purge** dei sample con `label_window_end(t)` (sez. 3.1.3) >= inizio del periodo successivo - embargo, con **embargo** di 2 giorni (`training/splits.py`, `DEFAULT_EMBARGO`). Nessuno split casuale.
+- **Holdout finale:** inizia a `selection.holdout_start` del `label_config` (fissato dallo studio di fattibilita': giorno UTC dell'ultima barra meno 120 giorni) e comprende tutto lo storico successivo, che quindi cresce nel tempo. Non e' mai usato per scegliere `label_config`, modello o soglie; `build_dataset` passa questo valore a `purged_walk_forward(holdout_start=...)`.
 
 #### 3.1.5 Sentiment storico e feature dropout
 
@@ -873,7 +903,7 @@ Temperature scaling **per domanda** (`T_action`, `T_edge`, `T_regime`) sul valid
     "net_ret_bps": 1698,
     "fill_minute": 7,
     "exit_minute": 7215,
-    "atr_1d_bps": 460,
+    "atr_tf": "1d", "atr_bps": 460,
     "label_config_sha256": "a41c...",
     "questions_version": "QUESTIONS_V1:5e1a...",
     "sentiment_dropped": false
@@ -964,10 +994,12 @@ Perche' `restricted_label_ce` invece della CE standard sul vocabolario: la CE st
   "prompt_template": "PROMPT_TEMPLATE_V1",
   "questions_version": "QUESTIONS_V1:5e1a...",
   "state_schema": "chronos.state.v1",
-  "label_config": {"k_tp": 4.0, "k_sl": 2.0, "horizon_min": 14400, "atr": "ATR_14_1d", "entry_mode": "maker",
-                   "entry_timeout_min": 30, "cost_model": "COST_V1",
+  "label_config": {"k_tp": 4.0, "k_sl": 2.0, "horizon_min": 14400, "atr": "ATR_14_1d", "atr_tf": "1d", "entry_mode": "maker",
+                   "entry_timeout_min": 30, "entry_first_bar": 3, "cost_model": "COST_V1",
                    "fees_bps": {"maker": 60, "taker": 120, "source": "assumed"},
-                   "slip_bps": 5, "stop_extra_slip_bps": 10, "sha256": "a41c..."},
+                   "slip_bps": 5, "stop_extra_slip_bps": 10,
+                   "spread_bps": {"BTC-EUR": 3.0, "ETH-EUR": 3.0, "SOL-EUR": 3.0},
+                   "selection": {"holdout_start": "2026-06-20T00:00:00Z"}, "sha256": "a41c..."},
   "label_token_ids": {"action": [362, 425, 356], "edge": [809, 451], "vol_regime": [220, 16, 17, 18, 19]},
   "temperatures": {"action": 1.31, "edge": 1.12, "vol_regime": 1.07},
   "data": {"products": ["BTC-EUR", "ETH-EUR", "SOL-EUR"], "indicator_anchor": {"BTC-EUR": "2023-10-01T00:00:00Z"}, "train_range": ["2023-10-01", "2026-04-30"],
@@ -994,14 +1026,25 @@ Perche' `restricted_label_ce` invece della CE standard sul vocabolario: la CE st
 
 | Gate | Criterio |
 |------|----------|
-| G1 Calibrazione | ECE (15 bin) <= 0.05 per `edge` e per la classe BUY di `action`, su ogni fold di test. |
+| G0 Regime | Prima di ogni altro gate. Sull'holdout, con il `label_config` del modello e le barre grezze: `lift_holdout = p_breakeven - p_hist` (griglia oraria, sample con fill) <= `0.10 + 2 SE_holdout` (`N_eff` e `rho` come nello studio di fattibilita'). Se fallisce: NO-GO per cambio di regime, e lo studio va rifatto su dati nuovi. |
+| G1 Calibrazione | ECE (15 bin) <= 0.05 per `edge` e per la classe BUY di `action`, su ogni fold di test. Diagnostica senza soglia: ECE e bias firmato di `edge` sui soli sample con `p_edge >= p_edge_min`, sui fold di test concatenati. |
 | G2 Discriminazione | Log-loss di `edge` inferiore a quella del predittore a priori (frequenza base) su >= 4/5 fold. |
-| G3 Economico | Backtest event-driven (sez. 3.5) con fee reali e slippage: PnL netto e Sharpe del modello > baseline LightGBM su >= 3/5 fold **e** sull'holdout. |
+| GE Evidenza assoluta | E1-E5 sui trade del backtest (fold di test concatenati, policy congelata) e sull'holdout; esito GO / INCONCLUSO / NO-GO. Calcolato per il candidato e per il baseline LightGBM. |
+| G3 Economico relativo | Solo se il candidato non e' il baseline. Backtest event-driven (sez. 3.5) con fee reali e slippage: PnL netto e Sharpe del modello > baseline LightGBM su >= 3/5 fold **e** sull'holdout. |
 | G4 Robustezza | Con `sentiment = null` forzato su tutto l'holdout, il PnL netto non scende sotto il 70% di quello con sentiment. |
 | G5 Latenza | p99 server <= 150 ms sotto carico di N prodotti in parallelo. |
 | G6 Dry run | G-DRY-OPS della sez. 5.1.7 superato con il modello candidato come shadow book, piu' la regola di promozione L5 della sez. 5.1.6. |
 
-Se G3 fallisce, il sistema va in produzione con `BaselineDecider`. Il modello LLM deve guadagnarsi il posto con i numeri: questa e' la contromisura principale contro l'overfitting di un modello da 9B su pochi campioni indipendenti.
+Criteri GE (OOS = fold di test concatenati; blocchi del bootstrap di `ceil_days(T_in + F + H)`, circolari sul tempo, tutti i prodotti nello stesso blocco; 10 000 repliche, seed fisso):
+- E1 campione: >= 150 trade OOS e `N_eff_trade` >= 100 (peso di ogni trade `1 / (1 + rho * c)`, con `c` = numero di altri prodotti con un trade sovrapposto);
+- E2 significativita': percentile 2.5% del block bootstrap della media di `net_ret` (bps, non pesata) > 0, e PnL OOS in EUR > 0;
+- E3 selezione: test di permutazione contro ingressi casuali dello stesso fold e prodotto (fill e fee floor superato, una posizione per prodotto, stesso numero di trade), sul `net_ret` della label alla barra di decisione: p <= 0.05;
+- E4 concentrazione: nessun fold oltre il 50% del PnL OOS e >= 3/5 fold con PnL > 0;
+- E5 holdout: >= 5 trade, PnL > 0 e `z = (m_h - m_oos) / sqrt(se_h^2 + se_oos^2) > -1.96`.
+
+Esito: G0 fallito -> NO-GO; E1 fallito -> INCONCLUSO se la media OOS e' > 0, altrimenti NO-GO; tutti ok -> GO; E2 fallito con `t = media / SE >= 1.0` e gli altri ok (E5 ok o non valutabile) -> INCONCLUSO; E5 non valutabile e gli altri ok -> INCONCLUSO; altrimenti NO-GO.
+
+Deploy: la rampa R0 (sez. 5.1.7) richiede G0, G1, G2, G4 superati e GE = GO per il decider del book champion, piu' G3 se il candidato e' un LLM. Con GE = INCONCLUSO il champion gira solo in dry, con capitale live zero, finche' la rivalutazione di GE sui trade OOS piu' i trade chiusi del book champion in dry non da' GO. Se G3 fallisce si va in produzione con il `BaselineDecider`, alle stesse condizioni sul suo GE: il modello LLM deve guadagnarsi il posto con i numeri, e anche il baseline deve dimostrare un edge assoluto prima di usare capitale reale. `training/evaluate.py` esce con 0 (GO), 5 (INCONCLUSO) o 1 (altro).
 
 ### 3.5 Linee Guida per l'implementazione in Sonnet 5.5
 
@@ -1010,20 +1053,21 @@ Se G3 fallisce, il sistema va in produzione con `BaselineDecider`. Il modello LL
 > Crea il package `training/` e la directory `decider/` di Chronos v2. Python 3.12. Librerie: `polars` (dataset), `numpy`, `numba` (scansione barriere), `transformers`, `peft`, `bitsandbytes`, `accelerate`, `datasets`, `lightgbm`, `scikit-learn` (solo metriche), `scipy`, `fastapi`, `uvicorn`, `pydantic` v2. Niente `trl`: il trainer e' un `transformers.Trainer` con `compute_loss` custom.
 >
 > 1. `training/labeling.py`
->    - `triple_barrier(open, high, low, close, atr, t_idx, label_config: LabelConfig, costs: CostParams) -> (outcome: int8, fill_idx: int32, exit_idx: int32, net_ret: float64)` con l'algoritmo della sez. 3.1.3 (ingresso maker/taker, `NO_FILL`, regola conservativa "entrambe le barriere nella stessa barra -> LOWER", `net_ret` esatto). Kernel interno compilato con `@numba.njit` che riceve solo array e scalari; `CostParams` e' la vista numerica del `CostModel` della sez. 0.3 (`modules/risk/costs.py`), non una copia delle formule;
+>    - `triple_barrier(open, high, low, close, atr, t_idx, label_config: LabelConfig, fees: FeeRates, costs: CostParams, spread_bps) -> TripleBarrierResult(outcome, fill_idx, exit_idx, net_ret, entry_px)` con l'algoritmo della sez. 3.1.3 (ingresso maker/taker, `NO_FILL`, regola conservativa "entrambe le barriere nella stessa barra -> LOWER", `net_ret` esatto). Kernel interno compilato con `@numba.njit` che riceve solo array e scalari; `CostParams` e' la vista numerica del `CostModel` della sez. 0.3 (`modules/risk/costs.py`), non una copia delle formule;
 >    - `forward_rv_bucket(...)` con la definizione della sez. 3.1.3, usando `indicators_batch.rv_per_day_bps` (quantili sui 365 giorni **precedenti** a ogni t, nessun dato futuro);
+>    - `label_window_end(ts_bar_close, label_config)` e `load_label_config(path)` (verifica dello `sha256`, exit code 2 se non coincide);
 >    - test con serie sintetiche costruite a mano per ogni esito (UPPER, LOWER, VERTICAL, NO_FILL, stessa barra) e un test che ricalcola a mano il `net_ret` dell'esempio della sez. 0.3.
 > 2. `training/sampling.py` — `cusum_events(log_ret, h)` e griglia oraria; `uniqueness_weights(t0, t1)`.
-> 2b. `training/feasibility.py` — CLI `python -m training.feasibility --products BTC-EUR ETH-EUR SOL-EUR [--fees-from-probe data/probe/coinbase_probe.json]`, studio della sez. 3.1.3 con la regola di scelta e lo stop esplicito se nessuna combinazione e' sostenibile. Produce `label_config.json` (con `sha256`) e `data/reports/feasibility.md`. Va eseguito **prima** di `build_dataset.py`.
-> 3. `training/splits.py` — `purged_walk_forward(timestamps, t1, n_folds=5, embargo=timedelta(hours=24))` che produce indici; test che verifica l'assenza di sovrapposizione tra intervalli `[t, t1]` di train e di test.
+> 2b. `training/feasibility.py` — CLI `python -m training.feasibility --products BTC-EUR ETH-EUR SOL-EUR [--fees-from-probe data/probe/coinbase_probe.json]`, studio della sez. 3.1.3 (finestra pre-holdout, `lift_0`, eleggibilita', pareggio su `N_eff`, jackknife, guardia per prodotto) e stop esplicito (exit code 3) se non e' un GO. Produce `label_config.json` (con `sha256`) e `data/reports/feasibility.md`. Va eseguito **prima** di `build_dataset.py`.
+> 3. `training/splits.py` — `purged_walk_forward(timestamps, t1, n_folds=5, embargo=timedelta(days=2), holdout_days=120, val_frac=0.15, holdout_start=None)` che produce indici (`timestamps` = `ts_bar_close`, `t1` = `label_window_end`); `holdout_start_from(last_ts_bar_close, holdout_days)`; test che verifica l'assenza di sovrapposizione tra intervalli `[t, t1]` di train e di test.
 > 4. `training/build_dataset.py` — CLI: `python -m training.build_dataset --config config/train.yml`. Passi: carica candele 1m da Parquet -> calcola indicatori con `modules.market.indicators_batch.compute_indicators` sull'intero storico del prodotto (ancora sez. 2.2.1.b), poi seleziona i timestamp (sample con `atr_14_<atr_tf>` NaN esclusi) -> ricostruisce sentiment storico da `data/news_history.db` con `modules.sentiment.aggregator` (stesso codice del runtime) -> costruisce `DecisionState` con `modules.features.state_builder` e serializza con `modules.features.serializer.serialize_state` (stesso codice del runtime) -> genera sample FLAT e LONG sintetici -> label -> feature dropout 25% sul blocco sentiment nel solo train -> scrive `data/datasets/<run_id>/{train,val,test}.jsonl` e `label_config.json`. Fallisce se un token di etichetta non e' single-token.
 > 5. `training/prompting.py` — `PROMPT_TEMPLATE_V1`, `render_prompt(state, question) -> str`, `label_token_ids(tokenizer, question) -> list[int]`. Importato sia dal trainer sia dal server.
 > 6. `training/train_lora.py` — carica il base model (4-bit NF4 se `quantization.load_in_4bit`), `prepare_model_for_kbit_training`, `get_peft_model(LoraConfig(...))` dai parametri della sez. 3.2.3. Collator: tokenizza `prompt` (senza token di etichetta), registra la posizione dell'ultimo token e gli id dei token di etichetta della domanda. `compute_loss`: `logits_last = outputs.logits[arange(B), last_pos]`, `restricted = logits_last.gather(1, label_ids_padded)` con mascheramento `-inf` dove le domande hanno meno opzioni, `loss = (F.cross_entropy(restricted, target_index, reduction="none") * weight).mean()`. Valutazione ogni 500 step con log-loss ristretta e accuracy per domanda. Salva adapter e tokenizer.
 > 7. `training/calibrate.py` — inferenza sul validation set, ottimizzazione di `T_q` per domanda (NLL, `minimize_scalar`), ECE e Brier prima/dopo, reliability diagram PNG con matplotlib. Scrive `temperatures` nel model card.
-> 8. `training/backtest.py` — simulatore event-driven barra per barra che usa **la stessa** `DecisionPolicy` e lo **stesso** `RiskManager` del runtime (sez. 4) con un `SimulatedExchange` (fill del limit se `low <= limit` per BUY; bracket TP/SL simulati con la regola conservativa; fee maker/taker da config). Output: equity curve, trade list, Sharpe annualizzato, max drawdown, profit factor, turnover, fee pagate.
+> 8. `training/backtest.py` — simulatore event-driven barra per barra che usa **la stessa** `DecisionPolicy` e lo **stesso** `RiskManager` del runtime (sez. 4) con un `SimulatedExchange` (fill del limit se `low <= limit` per BUY; bracket TP/SL simulati con la regola conservativa; fee maker/taker da config); decisione alla barra `t`, ordine prezzato a `close[t+F-1]` ed eseguibile dalla barra `t+F` (`entry_first_bar`), SELL del modello a `open[t'+F]`, nella barra di fill solo lo SL, tutto con i kernel di `modules/dryrun/fill_model.py`; ogni fold riparte da `backtest.starting_quote`; nell'ultimo fold nessun ingresso con `label_window_end >= holdout_start - embargo`. La trade list contiene `product, fold, decision_ts, decision_idx, fill_ts, exit_ts, exit_reason, net_ret_bps, pnl_eur, base_size, notional_eur`. Output: equity curve, trade list, Sharpe annualizzato, max drawdown, profit factor, turnover, fee pagate.
 > 9. `training/baseline_lgbm.py` — addestra tre LightGBM sugli stessi split usando `flatten_state()`, salva in `models/baseline/`.
 > 10. `training/tune_policy.py` — grid search delle soglie su validation -> `policy.json`. Ogni combinazione di soglie viene valutata eseguendo `training/backtest.py` (stessa `DecisionPolicy`, stesso `RiskManager`, quindi fee floor ed EV gate della sez. 0.3 attivi). E' vietata una simulazione semplificata che salti il RiskManager.
-> 11. `training/evaluate.py` — esegue G1–G4 della sez. 3.4 e stampa una tabella; exit code 1 se un gate fallisce.
+> 11. `training/evaluate.py` — esegue G0, G1, G2, GE (E1-E5), G3, G4 della sez. 3.4 senza fermarsi al primo fallimento e stampa una tabella; exit code 0 se tutto passa con GE = GO, 5 se GE = INCONCLUSO e il resto passa, 1 altrimenti.
 > 12. `decider/server.py` + `decider/Dockerfile` (base `nvidia/cuda` runtime + torch CUDA) secondo la sez. 3.3. Schemi request/response pydantic identici a `modules/decision/client.py` (pacchetto condiviso `modules/decision/protocol.py`). Merge dell'adapter in `decider/export.py`.
 >
 > Test di parita' obbligatorio (`tests/test_train_serve_parity.py`): dato uno stato golden e un modello tiny (`hf-internal-testing/tiny-random-Qwen2` o equivalente), le probabilita' calcolate dal percorso di training (`compute_loss` in eval) e quelle restituite dal server devono coincidere (tolleranza 1e-4).
@@ -1385,13 +1429,13 @@ Il `FillModel` e' **lo stesso oggetto** usato dal dry run (a livello di tick), d
 
 | Evento | Regola dry (tick-level) | Approssimazione backtest (bar-level) | Fee |
 |--------|------------------------|--------------------------------------|-----|
-| Ingresso taker, parte marketable | Walk degli ask al primo snapshot del book dopo `t0 + latency_ms`, fino al prezzo limite. | `open[t+1] * (1 + spread/2 + slip_bps)` | taker |
-| Ingresso maker (post-only, intero ordine) e residuo taker | Fill solo su trade con prezzo < limite (strettamente); `qty <= queue_haircut * volume_oltre_limite`. Se al momento dell'arrivo il limite incrocerebbe il book, l'ordine e' rifiutato come farebbe l'exchange con `post_only`. | Fill se `low[t+k] < limit` entro `T_in`, haircut sul volume della barra. | maker |
+| Ingresso taker, parte marketable | Walk degli ask al primo snapshot del book dopo `t0 + latency_ms`, fino al prezzo limite. | `open[t+F] * (1 + spread/2 + slip_bps)`, con F = `entry_first_bar` | taker |
+| Ingresso maker (post-only, intero ordine) e residuo taker | Fill solo su trade con prezzo < limite (strettamente); `qty <= queue_haircut * volume_oltre_limite`. Se al momento dell'arrivo il limite incrocerebbe il book, l'ordine e' rifiutato come farebbe l'exchange con `post_only`. | Limite `close[t+F-1] * (1 - spread/2)`; fill se `low[k] < limit` per k in `[t+F, t+F+T_in-1]`, haircut sul volume della barra. | maker |
 | Timeout ingresso | Cancella il residuo. | Uguale. | — |
 | TP (limit sell) | Trade con prezzo > TP; haircut sulla quantita'. | `high > TP`. | maker |
-| SL (stop) | Trigger su `last <= stop`; walk dei bid + `stop_extra_slip_bps`. | `min(stop, open)` se la barra apre sotto lo stop (gap), altrimenti `stop * (1 - stop_extra_slip_bps)`. | taker |
+| SL (stop) | Trigger su `last <= stop`; walk dei bid + `stop_extra_slip_bps`. | `min(stop, open) * (1 - (spread/2 + slip_bps + stop_extra_slip_bps))`; nella barra di fill vale solo lo SL (watchdog senza bracket). | taker |
 | TP e SL nello stesso evento o barra | SL. | SL. | — |
-| Uscita del modello (SELL) / watchdog | Walk dei bid. | `open[t+1] * (1 - spread/2 - slip_bps)`. | taker |
+| Uscita del modello (SELL) / watchdog | Walk dei bid. | `open[t+F] * (1 - spread/2 - slip_bps)` per una decisione presa a `t`. | taker |
 | Gap di dati (WS disconnesso con posizione aperta) | Alla riconnessione si scaricano le candele 1m del gap via REST; se `low <= SL` nel gap, SL eseguito a `min(SL, open della barra di trigger)`; trade marcato `gap_resolved=true`. | n/a | taker |
 
 Parametri iniziali, conservativi e configurabili: `latency_ms = 300`, `queue_haircut = 0.25`, `stop_extra_slip_bps = 10`. Le fee sono quelle **reali** del tier dell'account, lette con `get_transaction_summary` (lettura consentita dalla key View) e aggiornate ogni ora; se la chiamata fallisce si usano i valori di config, piu' alti per prudenza.
@@ -1412,7 +1456,7 @@ Ogni book ha il proprio `VirtualAccount` (saldo quote, saldo base, fee pagate, e
 
 #### 5.1.5 Label live: il bot impara anche dalle decisioni non prese
 
-Ogni minuto e per ogni prodotto il `DecisionEngine` scrive un `DecisionRecord`, anche quando la decisione e' HOLD o SKIP. Il `LabelResolver` gira ogni minuto: per ogni record con `t + H <= now` calcola le label (triple-barrier, `edge`, `vol_regime`) sulle barre 1m reali registrate, usando **la stessa funzione** `training/labeling.py` del dataset storico. Output in `data/live_labels/YYYY-MM-DD.jsonl` nel formato esatto della sez. 3.2.1 (con `split: "live"`).
+Ogni minuto e per ogni prodotto il `DecisionEngine` scrive un `DecisionRecord`, anche quando la decisione e' HOLD o SKIP. Il `LabelResolver` gira ogni minuto: per ogni record con `label_window_end(t) <= now` (sez. 3.1.3) calcola le label (triple-barrier, `edge`, `vol_regime`) sulle barre 1m reali registrate, usando **la stessa funzione** `training/labeling.py` del dataset storico. Output in `data/live_labels/YYYY-MM-DD.jsonl` nel formato esatto della sez. 3.2.1 (con `split: "live"`).
 
 Effetti:
 - ogni minuto produce esempi etichettati (non solo i pochi trade eseguiti);
@@ -1421,7 +1465,7 @@ Effetti:
 
 #### 5.1.6 Apprendimento sul campo: cosa si impara, e quando
 
-Con i parametri v1 (sez. 0.4) una label si risolve solo dopo `T_in + H` (circa 10 giorni) e ci sono circa **36 finestre indipendenti per prodotto all'anno**. Quindi:
+Con i parametri del `label_config` (sez. 0.4) una label si risolve solo a `label_window_end(t)` (circa 15.5 giorni con H = 15), e i campioni indipendenti per prodotto e anno sono `indep/yr` del report di fattibilita'. Quindi:
 - nella **prima settimana** di dry run non si risolve nessuna label: il bot non puo' imparare l'edge dal campo in una settimana, a nessuna condizione;
 - la **prova statistica dell'edge** viene dal backtest walk-forward su 3 anni di storico (sez. 3.4, G3), non dal dry run;
 - il dry run impara subito tutto cio' che **non** dipende dall'esito dei trade: costi reali, tasso di fill degli ingressi maker, latenza, coerenza tra pipeline live e pipeline di training;
@@ -1438,7 +1482,7 @@ Le soglie minime sono espresse in **campioni effettivi** (`n_eff` = somma dei pe
 | L3 Refit baseline | Mensile (1° del mese) | LightGBM riaddestrato su storico esteso fino a ieri + label live risolte (peso 2), stessi split purgati. | Storico aggiornato. | Modello challenger |
 | L1 Calibrazione | Con L3 | Platt per `edge`, temperature per `action`/`vol_regime`, sul fold di validation piu' recente (storico). Le label live servono a **misurare** la calibrazione, non a fittarla. | `n_eff` del fold >= 300. | `calibration.json` del challenger |
 | L2 Soglie di policy | Con L3 | `tune_policy.py` sul validation piu' recente. | Come L1. | `policy.json` del challenger |
-| L5 Promozione | Con L3 | Challenger -> champion se (a) batte il champion nel backtest walk-forward che include gli ultimi 90 giorni (PnL netto, Sharpe, max DD non peggiore) **e** (b) gira come book `challenger` in dry da >= 14 giorni senza anomalie operative ne' di parita'. Il confronto dei PnL delle shadow book a 14 giorni non e' un criterio: con trade da 10 giorni e' rumore. | Entrambe. | Nuova versione nel `ModelRegistry` |
+| L5 Promozione | Con L3 | Challenger -> champion se (a) batte il champion nel backtest walk-forward che include gli ultimi 90 giorni (PnL netto, Sharpe, max DD non peggiore) **e** (b) gira come book `challenger` in dry da >= 14 giorni senza anomalie operative ne' di parita'. Il confronto dei PnL delle shadow book a 14 giorni non e' un criterio: con trade di piu' giorni e' rumore. | Entrambe. | Nuova versione nel `ModelRegistry` |
 
 Regole invarianti:
 - nessun parametro cambia durante la giornata; il `DecisionEngine` ricarica gli artefatti promossi alle 00:30 UTC con uno swap atomico del riferimento e logga `model_version_changed`;
@@ -1462,7 +1506,7 @@ Il gate e' diviso in due, perche' a questo orizzonte la parte economica richiede
 | Costi | Fill rate maker misurato >= 50%; spread mediano entro 2x quello assunto nelle label |
 | Fee floor | Quota di intent scartati per `fee_floor` < 80% |
 
-**G-DRY-ECON** (sul book `champion`, guidato dal numero di trade, valutato in continuo; con circa 36 finestre per prodotto all'anno su 3 prodotti, 30 trade richiedono indicativamente 3–4 mesi):
+**G-DRY-ECON** (sul book `champion`, guidato dal numero di trade, valutato in continuo; il tempo necessario per 30 trade si ricava dalla frequenza di trade del backtest):
 
 | Criterio | Soglia |
 |----------|--------|
@@ -1477,7 +1521,7 @@ Il gate e' diviso in due, perche' a questo orizzonte la parte economica richiede
 
 | Gradino | Prerequisito | Capitale live | Size | Condizione per salire |
 |---------|--------------|---------------|------|-----------------------|
-| R0 live-micro | G-DRY-OPS **e** gate G3 della sez. 3.4 sul backtest | Minimo operativo (es. 20–50 EUR) | `min_size` della sez. 4.1.2 (circa 1–2 EUR di controvalore per trade, perdita massima a SL di pochi centesimi) | 10 trade live con parity report entro le tolleranze |
+| R0 live-micro | G-DRY-OPS **e** gate della sez. 3.4 superati con GE = GO | Minimo operativo (es. 20–50 EUR) | `min_size` della sez. 4.1.2 (circa 1–2 EUR di controvalore per trade, perdita massima a SL di pochi centesimi) | 10 trade live con parity report entro le tolleranze |
 | R1 | G-DRY-ECON | Capitale iniziale scelto dall'utente | Sizing a rischio della sez. 4.1.2 | 30 trade live, PF >= 1.2, DD <= 5% |
 | R2+ | R1 superato | Raddoppio per gradino | Sizing a rischio | Stesse condizioni di R1 sul gradino corrente |
 

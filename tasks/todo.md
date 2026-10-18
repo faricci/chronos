@@ -120,3 +120,27 @@ Lanciato con `python -m script.probe_coinbase --products BTC-EUR ETH-EUR SOL-EUR
 - Fee reali: tier `Intro`, maker 25 bps, taker 50 bps, volume 30 giorni 0. Sono inferiori alle fee presunte della spec (60/120): le presunte restano come fallback prudente (`FallbackFees`), non cambiano i default.
 - Level2 senza e con autenticazione: ricevuto `l2_data` in entrambi i casi.
 - Fattibilita' con le fee reali (maker, k=4/2, 1d): lift richiesto +0,05 BTC, +0,03 ETH, +0,03 SOL.
+
+## 13. P1 in corso (avviato 2026-10-18)
+
+Perimetro (Appendice A): `training/feasibility.py` PER PRIMO; poi sentiment (sez. 1); poi la parte CPU della sez. 3 (label, split, `BaselineDecider`, backtest). Il backtest vuole `DecisionPolicy`, `RiskManager`/`sizing` e `BarFillModel` (sez. 3.5 punto 8): questi pezzi di P2/P3 vengono anticipati nella misura minima necessaria, con i tripwire di copertura (C11) che restano validi.
+
+- [x] `modules/dryrun/fill_model.py` (`FillModelParams`, `BarFillModel`, kernel numba condivisi con le label); la faccia a tick (`TickFillModel`) e' di P3
+- [x] `training/labeling.py` (`triple_barrier` numba, `forward_rv_bucket`; T8/T9), `modules/risk/label_config.py` (`LabelConfig` condiviso col runtime)
+- [x] `training/sampling.py` (CUSUM, griglia oraria, pesi di unicita'), `training/splits.py` (walk-forward purgato, holdout 120 giorni)
+- [x] `training/feasibility.py` v2.7 (risoluzione architetto + quant: `docs/decisions/2026-10-18-fattibilita.md`) eseguito sullo storico reale: **GO**, `data/datasets/label_config.json` scritto (6h, 3/1.5, maker, H=15 g, F=3, spread 3 bps, `lift_0` +0,074, N_eff 665, jackknife max +0,089; holdout dal 2026-06-20). Spec alla v2.7.
+- [x] `modules/features/{schemas,serializer}` (+ golden), `modules/decision/{protocol,questions,policy,client}`, `modules/risk/{sizing,risk_manager}` (T4, controllo a mutazioni: 14/14 intercettate)
+- [x] ricalcolo della fattibilita' con le regole del quant/architetto (K1-K6) e aggiornamento della spec alla 2.7
+- [x] O1/O2/O3 risolti dall'architetto (`docs/decisions/2026-10-18-stato-backtest-baseline.md`, `...-spread.md`): lo stato non contiene lo spread (`costs` dal `label_config`), backtest a 1 minuto per i gate e 15 per la ricerca, iperparametri del baseline
+- [x] `modules/features/{state_builder,state_matrix}` (T10: 27.168 stati identici byte per byte fra percorso batch e incrementale; matrice vettoriale = percorso scalare), `modules/decision/baseline` (`BaselineDecider`)
+- [x] `training/{config,build_dataset,baseline_lgbm,fold_spans,backtest,tune_policy,evaluate}`; `modules/dryrun/{sim_exchange,bar_gateway,virtual_account}`, `modules/risk/kill_switch` (questi ultimi due da sub-agente), `modules/execution/ids`
+- [x] dataset reale costruito (`data/datasets/<run>`, 159.000 righe) e baseline addestrato (`models/baseline/baseline-lgbm@2026-10-18.1`)
+- [ ] tuning delle soglie sul modello reale, poi `python -m training.evaluate` (gate G0, G1, G2, GE): in corso
+- [ ] spec 2.8 (testo O1.7/O2/O3 dell'architetto), sentiment: servizio di raccolta news avviato (PID in `data/reports/sentiment_collect.pid`)
+
+## 14. Esito dello studio di fattibilita' (2026-10-18, v2.7)
+
+- Verdetto GO. Combinazione: `atr_tf` 6h, `k_tp/k_sl` 3/1.5, ingresso maker, H = 15 giorni, `entry_first_bar` 3, spread di label 3 bps (probe con minimo 3). Pareggio entro 0,01 con 4/1.5 e 3/2, risolto con N_eff.
+- `lift_0` +0,074 (il modello deve portare P(UPPER) da circa 0,33 a 0,405: +7,4 punti), lift grezzo +0,058; per prodotto BTC +0,095, ETH +0,062, SOL +0,074 (tutti dentro la guardia). Jackknife semestrale: massimo +0,089 (limite 0,10): il margine e' stretto. Il semestre 2023H2 ha lift -0,096 (rialzo); il chi2 di omogeneita' fra semestri ha p = 0,004: il tasso base dipende dal regime.
+- N_eff 665 campioni indipendenti (rho 0,54), circa 254 l'anno; durata mediana dei trade 48 h, p95 257 h. Per rilevare un edge di 0,08 servono circa 345 trade indipendenti (K5): il backtest da solo e' al limite della potenza; gate GE e dry run decidono.
+- Le cifre sono sulla finestra di selezione (fino al 2026-06-18): l'holdout (dal 2026-06-20) non e' ancora stato guardato; G0 lo fara' dopo l'addestramento.

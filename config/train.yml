@@ -1,0 +1,19 @@
+# Training tools (training/*.py). Barriers, fees, spread and the holdout are NOT here: they come from
+# data/datasets/label_config.json, written by `python -m training.feasibility`.
+data_root: data
+products: [BTC-EUR, ETH-EUR, SOL-EUR]
+label_config: data/datasets/label_config.json
+app_config: null          # path of an AppConfig YAML (risk, fill model, timeouts); null = built-in defaults
+datasets_dir: data/datasets
+models_dir: models/baseline
+seed: 1234
+n_folds: 5
+val_frac: 0.15
+embargo_days: 2
+sentiment_history_db: data/news_history.db
+backtest:
+  starting_quote: "100.00"
+  tune_decision_every_min: 15
+  eval_decision_every_min: 1
+lgbm:
+  num_threads: 4

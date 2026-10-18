@@ -13,3 +13,14 @@ collect_ignore = [
     "test_trading_logic.py",
     "test_vector_storage.py",
 ]
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _ignore_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests must never read the developer's real ``.env`` (it holds a real API key)."""
+    from modules.config import CoinbaseConfig
+
+    monkeypatch.setitem(CoinbaseConfig.model_config, "env_file", None)
