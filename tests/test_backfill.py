@@ -17,6 +17,7 @@ from modules.market.backfill import (
     BarStore,
     CandleSource,
     CoinbaseCandleSource,
+    StoreCandleSource,
     build_report,
     candles_to_frame,
     fill_flat_bars,
@@ -68,7 +69,7 @@ class FakeSource:
 
 
 def make_backfiller(
-    tmp_path: Path, source: CandleSource, now: datetime, *, window: int = 300, retries: int = 3
+    tmp_path: Path, source: CandleSource, now: datetime, *, window: int = 300, retries: int = 3, settle_s: float = 0.0
 ) -> Backfiller:
     return Backfiller(
         store=BarStore(tmp_path / "bars" / "1m"),
@@ -77,6 +78,7 @@ def make_backfiller(
         cfg=BackfillConfig(window_minutes=window, max_retries=retries),
         clock=lambda: now + timedelta(seconds=17),  # mid-minute: the open minute must not be fetched
         retry_wait=wait_none(),
+        settle_s=settle_s,
     )
 
 
@@ -163,9 +165,7 @@ def test_load_bars_uses_previous_month_close_when_start_is_in_a_gap(tmp_path: Pa
 def test_load_bars_defaults_and_unknown_product(tmp_path: Path) -> None:
     assert load_bars(tmp_path, "NOPE-EUR").empty
     store = BarStore(tmp_path)
-    store.write(PRODUCT, candles_to_frame(
-        [candle(T0), candle(T0 + timedelta(minutes=4))], sec(T0), sec(T0) + 600
-    ))
+    store.write(PRODUCT, candles_to_frame([candle(T0), candle(T0 + timedelta(minutes=4))], sec(T0), sec(T0) + 600))
     bars = load_bars(tmp_path, PRODUCT)
     assert len(bars) == 5 and bars.index.tz is not None
 
@@ -336,3 +336,33 @@ def test_load_bars_start_after_all_stored_data_is_empty(tmp_path: Path) -> None:
     store = BarStore(tmp_path)
     store.write(PRODUCT, candles_to_frame([candle(T0)], sec(T0), sec(T0) + 60))
     assert load_bars(tmp_path, PRODUCT, start=T0 + timedelta(hours=5), end=T0 + timedelta(hours=6)).empty
+
+
+async def test_end_respects_settle_s(tmp_path: Path) -> None:
+    """A minute is downloaded only when ts + 1 min + S <= now, i.e. when its REST candle is final."""
+    start = datetime(2026, 3, 1, 0, 0, tzinfo=UTC)
+    now = start + timedelta(minutes=10, seconds=-17)  # make_backfiller adds 17 s: the clock reads 10:00:00 sharp
+    src = FakeSource(minutes(start, 10))
+    bf = make_backfiller(tmp_path, src, now, settle_s=30.0)
+    # clock = start + 10 min; with S = 30 s the minute 09:59 (ends at 10:00:00) is not final until 10:00:30
+    (report,) = await bf.run([PRODUCT], start)
+    assert report.last == start + timedelta(minutes=8)  # minutes up to 09:58 (ts + 1 min + 30 s <= 10:00:00)
+    assert src.requests[-1][1] == sec(start + timedelta(minutes=9))  # the window ends exclusive at 09:59
+    later = make_backfiller(tmp_path, FakeSource(minutes(start, 10)), now + timedelta(seconds=30), settle_s=30.0)
+    (again,) = await later.run([PRODUCT], start)
+    assert again.last == start + timedelta(minutes=9) and again.rows == 10
+
+
+def test_store_candle_source_round_trips_exactly_through_candles_to_frame(tmp_path: Path) -> None:
+    store = BarStore(tmp_path)
+    raw = [candle(T0 + timedelta(minutes=i), 100.0 + i * 0.1234567891, volume=1.0 / 3.0 + i) for i in range(6)]
+    raw.append(candle(datetime(2026, 2, 1, 0, 1, tzinfo=UTC), 7.5))  # in the window, but in the next month's file
+    start, end = sec(T0), sec(T0) + 7200
+    store.write(PRODUCT, candles_to_frame(raw, 0, 4_000_000_000))
+    source = StoreCandleSource(tmp_path)
+    got = candles_to_frame(source.fetch(PRODUCT, start, end), start, end)
+    want = candles_to_frame(raw, start, end)
+    assert len(got) == 7 and got.equals(want)  # float for float: the replay sees what the live service saw
+    assert source.fetch(PRODUCT, sec(T0) + 7200, sec(T0) + 9000) == []  # nothing stored in that interval
+    assert source.fetch(PRODUCT, sec(T0), sec(T0) + 120)[-1]["start"] == str(sec(T0) + 60)  # end is exclusive
+    assert source.fetch("ETH-EUR", start, end) == []

@@ -1,6 +1,6 @@
 # Chronos v2 — Specifica Tecnica "System 1" Decision Architecture
 
-Versione: 2.5-draft | Data: 2026-10-17 | Stato: proposta per implementazione
+Versione: 2.6.1-draft | Data: 2026-10-18 | Stato: proposta per implementazione
 Target implementatore: Sonnet 5.5 (ogni blocco "Linee Guida" e' scritto per essere usato come prompt diretto)
 
 Changelog 2.1: perimetro infrastrutturale a costo zero (locale, CPU-only, AWS fuori scope); nuova sez. 5 "Dry Run"; piano di rilascio riscritto; la sandbox Coinbase e' statica e non viene piu' usata per validare i payload.
@@ -35,6 +35,10 @@ Changelog 2.4.1 (allineamento all'implementazione, nessun cambio di comportament
 - tipi condivisi in `modules/execution/orders.py`, fill idempotenti per `trade_id`, test di collegamento `tests/test_c11_wiring.py`, v1 `order_execution.py` disattivato (4.1.6).
 
 Changelog 2.5 (definizione esatta delle feature): nuova sez. 2.2.1.b (formule, minimi storici, unita'; serie HTF solo su barre chiuse; ancora unica dello storico); rimosso `liquidity.trades_z_1d` (non ricostruibile dallo storico OHLCV); `vol_z_1d` su `ln(1 + quote volume)`; warm-up del runtime = replay completo (2.3 A.4); label `vol_regime` con la stessa `RVd` dello stato e quantili su finestre concluse (3.1.3).
+
+Changelog 2.6 (fonte canonica delle barre 1m): le barre 1m del runtime sono le candele REST `get_public_candles` lette `S` secondi dopo la chiusura del minuto (`BarService`, sez. 2.3 A.2), la stessa fonte dello storico; i trade WebSocket non costruiscono piu' barre (`BarAggregator` eliminato); la decisione si calcola a `t + S` con `ts_bar_close = t`; nuova sezione `market.bars` della config; guardia stale separata per barre (`stale_bar_s`) e ticker; audit notturno delle revisioni REST (L0) e criterio G-DRY-OPS relativo; replay delle barre dallo store (`StoreCandleSource`).
+
+Changelog 2.6.1 (taratura di S, misure del 2026-10-18): le candele REST cambiano fino a ~92 s dopo la chiusura (0 su 70 dopo 120 s; nessuna revisione sulle candele con eta' >= 1 h): `market.bars.rest_delay_s` = 120 s (validator 60..300) e valori derivati `rest_max_delay_s` = 180, `decision_max_lag_s` = 240, `stale_bar_s` = 270; nuovo validator `decision_max_lag_s < stale_bar_s`; scala di taratura di S guidata da `rest_revision_ratio` (sez. 2.3 A.2).
 
 ---
 
@@ -71,7 +75,8 @@ Questi vincoli valgono per tutte le sezioni. Sono il motivo di molte scelte che 
 
 ```
                       +-------------------- container: chronos (CPU) ---------------------+
- Coinbase WS ---------> MarketStream -> BarAggregator(1m) -> IndicatorEngine(1m,1h,6h,1d) |
+ Coinbase WS ---------> MarketStream -> LocalOrderBook, trade (spread, simulatori)        |
+ Coinbase REST -------> BarService(1m, T+S) ------------> IndicatorEngine(1m,1h,6h,1d)    |
  (market_trades,      |                                         |                         |
   ticker, user)       |                                         v                         |
                       |  RSS/CryptoPanic -> NewsIngestor -> SentimentClassifier(ONNX)     |
@@ -186,15 +191,18 @@ Componenti trasversali che le sezioni 1–5 danno per esistenti. Sono il primo l
 
 **Backfill storico** (`modules/market/backfill.py`, CLI `python -m modules.market.backfill --products BTC-EUR ETH-EUR SOL-EUR --start 2023-10-01`):
 - `RESTClient().get_public_candles(granularity="ONE_MINUTE")` senza chiavi, finestre di 300 minuti (limite API 350 candele), dalla data piu' recente gia' salvata in avanti, oppure da `--start` se non c'e' nulla; ripresa idempotente dopo interruzione;
+- limite superiore esclusivo `floor_minute(now - market.bars.rest_delay_s)` (default 120 s; il `Backfiller` riceve lo stesso valore come `settle_s`, senza chiave propria): un minuto viene scaricato solo quando `ts + 1 min + S <= now`, cioe' quando la candela REST e' definitiva (stessa regola del `BarService`). Storico e runtime leggono la stessa versione della candela;
 - rate limit client-side configurabile (default 5 req/s) con `aiolimiter`, retry `tenacity` su 429/5xx;
 - scrittura Parquet partizionata per prodotto/anno/mese, schema `ts (UTC, inizio minuto), open, high, low, close, volume`; dedup su `ts`;
-- i minuti senza candela non sono errori (nessuno scambio): **non** vengono scritti; il loader (`load_bars()`) li ricostruisce come barre piatte (`OHLC = close precedente`, `volume = 0`), con la stessa regola del `BarAggregator` live. `load_bars(end=...)` taglia `end` all'ultima barra reale salvata: oltre quel punto non si distingue un mercato fermo da dati mai scaricati, e inventare barre piatte falserebbe feature e label. Il parametro `store_complete_until_end=True` esiste solo per chi sa che lo store e' completo fino a `end` (recorder live);
+- i minuti senza candela non sono errori (nessuno scambio): **non** vengono scritti; il loader (`load_bars()`) li ricostruisce come barre piatte (`OHLC = close precedente`, `volume = 0`), con la stessa regola del `BarService` live (sez. 2.3 A.2). `load_bars(end=...)` taglia `end` all'ultima barra reale salvata: oltre quel punto non si distingue un mercato fermo da dati mai scaricati, e inventare barre piatte falserebbe feature e label. Il parametro `store_complete_until_end=True` esiste solo per chi sa che lo store e' completo fino a `end` (recorder live);
 - report finale per prodotto: righe, intervallo, percentuale di minuti coperti, buchi piu' lunghi di 60 min;
 - ordine di grandezza: ~1.6 M righe e ~5.300 richieste per prodotto per 3 anni (~20 min per prodotto a 5 req/s).
 
+**Invarianti delle barre 1m.** (I1) Esiste una sola definizione di barra 1m: la candela REST `ONE_MINUTE` definitiva. Storico, runtime, store, label, replay e training usano solo questa; nessuna barra costruita dai trade WebSocket entra nello stato, nello store o nelle label (le due serie differiscono nell'assegnazione dei trade ai minuti, misurato il 2026-10-17, e lo scarto cambierebbe i token dello stato). (I2) Per ogni prodotto la sequenza di barre consumate dall'`IndicatorEngine` coincide con `load_bars(store)`: lo store e' la registrazione di cio' che il runtime ha consumato e non viene mai riscritto per correggere revisioni successive dell'exchange, che sono solo misurate (sez. 5.1.6, L0).
+
 Ordine di implementazione P0: `modules/config.py` -> `modules/market/backfill.py` + `load_bars()` -> `indicators_batch.py` -> `indicators.py` (incrementale, test di parita' sullo storico) -> `bars.py` -> `ws_feed.py` + `orderbook.py` -> `ledger/` -> `dryrun/recorder.py`.
 
-Criterio di uscita P0: storico 1m backfillato per i tre prodotti; test di parita' batch/incrementale verde su >= 5.000 barre per prodotto; 48 h di stream WS registrato senza buchi di sequenza non gestiti.
+Criterio di uscita P0: storico 1m backfillato per i tre prodotti; test di parita' batch/incrementale verde su >= 5.000 barre per prodotto; 48 h di stream WS registrato senza buchi di sequenza non gestiti; 48 h di `BarService` con `rest_revision_ratio <= 0.005` per prodotto, misurato rileggendo da REST i minuti con eta' >= 15 min.
 
 ### 0.6 Ambito per book
 
@@ -442,7 +450,7 @@ CREATE INDEX IF NOT EXISTS ix_sent_asset_time ON sentiment_events(asset_key, ing
 Flusso per ogni prodotto, ogni chiusura di barra da 1 minuto:
 
 ```
-bar_closed(product, t)
+bar_closed(product, t)                             # pubblicata dal BarService a t + S (sez. 2.3 A.2)
   -> IndicatorEngine.snapshot(product, t)          # O(1), incrementale
   -> SentimentService.snapshot(product, t)
   -> PositionLedger.view(product)
@@ -454,6 +462,8 @@ bar_closed(product, t)
   -> RiskManager / ExecutionGateway (sez. 4)
   -> DecisionRecord -> data/decisions/YYYY-MM-DD.jsonl (audit, replay, dataset futuro)
 ```
+
+**Istante logico e istante di calcolo.** `t` = chiusura del minuto (`ts_bar_close`); la decisione si calcola a `t + S` (`market.bars.rest_delay_s`, default 120 s), quando la candela REST del minuto e' definitiva. Tutto lo stato usa l'istante logico `t`: barre fino al minuto che chiude in `t`, `clock` da `t`, sentiment con `as_of = t` (`ingested_at <= t`). Fanno eccezione, perche' descrivono l'esecuzione, `position` e `costs`/`spread_bps`, letti al momento del calcolo. Il ritardo `S` e' irrilevante a questo orizzonte: 120 s sono lo 0.014% di `H`, la finestra di fill maker reale `[t+S, t+S+T_in]` copre il 93% di quella della label, e lo scarto fra il limite reale (best_bid a `t+S`) e quello della label e' una deriva di prezzo di 2 minuti a media nulla, piccola rispetto a barriere di piu' ATR giornalieri. Il prezzo dell'ordine viene comunque dal `LocalOrderBook` all'invio. Una barra pubblicata con ritardo oltre `market.bars.decision_max_lag_s` aggiorna indicatori e store ma non produce decisione ne' `DecisionRecord` (contatore `decisions.skipped_late`).
 
 Le tre domande condividono lo stesso stato: sul server il prefisso di stato viene calcolato una volta sola (prefix/KV caching) e le domande vengono lette in un'unica forward pass batch. Questo e' cio' che rende la decisione "System 1": nessuna generazione autoregressiva di testo, solo lettura dei logit sui token di etichetta.
 
@@ -556,6 +566,7 @@ Unica definizione delle feature prodotte dall'`IndicatorEngine`. Costanti e nomi
 Convenzioni:
 - Riga `i` = barra 1m con inizio `ts_i` sulla griglia contigua di `load_bars` (barre piatte incluse). Istante di decisione
   `t_i = ts_i + 1 min`. La riga `i` usa solo barre 1m con indice `<= i`. `c_i, h_i, l_i, v_i` = OHLCV della barra 1m.
+- Sorgente: le barre 1m sono sempre candele REST definitive (invariante I1, sez. 0.5), in batch e a runtime. La riga `i` entra nell'`IndicatorEngine` a `t_i + S`, una sola volta, in ordine e senza buchi; una riga gia' consumata non viene mai sostituita.
 - Barre HTF (`tf` in 1h, 6h, 1d; bucket UTC di `modules/market/timeframes.py`): una barra con inizio `B` e' visibile dalla
   riga `i` se e solo se `B + tf <= t_i`. `K = K(i, tf)` = ultima barra visibile; `C_k, H_k, L_k` = OHLC della barra HTF `k`.
   La barra in formazione non entra in nessuna serie.
@@ -657,6 +668,7 @@ Header `Server-Timing: model;dur=41.2, server;dur=2.8, total;dur=44.0` (OpenJev 
 {
   "decision_id": "01JAB3...ULID",
   "ts_bar_close": "2026-10-17T14:03:00Z",
+  "decided_at": "2026-10-17T14:05:00.412Z", "bar_source": "rest", "bar_lag_s": 120.4,
   "product": "SOL-EUR",
   "state_sha256": "9f2c...",
   "state": "{...canonical...}",
@@ -671,6 +683,8 @@ Header `Server-Timing: model;dur=41.2, server;dur=2.8, total;dur=44.0` (OpenJev 
   "order_intent_id": "01JAB3...ULID"
 }
 ```
+
+`bar_source` in `rest | flat | flat_unproven` (sez. 2.3 A.2); `bar_lag_s = published_at - ts_bar_close` della barra; `decided_at` = istante di calcolo.
 
 #### 2.2.5 Config YAML
 
@@ -710,11 +724,21 @@ Il `DecisionEngine` rifiuta di caricare un `policy.json` il cui `label_config_sh
 > Implementa i package `modules/market/`, `modules/features/`, `modules/decision/` di Chronos v2 (Python 3.12, asyncio, pydantic v2, mypy strict).
 >
 > **A. `modules/market/`**
-> 1. `ws_feed.py` — `CoinbaseMarketStream`: usa `coinbase.websocket.WSClient` (da `coinbase-advanced-py`) sui canali `market_trades`, `ticker`, `level2`, `heartbeats` (`level2` alimenta il `LocalOrderBook` usato per spread, stima dello slippage e simulatore di fill della sez. 5; verificare se il canale richiede autenticazione JWT e, nel caso, usare la stessa key read-only). Il WSClient lavora con callback in un thread proprio: fai il bridge verso asyncio con `loop.call_soon_threadsafe(queue.put_nowait, msg)`. Riconnessione automatica con backoff; rileva gap tramite `sequence_num` e, in caso di gap, segnala `BarAggregator.mark_dirty(product)`. Non usare il canale `candles` (granularita' 5 min): le barre 1m si costruiscono dai trade.
+> 1. `ws_feed.py` — `CoinbaseMarketStream`: usa `coinbase.websocket.WSClient` (da `coinbase-advanced-py`) sui canali `market_trades`, `ticker`, `level2`, `heartbeats` (`level2` alimenta il `LocalOrderBook` usato per spread, stima dello slippage e simulatore di fill della sez. 5; verificare se il canale richiede autenticazione JWT e, nel caso, usare la stessa key read-only). Il WSClient lavora con callback in un thread proprio: fai il bridge verso asyncio con `loop.call_soon_threadsafe(queue.put_nowait, msg)`. Riconnessione automatica con backoff; rileva gap tramite `sequence_num`; ogni intervallo di dati danneggiato (gap, reset, silenzio) viene notificato con `on_damage(start, end | None)` (consumatore: `BracketSimulator`, sez. 5.1.3). I trade, deduplicati per `trade_id` (il canale rimanda uno snapshot a ogni riconnessione), vanno a `on_trades` (simulatori di fill e bracket). Il feed WS non costruisce barre e non e' mai la fonte delle feature (invariante I1, sez. 0.5). Non usare il canale `candles` (granularita' 5 min).
 > 1b. `timeframes.py` — aggregazione di barre 1m contigue in barre 1h/6h/1d allineate all'epoca UTC (1d chiude alle 00:00 UTC): `aggregate_bars` (vettoriale) e `TimeframeAggregator` (incrementale) con la stessa regola; una barra HTF esiste solo quando tutti i suoi minuti sono arrivati (mai la barra in formazione, vincolo C7); input non contiguo -> `BarGapError`. Usato da `IndicatorEngine` e `indicators_batch`.
-> 2. `bars.py` — `BarAggregator`: costruisce barre OHLCV 1m dai trade (bucket = `floor(trade_time, 1min)`), emette `BarClosed(product, bar)` su una queue alla chiusura del minuto (timer allineato al wall-clock + 2 s di grazia per trade tardivi). Barre senza trade = barra piatta con `volume=0` e `close` precedente. Su `mark_dirty` riallinea con `RESTClient.get_candles(granularity="ONE_MINUTE")` in `to_thread`. Aggrega anche 15m e 1h dalle barre 1m.
+> 2. `bars.py` — `BarService` (shell asyncio) + `BarFinalizer` (nucleo puro, senza I/O ne' clock) + `BarStoreWriter`. Le barre 1m sono le candele REST `get_public_candles(granularity="ONE_MINUTE")` (`CandleSource` e `candles_to_frame` di `backfill.py`, stesso parsing dello storico). Il minuto `M` e' pronto quando `now >= M + 1 min + S`. A ogni risveglio (`M + 1 min + S`, oppure `retry_s` se un minuto pronto e' ancora pendente) il servizio scarica per ogni prodotto `[next_minute, floor(now) + 1 min)` (chunk da 300) e, per ogni minuto pronto in ordine: candela presente -> barra `rest`; candela assente ed esiste nella risposta una candela successiva -> barra piatta `flat` (OHLC = close precedente, volume 0, stessa regola di `load_bars`); candela assente senza candele successive -> attesa, e oltre `rest_max_delay_s` barra piatta `flat_unproven` (solo con un fetch riuscito). Un fetch fallito non pubblica nulla e non inventa barre: retry ogni `retry_s`, senza limite. La candela del minuto in corso serve solo come prova di completezza, mai come dato (C7). Le barre sono pubblicate una sola volta, contigue, ordinate per `(ts, product)`, come `BarClosed(product_id, bar, source, published_at)`; il `BarStoreWriter` scrive nello store le sole barre `rest` ogni `store_flush_minutes` e allo shutdown, ed espone `complete_until(product)`. Nessuna aggregazione 15m/1h qui: gli HTF li aggrega solo l'`IndicatorEngine`. Config:
+> ```yaml
+> market:
+>   bars:
+>     rest_delay_s: 120         # S, validator 60..300; candele REST stabili dopo ~92 s (max su 70, misura del 2026-10-18)
+>     rest_max_delay_s: 180     # S + 60; oltre: minuto senza candela e senza prova -> flat_unproven
+>     retry_s: 5
+>     decision_max_lag_s: 240   # S + 120; oltre: barra consumata, nessuna decisione (deve essere < stale_bar_s)
+>     store_flush_minutes: 15
+> ```
+> Taratura di S: i default seguono S con `rest_max_delay_s = S + 60`, `decision_max_lag_s = S + 120`, `risk.kill_switch.stale_bar_s = S + 150`. Il valore di S e' accettato solo da un soak di 48 h con `rest_revision_ratio <= 0.005` per prodotto (minuti riletti con eta' >= 15 min). Se il criterio fallisce: se prevalgono revisioni di valore su barre `rest`, si sale di un gradino (S = 120 -> 180 -> 300) con un nuovo soak; se prevalgono candele comparse o scomparse, oppure al gradino 300, si apre un CONFLITTO. Il criterio non si allenta e S non si abbassa sotto il valore validato.
 > 3. `indicators.py` — `IndicatorEngine`, **incrementale O(1) per barra**, uno stato per (product, timeframe) con timeframe 1h, 6h, 1d aggregati dalle barre 1m (barre 1d con chiusura alle 00:00 UTC): ATR di Wilder (14), RSI di Wilder (14), EMA per MACD (12/26/9), Bollinger (20, 2), VWAP rolling 1d, volatilita' realizzata `RVd`, z-score di `ln(1 + quote volume)` giornaliero (30 giorni), percentile dell'ATR 1d su 365 giorni (`sortedcontainers.SortedList`) e i campi di prezzo, con le definizioni esatte della sez. 2.2.1.b. Fornisci anche la versione vettoriale degli stessi indicatori in `indicators_batch.py` (polars o pandas). Un test deve verificare che batch e incrementale coincidano (tolleranza `|a-b| <= 1e-9 * max(1, |b|)`, maschere NaN identiche; test T1-T10 della risoluzione indicatori, `docs/decisions/2026-10-17-indicatori.md`) su >= 5.000 barre 1m per ciascun prodotto, lette dallo storico backfillato in Parquet (sez. 0.5); `data/historical_*.csv` della v1 non va usato. La versione batch e' quella usata per costruire il dataset di training.
-> 4. All'avvio, warm-up: `load_bars` sull'intero storico del prodotto (ancora della sez. 2.2.1.b) e replay di tutte le barre 1m nello stesso `IndicatorEngine` (`warm_up`, senza snapshot). Un warm-up parziale non e' ammesso: le ricorrenze di Wilder ed EMA dipendono dal punto di partenza. Budget <= 120 s per prodotto. Se il Parquet non copre il periodo, il processo esegue prima il backfill incrementale (sez. 0.5) e solo dopo apre gli stream.
+> 4. All'avvio, warm-up: `load_bars` sull'intero storico del prodotto (ancora della sez. 2.2.1.b) e replay di tutte le barre 1m nello stesso `IndicatorEngine` (`warm_up`, senza snapshot). Un warm-up parziale non e' ammesso: le ricorrenze di Wilder ed EMA dipendono dal punto di partenza. Budget <= 120 s per prodotto. Se il Parquet non copre il periodo, il processo esegue prima il backfill incrementale (sez. 0.5) e solo dopo apre gli stream. Dopo il warm-up il `BarFinalizer` viene inizializzato (`seed`) con l'ultima riga del frame del warm-up; il primo ciclo del `BarService` recupera da REST i minuti tra quella riga e `now - S`.
 >
 > **B. `modules/features/`**
 > 1. `schemas.py` — pydantic `DecisionState` con i sotto-modelli della sez. 2.2.1. Campi interi dichiarati `int`, i decimali con validator che arrotonda (`round(x, 2)`). Ordine dei campi = ordine di dichiarazione.
@@ -731,7 +755,7 @@ Il `DecisionEngine` rifiuta di caricare un `policy.json` il cui `label_config_sh
 >    - errori -> eccezioni tipizzate `DeciderTimeout`, `DeciderUnavailable`, `DeciderBadResponse`; nessun retry interno.
 > 3. `baseline.py` — `BaselineDecider` con la stessa firma di `decide`, che produce `DecisionAnswers` da tre modelli LightGBM (multiclass per action, binary per edge, multiclass per regime) sugli stessi campi numerici dello stato appiattito (`flatten_state()` in `features/serializer.py`). Le probabilita' grezze passano dalla calibrazione del model card (Platt per `edge`, temperature per `action` e `vol_regime`) prima di essere restituite. La confidenza la calcola il client (sez. 2.1.2), non il decider.
 > 4. `policy.py` — `DecisionPolicy(config).resolve(answers, position_side) -> Decision` secondo la sez. 2.1.2. Funzione pura, tabella di test parametrizzata con tutti i casi (FLAT/LONG x BUY/SELL/HOLD x veto edge x veto regime x decider down).
-> 5. `engine.py` — `DecisionEngine`: consuma `BarClosed`, per prodotto costruisce lo stato, chiama il backend configurato (fallback su `BaselineDecider` in caso di eccezione se `decision.fallback_to_baseline: true`), applica la policy, scrive `DecisionRecord` su JSONL con `aiofiles` (rotazione giornaliera), pubblica `Decision` sulla queue verso il RiskManager. I prodotti vengono processati in parallelo con `asyncio.gather`, ma con un `asyncio.Semaphore(4)` sul decider.
+> 5. `engine.py` — `DecisionEngine`: consuma `BarClosed`, aggiorna sempre l'`IndicatorEngine` con la barra; se `bar_lag_s <= market.bars.decision_max_lag_s` costruisce lo stato con istante logico `ts_bar_close = bar.ts + 1 min` (sentiment con `as_of = ts_bar_close`, sez. 2.1) e registra `decided_at`, `bar_source`, `bar_lag_s` nel `DecisionRecord`; altrimenti non decide e incrementa `decisions_skipped_late`; per prodotto costruisce lo stato, chiama il backend configurato (fallback su `BaselineDecider` in caso di eccezione se `decision.fallback_to_baseline: true`), applica la policy, scrive `DecisionRecord` su JSONL con `aiofiles` (rotazione giornaliera), pubblica `Decision` sulla queue verso il RiskManager. I prodotti vengono processati in parallelo con `asyncio.gather`, ma con un `asyncio.Semaphore(4)` sul decider.
 >
 > Test: client con `respx` (risposta valida, 429, timeout, JSON malformato, probabilita' che non sommano a 1); integrazione opzionale marcata `@pytest.mark.live` contro `OPENJEV_LIVE_URL`.
 
@@ -791,6 +815,8 @@ net_ret    = exit_px * (1 - f_out) / (entry * (1 + f_in)) - 1                 # 
 ```
 
 La scansione e la stima dei costi chiamano gli stessi oggetti del runtime (`CostModel`, `BarFillModel`), non reimplementazioni. `s` (spread) per il training e' la mediana per prodotto e ora del giorno misurata dal recorder (sez. 5); finche' non ci sono registrazioni si usa il valore del probe. I parametri sono scritti nel `label_config` del model card e **devono** coincidere con quelli usati dal RiskManager (sez. 4), altrimenti `edge.noul` non ha significato in esecuzione.
+
+`t` e' l'istante logico di chiusura della barra (`ts_bar_close`), non l'istante di calcolo `t + S` (sez. 2.1): le label non dipendono da `S`. Lo scarto tra l'ingresso simulato a barre e l'ingresso reale a `t + S` rientra nella parita' misurata dal dry run (sez. 5.1.7).
 
 **Studio di fattibilita' (`training/feasibility.py`, prima del primo training).** Sullo storico backfillato e con le fee reali (o presunte, marcate come tali), valuta la griglia `atr_tf in {6h, 1d}`, `k_tp in {3, 4, 5}`, `k_sl in {1.5, 2}`, `entry_mode in {maker, taker}`, `H in {5, 10, 15} giorni` e per ogni combinazione calcola: frequenza storica di UPPER (`p_hist`), `p_breakeven` mediano, `lift richiesto = p_breakeven - p_hist`, quota di timestamp che passano il fee floor, tasso di fill dell'ingresso maker, numero atteso di trade indipendenti per anno. Come sola diagnostica, che non entra nella regola di scelta, riporta anche la frequenza dell'esito VERTICAL (`p_vertical`) e il `net_ret` medio esatto dei soli esiti VERTICAL (`vert_mean_net_bps`): misurano quanto e' prudenziale l'EV a due esiti della sez. 0.3. Regola di scelta: tra le combinazioni con fee floor superato in >= 80% dei timestamp e fill maker >= 50%, si prende quella con lift richiesto minimo, a parita' quella con piu' trade indipendenti. Output: `label_config.json` + tabella Markdown in `data/reports/feasibility.md`. **Se nessuna combinazione ha lift richiesto <= 0.10, il report lo dichiara e il progetto non procede al training:** a quel tier di fee la strategia non e' sostenibile e va rivista (prodotti, fee, orizzonte) prima di scrivere altro codice.
 
@@ -1105,7 +1131,7 @@ Vincoli di validazione prima dell'invio: `SL < entry < TP`; `(TP-entry) >= 2 * q
 | Daily loss | Book | PnL realizzato + non realizzato del giorno UTC <= -`max_daily_loss_frac` x equity di apertura | Blocca nuovi ingressi del book fino a 00:00 UTC. |
 | Loss streak | Book | `max_consecutive_losses` stop consecutivi | Pausa del book per 48 h. |
 | Exposure | Book | Esposizione totale > `max_total_exposure_frac` | Nessun nuovo ingresso del book. |
-| Stale data | Globale | Ultima barra o ultimo ticker piu' vecchio di 90 s | Nessun ingresso in nessun book; i bracket esistenti restano. |
+| Stale data | Globale | Ultima barra 1m pubblicata con `now - ts_bar_close > stale_bar_s` (default 270 s; validator: >= `market.bars.rest_max_delay_s` + 90 e > `market.bars.decision_max_lag_s`), oppure ultimo ticker piu' vecchio di `stale_data_s` (90 s) | Nessun ingresso in nessun book; i bracket esistenti restano. |
 | Decider health | Globale | > 20% di decisioni in fallback nell'ultima ora, oppure tasso di incoerenza action/edge > soglia | Passa a baseline o HOLD-only (config). |
 | Drift | Globale | PSI > 0.25 su `edge.noul` o sulle feature principali rispetto alla finestra di training | Alert + HOLD-only. |
 | Watchdog SL | Per posizione | Posizione con bracket: `last_price <= SL - 1 x ATR_1h` e posizione ancora aperta dopo 10 s. Posizione senza bracket (finestra d'ingresso o bracket rifiutato): `last_price <= SL`. | Cancella bracket, `market_market_ioc` sell (in dry: walk dei bid). La doc Coinbase dichiara che l'esecuzione della protezione downside non e' garantita in alta volatilita'. |
@@ -1245,7 +1271,8 @@ risk:
     max_daily_loss_frac: 0.02
     max_consecutive_losses: 4
     loss_streak_pause_h: 48
-    stale_data_s: 90
+    stale_data_s: 90                  # solo ticker
+    stale_bar_s: 270                  # barre 1m (pubblicate a t + S); = S + 150, > decision_max_lag_s
     max_fallback_ratio_1h: 0.20
     psi_threshold: 0.25
   watchdog:
@@ -1407,7 +1434,7 @@ Le soglie minime sono espresse in **campioni effettivi** (`n_eff` = somma dei pe
 | Step | Frequenza | Cosa aggiorna | Condizione minima | Output |
 |------|-----------|---------------|-------------------|--------|
 | L4 Modello di costo | Giornaliera, da subito | `latency_ms` (p75 del RTT REST), spread mediano per prodotto e ora del giorno, tasso di fill maker entro `T_in`, fee correnti. | Sempre. | `fill_model.json` e tabella spread usata dalle label (sez. 3.1.3) |
-| L0 Parita' live/training | Giornaliera, da subito | Ricostruisce con `indicators_batch` + `StateBuilder` gli stati di ieri dalle barre registrate e li confronta con quelli calcolati live; PSI di ogni feature rispetto alla distribuzione storica. | Sempre. | Sezione "parity" del report; `DriftAlert` se PSI > 0.25 |
+| L0 Parita' live/training | Giornaliera, da subito | Ricostruisce con `indicators_batch` + `StateBuilder` gli stati di ieri dalle barre registrate e li confronta con quelli calcolati live; PSI di ogni feature rispetto alla distribuzione storica. Audit delle revisioni REST: riscarica le candele del giorno precedente (tutte con eta' >= 15 min all'esecuzione delle 00:15) e le confronta con lo store (minuto rivisto = presenza o OHLCV diversi); lo store non viene modificato. | Sempre. | Sezione "parity" del report; `DriftAlert` se PSI > 0.25; sezione `bars` del report (`rest_revision_ratio`) |
 | L3 Refit baseline | Mensile (1° del mese) | LightGBM riaddestrato su storico esteso fino a ieri + label live risolte (peso 2), stessi split purgati. | Storico aggiornato. | Modello challenger |
 | L1 Calibrazione | Con L3 | Platt per `edge`, temperature per `action`/`vol_regime`, sul fold di validation piu' recente (storico). Le label live servono a **misurare** la calibrazione, non a fittarla. | `n_eff` del fold >= 300. | `calibration.json` del challenger |
 | L2 Soglie di policy | Con L3 | `tune_policy.py` sul validation piu' recente. | Come L1. | `policy.json` del challenger |
@@ -1430,6 +1457,7 @@ Il gate e' diviso in due, perche' a questo orizzonte la parte economica richiede
 | Operativita' | uptime >= 99%, zero `DryRunViolation`, zero crash non gestiti, nessun kill switch scattato per bug |
 | Parita' decisioni | Rieseguendo la settimana con il replay (sez. 5.3) e con la pipeline batch di training, le decisioni coincidono con quelle live in >= 99% dei minuti |
 | Parita' feature | PSI < 0.10 per ogni feature dello stato rispetto alla distribuzione storica degli ultimi 90 giorni |
+| Barre REST | `rest_revision_ratio <= 0.005` per prodotto e per giorno (altrimenti si applica la scala di taratura di S della sez. 2.3 A.2); zero barre fuori ordine o duplicate |
 | Frequenza di BUY | Entro +-50% della frequenza attesa dal backtest sullo stesso periodo (se il periodo non ha BUY ne' nel backtest ne' live, criterio superato) |
 | Costi | Fill rate maker misurato >= 50%; spread mediano entro 2x quello assunto nelle label |
 | Fee floor | Quota di intent scartati per `fee_floor` < 80% |
@@ -1499,6 +1527,7 @@ dry_run:
     min_maker_fill_rate: 0.50
     max_spread_ratio_vs_labels: 2.0
     max_fee_floor_skip_ratio: 0.80
+    max_rest_revision_ratio: 0.005
   gate_econ:
     min_trades: 30
     min_profit_factor: 1.2
@@ -1578,9 +1607,10 @@ live_ramp:
   },
   "decisions": {"total": 4320, "BUY": 2, "SELL": 0, "HOLD": 4318,
                 "skip_reasons": {"fee_floor": 0, "ev_negative": 3, "regime_veto": 0, "below_min_size": 0,
-                                 "kill_switch": 0, "entry_pending": 41, "insufficient_balance": 0, "balance_stale": 0}},
+                                 "kill_switch": 0, "entry_pending": 41, "insufficient_balance": 0, "balance_stale": 0}, "skipped_late": 0},
   "labels": {"resolved_total": 0, "first_resolution_expected": "2026-10-27"},
   "parity": {"decision_match": 1.0, "max_feature_psi": 0.04, "worst_feature": "liquidity.vol_z_1d"},
+  "bars": {"SOL-EUR": {"rest": 1402, "flat": 36, "flat_unproven": 2, "lag_s_p50": 120.3, "lag_s_p99": 126.1, "fetch_failures": 0, "late": 0, "rest_revisions": 1, "rest_revision_ratio": 0.0007, "rest_revision_max_close_bps": 1.8}},
   "costs": {"median_spread_bps": {"BTC-EUR": 3, "ETH-EUR": 2, "SOL-EUR": 3}, "fee_maker_bps": 60, "fee_taker_bps": 120,
             "fee_source": "assumed", "maker_fill_rate": 0.67, "latency_ms_p75": 280},
   "ops": {"uptime": 0.9993, "ws_reconnects": 2, "decider_fallbacks": 0, "dry_run_violations": 0},
@@ -1607,8 +1637,8 @@ live_ramp:
 >    - nessun `sleep` reale: tutto guidato dagli eventi di mercato e dal `Clock` iniettato (in replay e test il clock e' simulato).
 > 7. `modules/dryrun/bracket_sim.py` — `BracketSimulator.on_trade(trade)` e `on_book(book)` per tutte le posizioni virtuali aperte del prodotto: regole TP/SL/"stesso evento -> SL"; gestione del gap di dati come in sez. 5.1.3 (download delle candele del gap via `RESTClient.get_candles`, lettura consentita).
 > 8. `modules/dryrun/books.py` — `ShadowBookManager`: istanzia un `ShadowExecutionGateway` + `VirtualAccount` + ledger per ogni book in config; fa fan-out degli eventi di mercato verso tutti i book; per `random_entry` usa un `RandomDecider(seed)` che emette BUY con probabilita' pari alla frequenza giornaliera di BUY osservata nel champion (aggiornata ogni ora); per `buy_and_hold` un `BuyAndHoldDecider` che compra una volta sola. I decider dei book passano tutti dalla stessa `DecisionPolicy` e dallo stesso `RiskManager` (tranne `buy_and_hold`, che salta il RiskManager per costruzione ma non il `BalanceGuard`: size = `max_base_for_quote(free(quote), ...)`).
-> 9. `modules/dryrun/recorder.py` — `WsRecorder`: scrive ogni messaggio WS grezzo con timestamp di ricezione in `data/ws_recordings/YYYY-MM-DD/<channel>-<product>.jsonl.gz` (scrittura in un thread dedicato con buffer, flush ogni 5 s, rotazione giornaliera, retention). `modules/dryrun/replay.py` — `ReplayMarketStream` con la stessa interfaccia di `CoinbaseMarketStream`, che rilegge le registrazioni con clock simulato: consente di rieseguire offline e in modo deterministico una settimana di dry run con parametri diversi (what-if a costo zero). Test: lo stesso replay eseguito due volte produce ledger identici byte per byte.
-> 10. `modules/dryrun/label_resolver.py` — task ogni 60 s: seleziona i `DecisionRecord` con `ts_bar_close + T_in + H <= now` (parametri dal `label_config` del modello che ha preso la decisione) non ancora risolti, carica le barre 1m dal Parquet locale (alimentato dal `BarAggregator` live e dal backfill incrementale), chiama `training.labeling.triple_barrier` e `forward_rv_bucket` (stesso codice del dataset storico), scrive `ResolvedLabel`. Idempotente (tabella `resolved` con `decision_id` PK).
+> 9. `modules/dryrun/recorder.py` — `WsRecorder`: scrive ogni messaggio WS grezzo con timestamp di ricezione in `data/ws_recordings/YYYY-MM-DD/<channel>-<product>.jsonl.gz` (scrittura in un thread dedicato con buffer, flush ogni 5 s, rotazione giornaliera, retention). `modules/dryrun/replay.py` — `ReplayMarketStream` con la stessa interfaccia di `CoinbaseMarketStream`, che rilegge le registrazioni con clock simulato: consente di rieseguire offline e in modo deterministico una settimana di dry run con parametri diversi (what-if a costo zero). Le barre 1m non sono nelle registrazioni WS: in replay il `BarService` usa `StoreCandleSource` (store Parquet, stessa interfaccia `CandleSource`) con lo stesso clock simulato. Test: lo stesso replay eseguito due volte produce ledger identici byte per byte.
+> 10. `modules/dryrun/label_resolver.py` — task ogni 60 s: seleziona i `DecisionRecord` con `ts_bar_close + T_in + H <= now` (parametri dal `label_config` del modello che ha preso la decisione) non ancora risolti, carica le barre 1m dal Parquet locale (alimentato dal `BarService` e dal backfill incrementale, sez. 2.3 A.2; `store_complete_until_end=True` solo se `BarStoreWriter.complete_until(product) >= vertical`, altrimenti la risoluzione viene rimandata), chiama `training.labeling.triple_barrier` e `forward_rv_bucket` (stesso codice del dataset storico), scrive `ResolvedLabel`. Idempotente (tabella `resolved` con `decision_id` PK).
 > 11. `modules/dryrun/learner.py` — `NightlyLearner` con gli step L0–L5 della sez. 5.1.6 e le rispettive frequenze (L0 e L4 ogni notte; L3, L1, L2, L5 il giorno `refit_day_of_month`), con soglie in `n_eff` (somma dei pesi di unicita' di `training/sampling.py`), eseguito con `asyncio.create_subprocess_exec(sys.executable, "-m", "modules.dryrun.learner", ...)` e `os.nice(10)` nel figlio dove supportato, per non rallentare il loop di trading. Ogni step controlla la propria soglia minima e, in sotto-soglia, registra `skipped: insufficient_samples` invece di produrre artefatti.
 > 12. `modules/dryrun/registry.py` — `ModelRegistry` su filesystem (`models/registry/`): `register(artifacts, manifest) -> version`, `get(alias)`, `promote(version, alias="champion")`, `rollback(alias)`. Gli alias sono un file `aliases.json` scritto in modo atomico (scrittura su file temporaneo + `os.replace`). Interfaccia astratta `ModelRegistry(Protocol)` per sostituire il backend in futuro (C8).
 > 13. `modules/dryrun/report.py` — job alle 00:05 UTC e CLI `python -m modules.dryrun.report --days 7 [--book champion]`: genera il JSON della sez. 5.2 e un Markdown con tabelle per book, istogramma degli skip, reliability diagram di `edge` (PNG matplotlib, solo quando ci sono label live risolte), parita' L0, costi L4, stato di G-DRY-OPS e G-DRY-ECON, data prevista della prima label risolta. Metriche: PnL netto, fee, win rate, profit factor, R medio, max drawdown, Sharpe giornaliero (indicativo, con nota sul campione), confronto con `random_entry` e `buy_and_hold`.

@@ -40,9 +40,45 @@ OBLIGATIONS: dict[str, tuple[set[str], set[str], str]] = {
         "TP/SL use the ATR of the decision's snapshot, never one re-read at send time (resolution Q1)",
     ),
     "modules/app.py": (
-        {"warm_up"},
+        {"warm_up", "settle_s", "seed", "flush"},
         set(),
-        "startup replays the whole stored history through IndicatorEngine.warm_up before opening streams",
+        "startup: incremental backfill with settle_s, whole-history warm_up, BarFinalizer.seed, store flush on SIGTERM",
+    ),
+    # --- fonte canonica delle barre 1m (docs/decisions/2026-10-18-barre-rest.md)
+    "modules/decision/engine.py": (
+        {"decision_max_lag_s", "skipped_late", "bar_source", "bar_lag_s", "decided_at"},
+        {
+            "test_late_bar_updates_the_engine_without_a_decision",
+            "test_ts_bar_close_is_bar_ts_plus_one_minute",
+            "test_sentiment_is_read_as_of_ts_bar_close",
+        },
+        "a bar older than decision_max_lag_s feeds the engine and the store but makes no decision; "
+        "the state uses the logical instant t",
+    ),
+    "modules/risk/kill_switch.py": (
+        {"stale_bar_s", "stale_data_s"},
+        {"test_no_stale_trip_with_a_90s_bar_lag", "test_stale_bar_trips_beyond_180s"},
+        "bars are stale beyond stale_bar_s (published at t + S), tickers beyond stale_data_s: two separate thresholds",
+    ),
+    "modules/dryrun/learner.py": (
+        {"rest_revisions"},
+        set(),
+        "L0 audits the REST revisions of the previous day (read only)",
+    ),
+    "modules/dryrun/report.py": (
+        {"rest_revision_ratio", "skipped_late", "lag_s_p99"},
+        set(),
+        "the daily report has the bars section and decisions.skipped_late",
+    ),
+    "modules/dryrun/label_resolver.py": (
+        {"complete_until", "store_complete_until_end"},
+        set(),
+        "labels use store_complete_until_end only when the store is known complete up to the vertical barrier",
+    ),
+    "modules/dryrun/replay.py": (
+        {"StoreCandleSource"},
+        set(),
+        "in replay the bars come from the store through StoreCandleSource, never from recorded trades",
     ),
 }
 

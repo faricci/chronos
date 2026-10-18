@@ -18,6 +18,12 @@ market:
     rate_limit_per_s: 5.0
     window_minutes: 300               # API limit is 350 candles per request
     max_retries: 5
+  bars:                               # 1m bars = REST candles read S seconds after the minute closes
+    rest_delay_s: 120                 # S, 60..300: REST candles settle within ~92 s
+    rest_max_delay_s: 180             # S + 60: no candle and no proof past this lag -> flat_unproven
+    retry_s: 5
+    decision_max_lag_s: 240           # S + 120: past this lag the bar is consumed, no decision
+    store_flush_minutes: 15
 
 sentiment:
   classifier:
@@ -68,7 +74,8 @@ risk:
     max_daily_loss_frac: 0.02
     max_consecutive_losses: 4
     loss_streak_pause_h: 48
-    stale_data_s: 90
+    stale_data_s: 90                  # last ticker
+    stale_bar_s: 270                  # last 1m bar (published at t + S) = S + 150; > decision_max_lag_s
     max_fallback_ratio_1h: 0.20
     psi_threshold: 0.25
   watchdog:
@@ -119,6 +126,7 @@ dry_run:
     min_maker_fill_rate: 0.50
     max_spread_ratio_vs_labels: 2.0
     max_fee_floor_skip_ratio: 0.80
+    max_rest_revision_ratio: 0.005
   gate_econ:
     min_trades: 30
     min_profit_factor: 1.2

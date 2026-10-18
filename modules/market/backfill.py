@@ -87,6 +87,40 @@ class CoinbaseCandleSource:
         return candles
 
 
+class StoreCandleSource:
+    """A ``CandleSource`` that serves the candles already in the store, in the API's string format.
+
+    Used by the replay (same clock, same ``BarService``, bars from the store) and by tests. ``[start_s, end_s)``.
+    """
+
+    def __init__(self, root: Path) -> None:
+        self._store = BarStore(root)
+
+    def fetch(self, product_id: str, start_s: int, end_s: int) -> list[dict[str, Any]]:
+        lo = datetime.fromtimestamp(start_s, UTC)
+        hi = datetime.fromtimestamp(end_s, UTC)
+        out: list[dict[str, Any]] = []
+        for year, month in self._store.months(product_id):
+            if (year, month) < (lo.year, lo.month) or (year, month) > (hi.year, hi.month):
+                continue
+            df = self._store.read_month(product_id, year, month)
+            rows = zip(df["ts"], df["open"], df["high"], df["low"], df["close"], df["volume"], strict=True)
+            for ts, o, h, lo_, c, v in rows:
+                sec = int(pd.Timestamp(ts).timestamp())
+                if start_s <= sec < end_s:
+                    out.append(
+                        {
+                            "start": str(sec),
+                            "open": repr(float(o)),
+                            "high": repr(float(h)),
+                            "low": repr(float(lo_)),
+                            "close": repr(float(c)),
+                            "volume": repr(float(v)),
+                        }
+                    )
+        return out
+
+
 def is_transient(exc: BaseException) -> bool:
     """Retry on rate limits (429), server errors (5xx) and network failures; fail fast on other 4xx."""
     if isinstance(exc, requests.exceptions.HTTPError):
@@ -292,6 +326,7 @@ class Backfiller:
     cfg: BackfillConfig
     clock: Clock = utc_now
     retry_wait: wait_base | None = None
+    settle_s: float = 120.0  # a minute is downloaded only once its REST candle is final (market.bars.rest_delay_s)
 
     async def _fetch(self, product_id: str, start_s: int, end_s: int) -> list[dict[str, Any]]:
         retrying = AsyncRetrying(
@@ -315,7 +350,9 @@ class Backfiller:
     async def run_product(self, product_id: str, start: datetime) -> ProductReport:
         last = self.store.last_ts(product_id)
         cursor = floor_minute(start.astimezone(UTC)) if last is None else last + MINUTE
-        end = floor_minute(self.clock())  # exclusive: never fetch the minute still being traded
+        # exclusive: a minute is fetched only when ts + 1 min + S <= now, i.e. when its candle is final. The live
+        # BarService applies the same rule, so history and runtime read the same version of every candle.
+        end = floor_minute(self.clock() - timedelta(seconds=self.settle_s))
         window = timedelta(minutes=self.cfg.window_minutes)
         buffer: list[pd.DataFrame] = []
         buffered = new_rows = 0
@@ -392,6 +429,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         source=CoinbaseCandleSource(),
         limiter=AsyncLimiter(rate, 1),
         cfg=cfg.market.backfill,
+        settle_s=cfg.market.bars.rest_delay_s,
     )
     reports = asyncio.run(backfiller.run(products, start))
     print(format_report(reports))

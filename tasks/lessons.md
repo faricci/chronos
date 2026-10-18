@@ -20,3 +20,17 @@ Rules:
 - Check `git status` after any command with `--fix` or `--write`.
 - Keep v1 paths in the `exclude` lists of ruff and mypy until they are deleted.
 - The shell tool strips backslashes inside heredocs and inline scripts: write files containing `\` with the Write/Edit tools.
+
+## 2026-10-18 - Do not build on a data-source equivalence nobody has measured
+
+Pattern: the spec said "build 1m bars from trades" and the history was REST candles. I implemented the aggregator exactly as written and only a live soak against the exchange's own candles showed that the two series differ in about half of the minutes. The tests (all green) could not show it: they compared the code with itself.
+
+Rules:
+- When two sources are meant to be the same series, compare them on real data before building on either, and say so in the plan.
+- A parity test between two implementations of one definition does not prove the definition matches the outside world; add a check against the external source.
+- Keep the first soak against the real service early in a module, not at the end.
+- Shell heredocs mangle long texts and backslashes: write multi-line patches as files with the Write tool and run them.
+
+## Un processo di lunga durata va ricontrollato, non dato per vivo
+
+- Il soak di 48 h era morto dopo 51 minuti per un riavvio del PC e il todo lo dava "in corso". Regola: prima di scrivere "in corso" in un documento, verificare PID vivo e `updated_at` del report; a ogni ripresa della sessione controllarli per primi.

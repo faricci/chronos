@@ -60,9 +60,30 @@ class BackfillConfig(_Section):
     max_retries: int = Field(default=5, ge=1)
 
 
+class BarsConfig(_Section):
+    """1m bars are the REST candles read S seconds after the minute closes (spec sez. 2.3 A.2, invariant I1)."""
+
+    # S: a minute is ready at M + 1 min + S. 60..300: REST candles keep changing for up to ~92 s after the close
+    # (measured 2026-10-18, 0 of 70 beyond 120 s); below 60 s a third of the bars would be revised later.
+    rest_delay_s: float = Field(default=120.0, ge=60, le=300)
+    rest_max_delay_s: float = 180.0  # S + 60: past this lag a minute with no candle and no proof is flat_unproven
+    retry_s: float = Field(default=5.0, gt=0)
+    decision_max_lag_s: float = 240.0  # S + 120: past this lag a bar updates indicators and store, no decision
+    store_flush_minutes: int = Field(default=15, ge=1)
+
+    @model_validator(mode="after")
+    def _ordering(self) -> BarsConfig:
+        if self.rest_max_delay_s < self.rest_delay_s:
+            raise ValueError("rest_max_delay_s must be >= rest_delay_s")
+        if self.decision_max_lag_s < self.rest_max_delay_s + self.retry_s:
+            raise ValueError("decision_max_lag_s must be >= rest_max_delay_s + retry_s")
+        return self
+
+
 class MarketConfig(_Section):
     products: tuple[str, ...] = ("BTC-EUR", "ETH-EUR", "SOL-EUR")
     backfill: BackfillConfig = BackfillConfig()
+    bars: BarsConfig = BarsConfig()
 
     @field_validator("products")
     @classmethod
@@ -191,7 +212,8 @@ class KillSwitchConfig(_Section):
     max_daily_loss_frac: float = Field(default=0.02, gt=0, le=1)
     max_consecutive_losses: int = Field(default=4, ge=1)
     loss_streak_pause_h: float = Field(default=48, gt=0)
-    stale_data_s: float = Field(default=90, gt=0)
+    stale_data_s: float = Field(default=90, gt=0)  # last ticker
+    stale_bar_s: float = Field(default=270, gt=0)  # last 1m bar, published at t + S; = S + 150
     max_fallback_ratio_1h: float = Field(default=0.20, ge=0, le=1)
     psi_threshold: float = Field(default=0.25, gt=0)
 
@@ -309,6 +331,7 @@ class GateOpsConfig(_Section):
     min_maker_fill_rate: float = Field(default=0.50, ge=0, le=1)
     max_spread_ratio_vs_labels: float = Field(default=2.0, gt=0)
     max_fee_floor_skip_ratio: float = Field(default=0.80, gt=0, le=1)
+    max_rest_revision_ratio: float = Field(default=0.005, gt=0, le=1)
 
 
 class GateEconConfig(_Section):
@@ -369,7 +392,7 @@ class CoinbaseConfig(BaseSettings):
     Public market data (candles, level2, ticker) needs no credentials.
     """
 
-    model_config = SettingsConfigDict(env_prefix="COINBASE_", extra="ignore", frozen=True)
+    model_config = SettingsConfigDict(env_prefix="COINBASE_", env_file=".env", extra="ignore", frozen=True)
 
     api_key: SecretStr | None = None
     api_secret: SecretStr | None = None
@@ -406,6 +429,19 @@ class AppConfig(_Section):
     dry_run: DryRunConfig = DryRunConfig()
     live_ramp: LiveRampConfig = LiveRampConfig()
     coinbase: CoinbaseConfig = Field(default_factory=CoinbaseConfig)
+
+    @model_validator(mode="after")
+    def _stale_bar_covers_the_publication_lag(self) -> AppConfig:
+        # With S = 30 the normal age of the last bar reaches 90 s just before the next one is published: the guard
+        # must not fire every minute.
+        bars, stale = self.market.bars, self.risk.kill_switch.stale_bar_s
+        floor = bars.rest_max_delay_s + 90
+        if stale < floor:
+            raise ValueError(f"risk.kill_switch.stale_bar_s must be >= market.bars.rest_max_delay_s + 90 = {floor}")
+        if stale <= bars.decision_max_lag_s:
+            # a decision is only computed on a bar the guard does not already consider stale
+            raise ValueError("risk.kill_switch.stale_bar_s must be > market.bars.decision_max_lag_s")
+        return self
 
 
 def _format_validation_error(path: Path | str, err: ValidationError) -> str:

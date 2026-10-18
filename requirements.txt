@@ -38,3 +38,4 @@ pydantic>=2
 pydantic-settings
 structlog
 sortedcontainers
+aiosqlite

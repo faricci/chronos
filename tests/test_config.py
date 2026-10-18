@@ -112,6 +112,14 @@ def test_secrets_in_yaml_are_rejected(tmp_path: Path) -> None:
         ({"sentiment": {"sources": [{"name": "x", "kind": "rss", "interval_s": 30}]}}, "needs a url"),
         ({"decision": {"backend": "gpt"}}, r"decision\.backend"),
         ({"risk": {"max_order_quote": 0}}, r"risk\.max_order_quote"),
+        ({"market": {"bars": {"rest_delay_s": 59}}}, r"market\.bars\.rest_delay_s"),
+        ({"market": {"bars": {"rest_delay_s": 301}}}, r"market\.bars\.rest_delay_s"),
+        ({"market": {"bars": {"rest_delay_s": 120, "rest_max_delay_s": 100}}}, "rest_max_delay_s must be >="),
+        ({"market": {"bars": {"decision_max_lag_s": 150}}}, "decision_max_lag_s must be >="),
+        ({"market": {"bars": {"decision_max_lag_s": 270}}}, "stale_bar_s must be > market.bars.decision_max_lag_s"),
+        ({"market": {"bars": {"retry_s": 0}}}, r"market\.bars\.retry_s"),
+        ({"market": {"bars": {"rest_max_delay_s": 200, "decision_max_lag_s": 260}}}, "stale_bar_s must be >="),
+        ({"risk": {"kill_switch": {"stale_bar_s": 200}}}, "stale_bar_s must be >="),
         ({"execution": {"balance_refresh_s": 60}}, r"execution\.balance_refresh_s"),
     ],
 )
@@ -192,3 +200,25 @@ def test_coverage_settings_defaults_and_no_off_switch() -> None:
     # C11: the balance guard, the spot registry and the order whitelist cannot be turned off from the config
     names = {n.lower() for section in (cfg.risk, cfg.execution) for n in type(section).model_fields}
     assert not any(w in n for n in names for w in ("guard", "whitelist", "leverage", "margin", "disable_coverage"))
+
+
+def test_bar_settings_defaults() -> None:
+    bars = AppConfig().market.bars
+    assert (bars.rest_delay_s, bars.rest_max_delay_s, bars.retry_s) == (120, 180, 5)
+    assert (bars.decision_max_lag_s, bars.store_flush_minutes) == (240, 15)
+    ks = AppConfig().risk.kill_switch
+    assert (ks.stale_bar_s, ks.stale_data_s) == (270, 90)
+    # the derived defaults follow S by fixed formulas, so a retuning changes one number
+    s = bars.rest_delay_s
+    assert (bars.rest_max_delay_s, bars.decision_max_lag_s, ks.stale_bar_s) == (s + 60, s + 120, s + 150)
+    assert AppConfig().dry_run.gate_ops.max_rest_revision_ratio == 0.005
+
+
+def test_a_larger_publication_lag_needs_a_larger_stale_bar_threshold() -> None:
+    ok = {
+        "market": {"bars": {"rest_delay_s": 300, "rest_max_delay_s": 360, "decision_max_lag_s": 420}},
+        "risk": {"kill_switch": {"stale_bar_s": 450}},
+    }
+    from modules.config import AppConfig as App
+
+    assert App.model_validate(ok).market.bars.rest_max_delay_s == 360
