@@ -171,8 +171,9 @@ def test_only_the_guard_makes_tickets_and_reserves() -> None:
 
 
 def test_v1_order_executor_is_disabled_and_not_imported_by_v2() -> None:
-    v1 = parse(MODULES / "order_execution.py")
-    assert any(isinstance(n, ast.Raise) for n in v1.body), "modules/order_execution.py must raise at import (C11)"
+    if (MODULES / "order_execution.py").exists():  # deleted once the v2 gateway exists (test below)
+        v1 = parse(MODULES / "order_execution.py")
+        assert any(isinstance(n, ast.Raise) for n in v1.body), "modules/order_execution.py must raise at import (C11)"
     importers = [
         rel(p)
         for p in v2_files()
@@ -185,13 +186,9 @@ def test_v1_order_executor_is_disabled_and_not_imported_by_v2() -> None:
     assert not importers, f"v2 modules must not import the v1 executor: {importers}"
 
 
-@pytest.mark.xfail(
-    condition=not (MODULES / "execution" / "gateway.py").exists(),
-    strict=True,
-    reason="delete modules/order_execution.py (and its test) when LiveExecutionGateway lands; remove this marker",
-)
 def test_v1_order_executor_is_deleted_once_the_v2_gateway_exists() -> None:
-    assert not (MODULES / "order_execution.py").exists()
+    if (MODULES / "execution" / "gateway.py").exists():
+        assert not (MODULES / "order_execution.py").exists()
 
 
 # ------------------------------------------------------------------------------ 2. tripwires

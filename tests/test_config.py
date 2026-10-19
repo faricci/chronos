@@ -43,7 +43,7 @@ def test_defaults_match_spec() -> None:
     assert cfg.execution.mode == "dry"
     assert cfg.decision.backend == "baseline"
     assert cfg.market.products == ("BTC-EUR", "ETH-EUR", "SOL-EUR")
-    assert cfg.risk.regime_multipliers == {1: 0.75, 2: 1.0, 3: 0.6}
+    assert cfg.risk.regime_multipliers == {1: 1.0, 2: 1.0, 3: 1.0}
     assert cfg.dry_run.fill_model.fallback_fees.maker_bps == 60
     assert cfg.dry_run.fill_model.fallback_fees.taker_bps == 120
     assert cfg.dry_run.fill_model.stop_extra_slip_bps == 10

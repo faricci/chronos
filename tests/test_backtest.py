@@ -11,13 +11,14 @@ import pytest
 
 from modules.config import EntryTimeout, FallbackFees, KillSwitchConfig, RiskConfig
 from modules.decision.baseline import AnswerArrays
-from modules.decision.policy import PolicyConfig
+from modules.decision.policy import REGIME_RULE, PolicyConfig, regimes_from_pctile
 from modules.dryrun.fill_model import FillModelParams
 from modules.execution.balance_guard import BalanceGuard
 from modules.execution.orders import ProductMeta
 from modules.execution.spot import SpotRegistry
 from modules.features.serializer import FLAT_COLUMNS
 from modules.ledger.positions import PositionLedger
+from modules.market.indicators_batch import compute_indicators
 from tests.indicator_fixtures import synthetic_bars
 from tests.label_fixtures import loaded_label
 from training.backtest import (
@@ -33,8 +34,8 @@ D = Decimal
 POS_LONG = FLAT_COLUMNS.index("pos_is_long")
 POS_HOURS = FLAT_COLUMNS.index("pos_hours_held")
 LABEL = loaded_label({"BTC-EUR": 3.0, "SOL-EUR": 3.0}, horizon_min=4 * 1440)
-POLICY = PolicyConfig(model="stub", tau_buy=0.5, tau_sell=0.5, c_min=0.0, p_edge_min=0.0,
-                      allowed_regimes_for_entry=(2,), label_config_sha256=LABEL.sha256)  # fmt: skip
+POLICY = PolicyConfig(model="stub", tau_buy=0.5, tau_sell=0.5, c_min=0.0, p_be_buffer=0.0,
+                      regime_rule=REGIME_RULE, label_config_sha256=LABEL.sha256)  # fmt: skip
 
 
 class StubDecider:
@@ -65,13 +66,14 @@ def registry() -> SpotRegistry:
 
 @pytest.fixture(scope="module")
 def markets() -> dict[str, object]:
-    btc = synthetic_bars(days=70, seed=51, zero_volume_day=None, constant_days=None)
-    sol = synthetic_bars(days=70, seed=52, zero_volume_day=None, constant_days=None)
+    btc = synthetic_bars(days=150, seed=51, zero_volume_day=None, constant_days=None)
+    sol = synthetic_bars(days=150, seed=52, zero_volume_day=None, constant_days=None)
     bm = build_market("BTC-EUR", btc, LABEL)
     return {"BTC-EUR": bm, "SOL-EUR": build_market("SOL-EUR", sol, LABEL, bm.ind)}
 
 
-SPAN = Span(pd.Timestamp("2024-01-12", tz="UTC"), pd.Timestamp("2024-02-20", tz="UTC"), None, 0)
+# the regime token (ATR percentile over 365 days) needs >= 104 daily bars: decisions start at day 112
+SPAN = Span(pd.Timestamp("2024-04-22", tz="UTC"), pd.Timestamp("2024-05-27", tz="UTC"), None, 0)
 
 
 def config(every: int = 15, **risk: object) -> BacktestConfig:
@@ -228,15 +230,52 @@ async def test_thin_bars_produce_no_fills_and_count_blocked_bars(markets) -> Non
 
 
 async def test_the_span_limits_the_decisions(markets) -> None:  # type: ignore[no-untyped-def]
-    narrow = Span(pd.Timestamp("2024-01-20", tz="UTC"), pd.Timestamp("2024-01-25", tz="UTC"), None, 1)
+    narrow = Span(pd.Timestamp("2024-05-01", tz="UTC"), pd.Timestamp("2024-05-06", tz="UTC"), None, 1)
     res = await run(markets, span=narrow)
     if len(res.trades):
-        assert res.trades["decision_ts"].min() >= pd.Timestamp("2024-01-20", tz="UTC")
-        assert res.trades["decision_ts"].max() < pd.Timestamp("2024-01-25", tz="UTC")
+        assert res.trades["decision_ts"].min() >= pd.Timestamp("2024-05-01", tz="UTC")
+        assert res.trades["decision_ts"].max() < pd.Timestamp("2024-05-06", tz="UTC")
     assert set(res.trades["fold"]) <= {1}
 
 
 async def test_data_limit_keeps_every_outcome_inside_the_limit(markets) -> None:  # type: ignore[no-untyped-def]
-    limit = pd.Timestamp("2024-02-05", tz="UTC")
+    limit = pd.Timestamp("2024-05-12", tz="UTC")
     res = await run(markets, span=Span(SPAN.entry_start, SPAN.entry_end, limit, 4))
     assert len(res.trades) > 0 and (res.trades["exit_ts"] <= limit).all()
+
+
+# ----------------------------------------------------------------------------------- regime (P1c)
+
+
+class ExtremeRegimeStub(StubDecider):
+    """The model's own regime head says "extreme" everywhere: it must not block anything, it only goes to the logs."""
+
+    def answers_batch(self, x: np.ndarray) -> AnswerArrays:
+        a = super().answers_batch(x)
+        return AnswerArrays(a.p_action, a.p_edge, np.tile([0.0, 0.0, 0.0, 0.0, 1.0], (len(x), 1)))
+
+
+async def test_extreme_model_regime_does_not_block_entries(markets) -> None:  # type: ignore[no-untyped-def]
+    res = await run(markets, ExtremeRegimeStub())
+    assert len(res.trades) > 3, res.skips  # no PolicyContractError, no regime veto from the head
+    assert "regime_veto" not in res.skips
+
+
+async def test_no_entry_without_the_regime_token(markets) -> None:  # type: ignore[no-untyped-def]
+    """Before 104 daily bars the token is missing: the policy says no entry, whatever the model answers."""
+    early = Span(pd.Timestamp("2024-02-01", tz="UTC"), pd.Timestamp("2024-02-20", tz="UTC"), None, 0)
+    res = await run(markets, span=early)
+    assert res.trades.empty
+
+
+def test_regime_is_causal() -> None:
+    """The regime of row i, computed on bars[:i+1], equals the one computed on all the bars (C7)."""
+    bars = synthetic_bars(days=150, seed=77, zero_volume_day=None, constant_days=None)
+    full = compute_indicators(bars)["atr_1d_pctile_365d"].to_numpy()
+    token = lambda x: regimes_from_pctile(np.clip(np.rint(x), 0, 100))  # noqa: E731
+    checked = 0
+    for cut in (112 * 1440, 125 * 1440 + 777, 140 * 1440 + 31):
+        part = compute_indicators(bars.iloc[:cut])["atr_1d_pctile_365d"].to_numpy()
+        np.testing.assert_array_equal(token(part), token(full[:cut]))
+        checked += int((token(part) >= 0).sum())
+    assert checked >= 200

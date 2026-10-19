@@ -7,6 +7,8 @@ coverage; the guard stays the final authority (C11).
 ::
 
     scale_p       = clip((p_edge - p_edge_min) / (p_edge_full - p_edge_min), 0, 1)
+                    (p_edge_min is the floor of THIS decision: break-even + buffer; when it reaches p_edge_full
+                    every decision that passed the EV gate has full conviction: scale_p = 1)
     risk_eur      = equity * risk_frac * scale_p * m_reg
     loss_per_unit = (entry - SL) + entry * cost_sl / 1e4
     size_raw      = risk_eur / loss_per_unit
@@ -76,9 +78,10 @@ def compute_size(
     if entry <= 0 or stop_loss >= entry:
         raise ValueError("sizing needs 0 < stop_loss < entry")
     if p_edge_full <= p_edge_min:
-        raise ValueError("p_edge_full must exceed p_edge_min")
-    span = _dec(p_edge_full) - _dec(p_edge_min)
-    scale_p = min(max((_dec(p_edge) - _dec(p_edge_min)) / span, Decimal(0)), Decimal(1))
+        scale_p = Decimal(1) if p_edge >= p_edge_min else Decimal(0)
+    else:
+        span = _dec(p_edge_full) - _dec(p_edge_min)
+        scale_p = min(max((_dec(p_edge) - _dec(p_edge_min)) / span, Decimal(0)), Decimal(1))
     budget = equity * _dec(risk_frac)  # risk of one trade at full conviction
     risk_eur = budget * scale_p * _dec(m_reg)
     loss_per_unit = (entry - stop_loss) + entry * _dec(cost_sl_bps) / _BPS

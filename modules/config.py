@@ -150,6 +150,7 @@ def _default_sources() -> tuple[SourceConfig, ...]:
         ),
         SourceConfig(name="cointelegraph_rss", kind="rss", url="https://cointelegraph.com/rss", interval_s=45),
         SourceConfig(name="decrypt_rss", kind="rss", url="https://decrypt.co/feed", interval_s=60),
+        SourceConfig(name="theblock_rss", kind="rss", url="https://www.theblock.co/rss.xml", interval_s=60),
         SourceConfig(name="cryptoslate_rss", kind="rss", url="https://cryptoslate.com/feed/", interval_s=60),
         SourceConfig(
             name="cryptopanic", kind="cryptopanic", interval_s=120, token_env="CRYPTOPANIC_TOKEN", enabled_if_token=True
@@ -232,7 +233,7 @@ class RiskConfig(_Section):
     min_net_edge_bps: float = Field(default=30, ge=0)
     ev_min_bps: float = 0
     slippage_buffer_bps: float = Field(default=5, ge=0)
-    regime_multipliers: dict[int, float] = {1: 0.75, 2: 1.0, 3: 0.6}
+    regime_multipliers: dict[int, float] = {1: 1.0, 2: 1.0, 3: 1.0}
     kill_switch: KillSwitchConfig = KillSwitchConfig()
     watchdog: WatchdogConfig = WatchdogConfig()
 
@@ -284,6 +285,20 @@ class BookConfig(_Section):
     starting_quote: Decimal = Field(default=Decimal("100.00"), gt=0)
     match_frequency_of: str | None = None
     seed: int | None = None
+    # TEST ONLY, ``random_entry`` books only: draw BUY with this probability per decision and carry this ``p_edge``
+    # into the RiskManager, instead of the frequency and the mean edge observed on the source book. It exists to put
+    # trades through the real pipeline in a short run (a benchmark that never trades proves nothing in 20 minutes);
+    # while it is on the book benchmarks nothing, and the app logs it. Both or none.
+    forced_buy_rate: float | None = Field(default=None, ge=0, le=1)
+    forced_edge: float | None = Field(default=None, gt=0, lt=1)
+
+    @model_validator(mode="after")
+    def _forced_goes_with_random(self) -> BookConfig:
+        if (self.forced_buy_rate is None) != (self.forced_edge is None):
+            raise ValueError("forced_buy_rate and forced_edge go together")
+        if self.forced_buy_rate is not None and self.decider != "random":
+            raise ValueError("forced_buy_rate belongs to the random decider only")
+        return self
 
 
 class FallbackFees(_Section):
@@ -370,6 +385,24 @@ class DryRunConfig(_Section):
         return self
 
 
+class TelemetryConfig(_Section):
+    """What the agent writes for outsiders (spec sez. 6.3): the present (``status.json``), the history (events, equity,
+    ops of the day). Empty ``events_dir`` / ``equity_dir`` / ``ops_dir`` mean ``<data_dir>/events``, ``/equity`` and
+    ``/reports/ops`` (where the report reads them); ``dir`` is where ``status.json`` goes. Nothing here can stop
+    trading: a telemetry error is logged and counted, never raised (sez. 6.3.5)."""
+
+    enabled: bool = True
+    dir: str = "telemetry"
+    status_interval_s: float = Field(default=10, gt=0)
+    equity_interval_s: float = Field(default=60, gt=0)
+    ops_interval_s: float = Field(default=60, gt=0)
+    events_dir: str | None = None
+    equity_dir: str | None = None
+    ops_dir: str | None = None
+    events_queue_max: int = Field(default=10_000, ge=1)
+    events_retention_days: int = Field(default=180, ge=1)
+
+
 class ParityTolerance(_Section):
     max_median_entry_delta_bps: float = Field(default=10, gt=0)
     min_bracket_outcome_agreement: float = Field(default=0.90, gt=0, le=1)
@@ -428,6 +461,7 @@ class AppConfig(_Section):
     execution: ExecutionConfig = ExecutionConfig()
     dry_run: DryRunConfig = DryRunConfig()
     live_ramp: LiveRampConfig = LiveRampConfig()
+    telemetry: TelemetryConfig = TelemetryConfig()
     coinbase: CoinbaseConfig = Field(default_factory=CoinbaseConfig)
 
     @model_validator(mode="after")

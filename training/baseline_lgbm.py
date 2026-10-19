@@ -1,8 +1,10 @@
 """Baseline LightGBM models (spec sez. 3.5 punto 9, decision O3).
 
 For every walk-forward fold ``k`` and for the final model it trains three boosters (``action``, ``edge``,
-``vol_regime``) on the rows of ``samples.parquet`` that belong to the training set, stops on the weighted validation
-logloss, then fits the calibration on the validation set only. The test set of a fold is never used for any fit.
+``vol_regime``) on the rows of ``samples.parquet`` that belong to the training set and stops on the weighted validation
+logloss. ``action`` and ``vol_regime`` are calibrated on the validation set; the Platt map of ``edge`` is fitted on the
+out-of-fold scores of the train rows plus the validation scores (``OOF_PLATT_V1``). The test set of a fold is never
+used for any fit.
 
 ::
 
@@ -79,6 +81,9 @@ VOL_MIN_TRAIN: Final = 5_000
 VOL_MIN_VAL: Final = 1_000
 ECE_BINS: Final = 15
 FINAL: Final = "final"
+CAL_FOLDS: Final = 4  # contiguous blocks of the cross-fitting that calibrates ``edge``
+CAL_NEFF_MIN: Final = 200.0  # below this effective sample size the edge calibration is not trusted
+CALIBRATION_SCHEME: Final = "OOF_PLATT_V1"
 
 
 class TrainingError(Exception):
@@ -166,6 +171,12 @@ def _normalise(w: np.ndarray) -> np.ndarray:
     return np.asarray(w / w.mean())
 
 
+def _edge_frame(samples: pd.DataFrame, mask: np.ndarray) -> pd.DataFrame:
+    """FLAT rows with a known ``edge_target`` inside one set (the rows of the ``edge`` model, in sample order)."""
+    s = samples[mask]
+    return s[(s["position_side"] == "FLAT") & s["edge_target"].notna()]
+
+
 def _select(samples: pd.DataFrame, mask: np.ndarray, kind: str, features: Sequence[str]) -> SetData:
     """Rows of one model inside one set. ``mask``: rows of ``samples`` that belong to the set."""
     s = samples[mask]
@@ -173,7 +184,7 @@ def _select(samples: pd.DataFrame, mask: np.ndarray, kind: str, features: Sequen
         y = s["action_target"].map({a: i for i, a in enumerate(ACTIONS)}).to_numpy(dtype=np.int64)
         w = s["w_action"].to_numpy(dtype=np.float64)
     elif kind == "edge":
-        s = s[(s["position_side"] == "FLAT") & s["edge_target"].notna()]
+        s = _edge_frame(samples, mask)
         y = s["edge_target"].to_numpy(dtype=np.int64)
         w = s["w_edge"].to_numpy(dtype=np.float64)
     elif kind == "vol_regime":
@@ -222,6 +233,43 @@ def _raw(booster: lgb.Booster, data: SetData, n_class: int | None) -> np.ndarray
     return raw.reshape(len(data.x), n_class) if n_class else raw.reshape(len(data.x))
 
 
+def _cal_blocks(tr: pd.DataFrame, embargo: timedelta) -> list[tuple[np.ndarray, np.ndarray]]:
+    """``(block, fit)`` positions of ``tr``: ``CAL_FOLDS`` contiguous blocks by ``(t, product)``; the fit rows are
+    the ones whose ``[t, label_window_end]`` ends more than ``embargo`` before the block or starts more than
+    ``embargo`` after it (purge on both sides)."""
+    order = tr.reset_index(drop=True).sort_values(["t", "product"], kind="stable").index.to_numpy()
+    t = tr["t"].to_numpy(dtype="datetime64[ns]")
+    end = tr["label_window_end"].to_numpy(dtype="datetime64[ns]")
+    gap = np.timedelta64(embargo)
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    for block in np.array_split(order, CAL_FOLDS):
+        if len(block) == 0:
+            continue
+        start, last = t[block].min(), end[block].max()
+        out.append((block, np.flatnonzero((end < start - gap) | (t > last + gap))))
+    return out
+
+
+def oof_edge_scores(
+    tr: pd.DataFrame, x: np.ndarray, y: np.ndarray, n_rounds: int, embargo: timedelta, threads: int
+) -> np.ndarray:
+    """Raw ``edge`` score of every train row from a booster that never saw it (cross-fitting with purge, no early
+    stopping, ``n_rounds`` trees, ``w_edge`` normalised to mean 1). NaN where the block is not evaluated.
+
+    ``tr``: the rows behind ``x`` / ``y`` (same order) with ``t``, ``product``, ``label_window_end`` and ``w_edge``.
+    """
+    params = dict(LGBM_PARAMS, num_threads=threads, objective="binary")
+    w = tr["w_edge"].to_numpy(dtype=np.float64)
+    z = np.full(len(tr), np.nan)
+    for block, fit in _cal_blocks(tr, embargo):
+        if len(fit) < 2 * int(LGBM_PARAMS["min_data_in_leaf"]):
+            continue
+        dfit = lgb.Dataset(x[fit], label=y[fit], weight=_normalise(w[fit]))
+        booster = lgb.train(params, dfit, num_boost_round=n_rounds)
+        z[block] = np.asarray(booster.predict(x[block], raw_score=True)).reshape(len(block))
+    return z
+
+
 # ----------------------------------------------------------------------------------------- splits
 
 
@@ -249,9 +297,13 @@ def set_membership(samples: pd.DataFrame, label: LoadedLabelConfig, cfg: TrainCo
 
 
 def fit_subset(
-    samples: pd.DataFrame, member: np.ndarray, cfg: TrainConfig, tag: int, allow_degenerate: bool
+    samples: pd.DataFrame, member: np.ndarray, cfg: TrainConfig, tag: int, allow_degenerate: bool, rho: float
 ) -> dict[str, Any]:
-    """Boosters + calibration + metrics for one fold (or the final model). Returns plain objects ready to be saved."""
+    """Boosters + calibration + metrics for one fold (or the final model). Returns plain objects ready to be saved.
+
+    ``rho``: pairwise correlation of the products' labels (``feasibility.rho_raw``), for the ``N_eff`` of the edge
+    calibration set. ``result["edge_cal"]["ok"]`` is False when that set is too small; the caller decides what follows.
+    """
     threads = cfg.lgbm.num_threads
     result: dict[str, Any] = {"boosters": {}, "metrics": {}, "best_iteration": {}, "n_rows": {}}
     cal: dict[str, Any] = {}
@@ -283,8 +335,20 @@ def fit_subset(
         raise TrainingError("edge: empty train or validation set")
     booster, best = _fit("edge", tr, va, threads)
     z = _raw(booster, va, None)
-    a, b = fit_platt(z, va.y.astype(float), va.w)
+    ftr, fva = (_edge_frame(samples, member == s) for s in ("train", "val"))
+    z_oof = oof_edge_scores(ftr, tr.x, tr.y, best, timedelta(days=cfg.embargo_days), threads)
+    done = np.isfinite(z_oof)  # the calibration set C: OOF train scores + validation scores, never test rows
+    w_raw = np.concatenate([ftr["w_edge"].to_numpy(dtype=np.float64)[done], fva["w_edge"].to_numpy(dtype=np.float64)])
+    k = len(set(ftr["product"].to_numpy()[done]) | set(fva["product"].to_numpy()))
+    n_eff = float(w_raw.sum() / (1.0 + (k - 1) * rho))
+    a, b = fit_platt(
+        np.concatenate([z_oof[done], z]), np.concatenate([tr.y[done], va.y]).astype(float), _normalise(w_raw)
+    )
     cal["platt_edge"] = {"a": a, "b": b}
+    cal["edge_cal"] = result["edge_cal"] = {
+        "scheme": CALIBRATION_SCHEME, "n_rows_oof": int(done.sum()), "n_rows_val": len(va.y), "n_eff": n_eff,
+        "n_eff_min": CAL_NEFF_MIN, "ok": bool(n_eff >= CAL_NEFF_MIN),
+    }  # fmt: skip
     p_raw = 1.0 / (1.0 + np.exp(-z))
     p_cal = Calibration(**cal).edge_probs(z)
     y = va.y.astype(float)
@@ -381,16 +445,24 @@ def train_baseline(
     version = _version(models_dir, now)
     root = models_dir / version
     members = set_membership(samples, label, cfg)
+    rho = float(label.raw.get("feasibility", {}).get("rho_raw", 1.0))
     folds: dict[str, Any] = {}
     degenerate: dict[str, dict[str, bool]] = {}
     for name, member in members.items():
         is_final = name == FINAL
         tag = 99 if is_final else int(name.split("_")[1])
-        res = fit_subset(samples, member, cfg, tag, allow_degenerate=(not is_final) or allow_degenerate_final)
+        print(f"[{name}] start {datetime.now(UTC):%Y-%m-%d %H:%M:%S}", flush=True)
+        res = fit_subset(samples, member, cfg, tag, allow_degenerate=(not is_final) or allow_degenerate_final, rho=rho)
+        ec = res["edge_cal"]
+        print(f"[{name}] end {datetime.now(UTC):%Y-%m-%d %H:%M:%S} edge_cal n_eff={ec['n_eff']:.1f} ok={ec['ok']}",
+              flush=True)  # fmt: skip
+        if is_final and not ec["ok"]:
+            raise TrainingError(f"final: edge calibration N_eff {ec['n_eff']:.1f} < {CAL_NEFF_MIN:.0f}")
         _save(root / name, res)
         degenerate[name] = res["degenerate"]
         folds[name] = {
             "best_iteration": res["best_iteration"], "n_rows": res["n_rows"], "metrics_val": res["metrics"],
+            "edge_cal": res["edge_cal"],
             "metrics_test": {} if is_final else test_metrics(samples, member, res),
         }  # fmt: skip
     questions = build_questions(label.cfg.horizon_min, label.cfg.k_tp, label.cfg.k_sl, label.cfg.atr_tf)
@@ -443,6 +515,7 @@ def train_baseline(
             "num_boost_round": NUM_BOOST_ROUND,
             "early_stopping_rounds": EARLY_STOPPING_ROUNDS,
         },
+        "calibration_scheme": CALIBRATION_SCHEME,
         "degenerate": degenerate,
         "folds": folds,
         "calibration": json.loads((root / FINAL / "calibration.json").read_text(encoding="utf-8")),

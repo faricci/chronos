@@ -142,13 +142,47 @@ def test_a_file_cut_short_by_a_crash_still_yields_what_was_written(tmp_path: Pat
     assert len(list(read_recording(path))) >= 1
 
 
-def test_appending_to_an_existing_file_keeps_everything(tmp_path: Path) -> None:
-    for seq in (1, 2):  # two runs on the same day (a restart) write into the same file
+def test_a_truncated_member_followed_by_an_appended_one_yields_what_precedes_the_damage(tmp_path: Path) -> None:
+    """What the soak left on 2026-10-18: a run killed mid-write, then a restart appending a new gzip member."""
+    path = tmp_path / "x.jsonl.gz"
+    with gzip.open(path, "wb") as fh:
+        for i in range(200):
+            fh.write(f"{at(D1, i):.6f}\t{l2(i)}\n".encode())
+    cut = path.read_bytes()[:-40]  # the first run died: its member has no trailer and misses its tail
+    with gzip.open(tmp_path / "second.gz", "wb") as fh:
+        fh.write(f"{at(D1, 999):.6f}\t{l2(999)}\n".encode())
+    path.write_bytes(cut + (tmp_path / "second.gz").read_bytes())
+    got = list(read_recording(path))  # must not raise
+    assert len(got) >= 150 and got[:150] == [(at(D1, i), l2(i)) for i in range(150)]  # all that precedes the damage
+
+
+def test_a_restart_writes_a_new_part_and_keeps_everything(tmp_path: Path) -> None:
+    for seq in (1, 2, 3):  # three runs on the same day: each one has its own file
         rec = WsRecorder(tmp_path)
         rec.start()
         rec.record(at(D1, seq), l2(seq))
         finish(rec)
-    assert [raw for _, raw in read_recording(tmp_path / "2026-10-17" / "l2_data-BTC-EUR.jsonl.gz")] == [l2(1), l2(2)]
+    folder = tmp_path / "2026-10-17"
+    names = sorted(p.name for p in folder.glob("l2_data-BTC-EUR*"))
+    assert names == ["l2_data-BTC-EUR.jsonl.gz", "l2_data-BTC-EUR.part1.jsonl.gz", "l2_data-BTC-EUR.part2.jsonl.gz"]
+    assert [raw for _, _, raw in merged_messages(tmp_path, [D1.date()])] == [l2(1), l2(2), l2(3)]
+
+
+def test_a_crash_damaged_file_does_not_hide_what_the_next_run_recorded(tmp_path: Path) -> None:
+    """The soak of 2026-10-18: the PC restarted, the recorder appended to a truncated gzip and lost the rest."""
+    rec = WsRecorder(tmp_path)
+    rec.start()
+    for i in range(50):
+        rec.record(at(D1, i), l2(i))
+    finish(rec)
+    first = tmp_path / "2026-10-17" / "l2_data-BTC-EUR.jsonl.gz"
+    first.write_bytes(first.read_bytes()[:-30])  # the first run "died" mid-write
+    rec2 = WsRecorder(tmp_path)
+    rec2.start()
+    rec2.record(at(D1, 1000), l2(1000))
+    finish(rec2)
+    got = [raw for _, _, raw in merged_messages(tmp_path, [D1.date()])]
+    assert l2(1000) in got  # the new session is intact whatever happened to the old file
 
 
 def test_a_message_with_a_newline_cannot_break_the_one_line_format(tmp_path: Path) -> None:

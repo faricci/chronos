@@ -279,3 +279,77 @@ async def _run_sequence(ops: list[tuple[str, int, int]], path: Path) -> None:
 def test_random_fill_sequences_keep_the_invariants_and_survive_a_reload(ops: list[tuple[str, int, int]]) -> None:
     with tempfile.TemporaryDirectory() as tmp:
         asyncio.run(_run_sequence(ops, Path(tmp) / "dry.db"))
+
+
+# ---------------------------------------------------------------- get_order and the one-transaction fills
+
+
+def fill_rec(trade: str, side: str, size: str, price: str = "92.03", cid: str = "c1") -> FillRecord:
+    return FillRecord(trade, B, cid, P, side, D(price), D(size), D("0.01"), "maker", T0)  # type: ignore[arg-type]
+
+
+async def test_get_order_finds_an_order_in_any_status_and_respects_the_book(ledger: PositionLedger) -> None:
+    rec = OrderRecord("c1", B, P, "BUY", "entry", "OPEN", T0, T0, intent_id="i1", payload='{"x": 1}')
+    await ledger.record_order(rec)
+    assert await ledger.get_order("c1") == rec
+    assert await ledger.get_order("c1", B) == rec
+    assert await ledger.get_order("c1", "other") is None
+    assert await ledger.get_order("nope") is None
+    await ledger.update_order("c1", "FILLED", T0, "ex-1")  # terminal: no longer in open_orders, still readable
+    assert await ledger.open_orders(B) == []
+    found = await ledger.get_order("c1")
+    assert found is not None and (found.status, found.exchange_order_id) == ("FILLED", "ex-1")
+
+
+async def test_a_fill_and_its_position_are_written_in_one_transaction(
+    ledger: PositionLedger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def broken(_view: PositionView) -> None:
+        raise RuntimeError("crash between the fill and the position")
+
+    monkeypatch.setattr(ledger, "_write_position", broken)
+    with pytest.raises(RuntimeError):
+        await ledger.apply_entry_fill_recorded(fill_rec("t1", "BUY", "0.023"), "dec-1", PLAN)
+    assert await ledger.fills_for("c1") == []  # the fill did not survive without its position
+    assert ledger.view(B, P).side == "FLAT"
+    monkeypatch.undo()
+    result = await ledger.apply_entry_fill_recorded(fill_rec("t1", "BUY", "0.023"), "dec-1", PLAN)  # the retry works
+    assert result is not None and result.position.base_qty == D("0.023")
+    assert result.position.tp == PLAN.tp and result.position.entry_decision_id == "dec-1"
+    assert [f.trade_id for f in await ledger.fills_for("c1")] == ["t1"]
+
+
+async def test_a_fill_already_stored_changes_nothing_when_recorded_with_its_position(ledger: PositionLedger) -> None:
+    first = await ledger.apply_entry_fill_recorded(fill_rec("t1", "BUY", "0.023"), "dec-1", PLAN)
+    again = await ledger.apply_entry_fill_recorded(fill_rec("t1", "BUY", "0.023"), "dec-1", PLAN)
+    assert first is not None and again is None
+    assert ledger.view(B, P).base_qty == D("0.023")  # not 0.046
+    assert await ledger.record_fill(fill_rec("t1", "BUY", "0.023")) is False  # the plain path sees it too
+    sold = await ledger.apply_exit_fill_recorded(fill_rec("t2", "SELL", "0.010", cid="c2"))
+    assert sold is not None and sold.base_qty == D("0.013")
+    assert await ledger.apply_exit_fill_recorded(fill_rec("t2", "SELL", "0.010", cid="c2")) is None
+    assert ledger.view(B, P).base_qty == D("0.013")
+
+
+async def test_a_recorded_exit_can_be_clipped_and_an_oversell_stores_nothing(ledger: PositionLedger) -> None:
+    await ledger.apply_entry_fill_recorded(fill_rec("t1", "BUY", "0.023"), "dec-1", PLAN)
+    flat = await ledger.apply_exit_fill_recorded(fill_rec("t2", "SELL", "0.030", cid="c2"), D("0.023"))
+    assert flat is not None and flat.side == "FLAT"  # clipped to what was held
+    assert [f.size for f in await ledger.fills_for("c2")] == [D("0.030")]  # the fill itself is stored as it was
+    with pytest.raises(ShortPositionError):
+        await ledger.apply_exit_fill_recorded(fill_rec("t3", "SELL", "0.001", cid="c3"))
+    assert await ledger.fills_for("c3") == []  # and a refused exit leaves no fill behind
+
+
+async def test_recorded_fills_survive_a_reload(tmp_path: Path) -> None:
+    path = tmp_path / "dry.db"
+    lg = await PositionLedger.open(path, "dry")
+    try:
+        await lg.apply_entry_fill_recorded(fill_rec("t1", "BUY", "0.023"), "dec-1", PLAN)
+    finally:
+        await lg.close()
+    again = await reload(path)
+    try:
+        assert again.view(B, P).base_qty == D("0.023") and len(await again.fills_for("c1")) == 1
+    finally:
+        await again.close()

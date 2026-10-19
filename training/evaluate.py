@@ -18,7 +18,13 @@ fold with its own model and its own thresholds, concatenated) and of the holdout
   position per product, same number of trades): ``p <= 0.05``; random entries inherit the drift of the period, so
   only the ability to pick entries passes;
 - E4 concentration: no fold above 50% of the OOS PnL and at least 3 of 5 folds with PnL > 0;
-- E5 holdout: >= 5 trades, PnL > 0 and consistent with the OOS (``z > -1.96``).
+- E5 holdout: >= 5 trades, PnL > 0 and consistent with the OOS (``z > -1.96``); a holdout WITHOUT trades is
+  E5 = False (``holdout_no_trades``), with 1..4 trades it is not evaluable.
+
+A fold (or the holdout) whose policy is not tunable runs as "no entry": zero trades, PnL 0.0, and 0.0 is not
+positive for E4 (decision P1c: a flat fold is never treated as neutral). ``pnl_by_fold`` always lists the five
+folds. E1..E3 use only the trades that exist (no fictitious zeros). The trivial baselines (B0 buy and hold,
+B2 always invested with the same bracket) are report-only: they change no gate and no verdict.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import math
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, Literal
 
@@ -41,7 +48,7 @@ from modules.config import EXIT_CONFIG_ERROR
 from modules.decision.baseline import MARKET_FEATURES, BaselineDecider, Calibration
 from modules.decision.policy import PolicyConfig
 from modules.decision.questions import build_questions
-from modules.risk.costs import CostModel
+from modules.risk.costs import CostModel, net_return
 from modules.risk.label_config import LoadedLabelConfig, load_label_config
 from training import feasibility as fz
 from training.backtest import (
@@ -55,7 +62,7 @@ from training.backtest import (
     decision_rows,
     run_backtest,
 )
-from training.baseline_lgbm import FINAL, _select, ece, latest_run, logloss_binary, set_membership
+from training.baseline_lgbm import FINAL, _edge_frame, _select, ece, latest_run, logloss_binary, set_membership
 from training.config import TrainConfig, load_train_config_or_exit
 from training.fold_spans import SpanSet, compute_spans
 from training.labeling import NO_FILL, label_window_end, triple_barrier
@@ -358,6 +365,7 @@ def edge_gates(
     import lightgbm as lgb
 
     members = set_membership(samples, label, cfg)
+    rho = float(label.raw.get("feasibility", {}).get("rho_raw", 1.0))
     folds: dict[str, Any] = {}
     for name, m in members.items():
         if name == FINAL:
@@ -371,10 +379,17 @@ def edge_gates(
         p, y = cal.edge_probs(z), te.y.astype(float)
         base = float((tr.w * tr.y).sum() / tr.w.sum())
         pol = policies.get(name)
-        region = p >= pol.p_edge_min if pol is not None else np.zeros(len(p), dtype=bool)
+        pbe = te.x[:, MARKET_FEATURES.index("p_breakeven")]  # the state token the policy and the RiskManager see
+        region = (p >= pbe + pol.p_be_buffer) if pol is not None else np.zeros(len(p), dtype=bool)
+        raw_w = _edge_frame(samples, m == "test")["w_edge"].to_numpy(dtype=np.float64)
+        n_eff_test = float(raw_w.sum() / (1.0 + (len(set(samples["product"])) - 1) * rho))
+        p_obs = float((te.w * y).sum() / te.w.sum())
+        se = math.sqrt(max(p_obs * (1 - p_obs), 1e-12) / max(n_eff_test, 1e-12))
+        bias_all = float((te.w * (p - y)).sum() / te.w.sum())
         entry: dict[str, Any] = {
             "edge_ece": ece(p, y, te.w), "edge_logloss": logloss_binary(p, y, te.w),
             "prior_logloss": logloss_binary(np.full(len(y), base), y, te.w), "n_edge": int(len(y)),
+            "bias_all": bias_all, "n_eff_test": n_eff_test, "se": se, "bias_z": bias_all / se,
         }  # fmt: skip
         if region.any():
             w = te.w[region]
@@ -383,6 +398,54 @@ def edge_gates(
             entry["region_n"] = int(region.sum())
         folds[name] = entry
     return folds
+
+
+# ------------------------------------------------------------------------ trivial baselines (report only)
+
+
+def buy_and_hold(markets: Mapping[str, ProductMarket], label: LoadedLabelConfig, span: Span) -> dict[str, Any]:
+    """B0: equal-weight buy and hold of the products over ``span`` (one round trip, no rebalancing).
+
+    Entry at the close of the first bar with the maker fee, exit at the close of the last bar with the taker fee, half
+    the spread and the slippage buffer; exact ``net_return``. Reports the return, the maximum drawdown of the
+    equal-weight daily curve and the return per day of exposure.
+    """
+    start_ns, end_ns = _utc_value(span.entry_start), _utc_value(span.entry_end)
+    rets: list[float] = []
+    curves: list[np.ndarray] = []
+    for name, pm in markets.items():
+        t_ns = pm.bars.ts_close.astype("datetime64[ns]").astype(np.int64)
+        idx = np.flatnonzero((t_ns >= start_ns) & (t_ns < end_ns))
+        if idx.size < 2:
+            continue
+        first, last = int(idx[0]), int(idx[-1])
+        s = label.spread_for(name, pd.Timestamp(pm.bars.ts_close[first]).to_pydatetime())
+        entry = Decimal(repr(float(pm.bars.c[first])))
+        exit_ = Decimal(repr(float(pm.bars.c[last]) * (1.0 - (s / 2 + label.costs.slippage_buffer_bps) / 1e4)))
+        rets.append(1e4 * float(net_return(entry, exit_, label.fees.maker_bps, label.fees.taker_bps)))
+        curves.append(pm.bars.c[idx[::1440]] / pm.bars.c[first])
+    if not rets:
+        return {"n_products": 0}
+    k = min(len(c) for c in curves)
+    curve = np.mean([c[:k] for c in curves], axis=0)
+    days = max((end_ns - start_ns) / 86_400e9, 1e-9)
+    mdd = float(np.max(1.0 - curve / np.maximum.accumulate(curve)))
+    return {"n_products": len(rets), "return_bps": float(np.mean(rets)), "days": days,
+            "bps_per_day": float(np.mean(rets)) / days, "max_drawdown": mdd}  # fmt: skip
+
+
+def always_invested(cand: Mapping[tuple[int, str], Candidates]) -> dict[str, Any]:
+    """B2: the strategy "enter whenever flat" with the same bracket: greedy chain over the candidates of every
+    (fold, product): the first candidate, then the first one starting at or after the exit of the previous."""
+    n, total = 0, 0.0
+    for c in cand.values():
+        next_free = -1
+        for i in np.argsort(c.t_idx, kind="stable"):
+            if int(c.t_idx[i]) >= next_free:
+                n += 1
+                total += float(c.label_bps[i])
+                next_free = int(c.exit_idx[i])
+    return {"n": n, "mean_label_bps": total / n if n else None}
 
 
 # ---------------------------------------------------------------------------------- the run
@@ -410,9 +473,12 @@ async def evaluate_model(
     bt1 = backtest_config(cfg, app, EVAL_DECISION_EVERY_MIN)
     bt15 = backtest_config(cfg, app, TUNE_DECISION_EVERY_MIN)
     policies: dict[str, PolicyConfig | None] = {}
+    fold_status: dict[str, str] = {}
+    fold_summary: dict[str, Any] = {}
     for sub in [f"fold_{f.index}" for f in spans.folds] + [FINAL]:
         raw = json.loads((model_dir / sub / "policy.json").read_text(encoding="utf-8"))
         policies[sub] = None if raw.get("untunable") else PolicyConfig.model_validate(raw)
+        fold_status[sub] = str(raw.get("reason", "untunable")) if raw.get("untunable") else "ok"
 
     # ---- backtests
     oos: list[BacktestResult] = []
@@ -421,8 +487,11 @@ async def evaluate_model(
     for f in spans.folds:
         sub = f"fold_{f.index}"
         pol = policies[sub]
+        for name, pm in markets.items():
+            cand[(f.index, name)] = candidates_for(pm, label, f.test, EVAL_DECISION_EVERY_MIN, min_edge)
         if pol is None:
-            print(f"{sub}: untunable, no trades", flush=True)
+            print(f"{sub}: {fold_status[sub]}, no entries (PnL 0.00, not positive)", flush=True)
+            fold_summary[sub] = {"trades": 0, "pnl_eur": 0.0}
             continue
         decider = BaselineDecider.load(model_dir, label=label, questions=questions, subset=sub, allow_degenerate=True)
         res = await run_backtest(markets, decider, pol, label, f.test, bt1, registry, flat_cache, long_cache)
@@ -433,9 +502,9 @@ async def evaluate_model(
             "mean_bps_1min": float(res.trades["net_ret_bps"].mean()) if len(res.trades) else None,
             "mean_bps_15min": float(res15.trades["net_ret_bps"].mean()) if len(res15.trades) else None,
         }  # fmt: skip
-        for name, pm in markets.items():
-            cand[(f.index, name)] = candidates_for(pm, label, f.test, EVAL_DECISION_EVERY_MIN, min_edge)
-        print(f"{sub}: {len(res.trades)} trades, PnL {res.trades['pnl_eur'].sum():.2f} EUR", flush=True)
+        pnl_f = float(res.trades["pnl_eur"].sum()) if len(res.trades) else 0.0
+        fold_summary[sub] = {"trades": len(res.trades), "pnl_eur": pnl_f}
+        print(f"{sub}: {len(res.trades)} trades, PnL {pnl_f:.2f} EUR", flush=True)
     trades = pd.concat([r.trades for r in oos], ignore_index=True) if oos else pd.DataFrame()
 
     hold = pd.DataFrame()
@@ -446,6 +515,9 @@ async def evaluate_model(
             await run_backtest(markets, final, pol_final, label, spans.holdout, bt1, registry, flat_cache, long_cache)
         ).trades
         print(f"holdout: {len(hold)} trades, PnL {hold['pnl_eur'].sum() if len(hold) else 0:.2f} EUR", flush=True)
+    else:
+        print(f"final: {fold_status[FINAL]}, holdout without entries", flush=True)
+    fold_summary[FINAL] = {"trades": len(hold), "pnl_eur": float(hold["pnl_eur"].sum()) if len(hold) else 0.0}
 
     # ---- gates
     g0 = regime_check(markets, label, min_edge)
@@ -456,11 +528,15 @@ async def evaluate_model(
         trades, hold, cand, label, spans, g0["passed"], float(label.raw.get("feasibility", {}).get("rho_raw", 1.0))
     )
 
+    b0 = {f"fold_{f.index}": buy_and_hold(markets, label, f.test) for f in spans.folds}
+    b0["holdout"] = buy_and_hold(markets, label, spans.holdout)
     gates = {"G0": g0, "G1": {"per_fold": g1, "passed": all(g1.values()) and bool(g1)},
              "G2": {"per_fold": g2, "n_better": sum(g2.values()), "passed": sum(g2.values()) >= G2_MIN_FOLDS},
              "GE": ge, "G3": {"applicable": False, "note": "the candidate is the baseline"},
              "G4": {"passed": True, "note": "trivial: sentiment_available=false"},
-             "edge_gates_per_fold": folds, "cadence_sensitivity": sens}  # fmt: skip
+             "edge_gates_per_fold": folds, "cadence_sensitivity": sens,
+             "fold_status": fold_status, "fold_summary": fold_summary,
+             "baselines": {"B0_buy_and_hold": b0, "B2_always_invested": always_invested(cand)}}  # fmt: skip
     others = g0["passed"] and gates["G1"]["passed"] and gates["G2"]["passed"]
     status: Status = ge["status"]
     code = 0 if others and status == "GO" else EXIT_INCONCLUSIVE if others and status == "INCONCLUSO" else 1
@@ -475,9 +551,13 @@ def _ge(
     block = pd.Timedelta(days=math.ceil((cfg.entry_first_bar + cfg.entry_timeout_min - 1 + cfg.horizon_min) / 1440))
     n = len(trades)
     out: dict[str, Any] = {"n_oos_trades": n, "n_holdout_trades": len(hold), "block_days": block.days}
+    pnl_by_fold: dict[int, float] = {f.index: 0.0 for f in spans.folds}  # a fold without trades counts as 0.0
     if n == 0:
         out.update(
-            status=edge_status(g0_ok, {"E1": False}, 0.0, 0.0).status, checks={"E1": False}, reasons=["no_trades"]
+            status=edge_status(g0_ok, {"E1": False}, 0.0, 0.0).status,
+            checks={"E1": False},
+            reasons=["no_trades"],
+            pnl_by_fold=pnl_by_fold,
         )
         return out
     start, end = spans.folds[0].test.entry_start, spans.holdout_start
@@ -489,7 +569,6 @@ def _ge(
     for fold, product in zip(trades["fold"], trades["product"], strict=True):
         counts[(int(fold), str(product))] = counts.get((int(fold), str(product)), 0) + 1
     perm = permutation_pvalue(trades["label_net_bps"].to_numpy(), counts, cand, N_PERM, SEED)
-    pnl_by_fold: dict[int, float] = {}
     for fold, pnl in zip(trades["fold"], trades["pnl_eur"], strict=True):
         pnl_by_fold[int(fold)] = pnl_by_fold.get(int(fold), 0.0) + float(pnl)
     share, n_pos = concentration(pnl_by_fold)
@@ -514,7 +593,11 @@ def _ge(
         )
         z = holdout_consistency(boot_h, boot)
         checks["E5"] = bool(hold["pnl_eur"].sum() > 0 and z > Z_HOLDOUT_MIN)
+    elif len(hold) == 0:
+        checks["E5"] = False  # a holdout that never trades is not evidence of anything
     verdict = edge_status(g0_ok, checks, boot.mean, boot.t)
+    if len(hold) == 0 and "E5" in verdict.reasons:
+        verdict.reasons.append("holdout_no_trades")
     out.update(
         status=verdict.status, checks=checks, reasons=verdict.reasons, n_eff_trades=neff,
         bootstrap={"mean_bps": boot.mean, "se": boot.se, "q025": boot.q025, "q975": boot.q975, "t": boot.t},
@@ -549,6 +632,14 @@ def render(ev: Evaluation, model: str) -> str:
             f"   mean {b['mean_bps']:+.1f} bps/trade, q2.5 {b['q025']:+.1f}, t {b['t']:.2f}; "
             f"permutation p {ge['permutation']['p']:.4f}; folds PnL {ge['pnl_by_fold']}; holdout z {ge['holdout_z']}"
         )
+    for sub_, st in g.get("fold_status", {}).items():
+        sm = g.get("fold_summary", {}).get(sub_, {})
+        lines.append(f"   {sub_:<7}: {st}, trades {sm.get('trades', 0)}, PnL {sm.get('pnl_eur', 0.0):+.2f} EUR")
+    b = g.get("baselines", {})
+    if b:
+        lines.append(f"baselines (report only): B2 always invested {b['B2_always_invested']}")
+        for k, v in b["B0_buy_and_hold"].items():
+            lines.append(f"   B0 buy and hold {k}: {v}")
     lines.append(f"G3               : n/a ({g['G3']['note']})")
     lines.append(f"G4               : PASS ({g['G4']['note']})")
     lines.append(f"cadence sensitivity: {g['cadence_sensitivity']}")

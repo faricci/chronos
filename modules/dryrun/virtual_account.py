@@ -14,15 +14,30 @@ PnL convention (what makes the accounting identity exact):
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from decimal import Decimal
-from typing import Final
+from typing import Final, Literal, Protocol
 
-from modules.execution.balance import BalanceBook, Clock, CoverageAlarm
+from modules.execution.balance import BalanceBook, Clock, CoverageAlarm, Reservation
 
-__all__ = ["VirtualAccount"]
+__all__ = ["FillLike", "VirtualAccount"]
 
 ZERO: Final = Decimal(0)
+
+
+class FillLike(Protocol):
+    """A booked fill as ``restore`` needs it (``FillRecord`` of the ledger satisfies it)."""
+
+    @property
+    def product_id(self) -> str: ...
+    @property
+    def side(self) -> Literal["BUY", "SELL"]: ...
+    @property
+    def price(self) -> Decimal: ...
+    @property
+    def size(self) -> Decimal: ...
+    @property
+    def fee(self) -> Decimal: ...
 
 
 class VirtualAccount:
@@ -32,6 +47,7 @@ class VirtualAccount:
         self.book = book
         self.quote_currency = quote_currency
         self.starting_quote = starting_quote
+        self._clock = clock
         self.balances = BalanceBook(book, "virtual", clock, {quote_currency: starting_quote})
         self.fees_paid = ZERO
         self.realized_pnl = ZERO
@@ -123,3 +139,54 @@ class VirtualAccount:
             self._qty[product_id] = held - size
             self._cost[product_id] = cost - released
         return alarms
+
+    # --------------------------------------------------------------------------------------- restart
+
+    def restore(
+        self, fills: Iterable[FillLike], base_of: Mapping[str, str], reservations: Iterable[Reservation] = ()
+    ) -> None:
+        """Rebuild a FRESH account from the fills the ledger booked (after a restart).
+
+        The fills are replayed in order with the arithmetic of ``record_fill`` (a BUY spends ``price x size + fee`` of
+        quote and adds ``size`` base; a SELL does the reverse), so the balances, ``fees_paid``, ``realized_pnl`` and the
+        cost basis are the ones the running account had. ``reservations`` are the orders that are still open (the
+        standalone brackets): their amount is taken out of ``free`` and registered in the new ``BalanceBook``, so
+        ``free + reserved`` is what the fills say. A history that would leave a negative balance (the ledger and the
+        starting capital disagree) raises ``ValueError``: it is never papered over.
+        """
+        if self.balances.epoch != 0 or self._qty or self.fees_paid or self.realized_pnl:
+            raise ValueError("restore needs a fresh account")
+        quote = self.starting_quote
+        bases: dict[str, Decimal] = {}
+        fees = realized = ZERO
+        qty: dict[str, Decimal] = {}
+        cost: dict[str, Decimal] = {}
+        for f in fills:
+            base = base_of[f.product_id]
+            fees += f.fee
+            if f.side == "BUY":
+                quote -= f.price * f.size + f.fee
+                bases[base] = bases.get(base, ZERO) + f.size
+                qty[f.product_id] = qty.get(f.product_id, ZERO) + f.size
+                cost[f.product_id] = cost.get(f.product_id, ZERO) + f.price * f.size
+            else:
+                held = qty.get(f.product_id, ZERO)
+                if f.size > held:
+                    raise ValueError(f"{self.book}: SELL fill of {f.size} {f.product_id} exceeds the {held} held")
+                released = cost[f.product_id] if f.size == held else cost[f.product_id] * f.size / held
+                quote += f.price * f.size - f.fee
+                bases[base] -= f.size
+                realized += f.price * f.size - released
+                qty[f.product_id] = held - f.size
+                cost[f.product_id] -= released
+        free = {self.quote_currency: quote, **bases}
+        reserved = list(reservations)
+        for r in reserved:
+            free[r.currency] = free.get(r.currency, ZERO) - r.amount
+        negative = {c: v for c, v in free.items() if v < 0}
+        if negative:
+            raise ValueError(f"{self.book}: the ledger replays to negative balances {negative}")
+        self.balances = BalanceBook(self.book, "virtual", self._clock, free)
+        for r in reserved:
+            self.balances.restore_reservation(r)
+        self.fees_paid, self.realized_pnl, self._qty, self._cost = fees, realized, qty, cost

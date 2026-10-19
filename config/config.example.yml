@@ -46,6 +46,7 @@ sentiment:
     - {name: coindesk_rss, kind: rss, url: "https://www.coindesk.com/arc/outboundfeeds/rss/", interval_s: 45}
     - {name: cointelegraph_rss, kind: rss, url: "https://cointelegraph.com/rss", interval_s: 45}
     - {name: decrypt_rss, kind: rss, url: "https://decrypt.co/feed", interval_s: 60}
+    - {name: theblock_rss, kind: rss, url: "https://www.theblock.co/rss.xml", interval_s: 60}
     - {name: cryptoslate_rss, kind: rss, url: "https://cryptoslate.com/feed/", interval_s: 60}
     - {name: cryptopanic, kind: cryptopanic, interval_s: 120, token_env: "CRYPTOPANIC_TOKEN", enabled_if_token: true}
     - {name: fear_greed, kind: fear_greed, url: "https://api.alternative.me/fng/", interval_s: 3600}
@@ -69,7 +70,7 @@ risk:
   min_net_edge_bps: 30
   ev_min_bps: 0
   slippage_buffer_bps: 5
-  regime_multipliers: {1: 0.75, 2: 1.0, 3: 0.6}   # only allowed regimes; the veto lives in policy.json
+  regime_multipliers: {1: 1.0, 2: 1.0, 3: 1.0}   # only allowed regimes; the veto lives in policy.json
   kill_switch:
     max_daily_loss_frac: 0.02
     max_consecutive_losses: 4
@@ -138,3 +139,13 @@ live_ramp:
   r0_min_trades: 10
   step_min_trades: 30
   parity: {max_median_entry_delta_bps: 10, min_bracket_outcome_agreement: 0.90}
+
+telemetry:                            # sez. 6.3: status.json, events, equity, ops of the day (never stops trading)
+  enabled: true
+  dir: "telemetry"                    # status.json
+  status_interval_s: 10
+  equity_interval_s: 60
+  ops_interval_s: 60
+  events_queue_max: 10000
+  events_retention_days: 180
+                                      # events_dir / equity_dir / ops_dir default to data/events, data/equity, data/reports/ops

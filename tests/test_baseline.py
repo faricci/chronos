@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -136,21 +137,24 @@ def test_hold_subsampling_is_deterministic_and_skipped_when_balanced() -> None:
 # ------------------------------------------------------------------------- fit_subset on a planted signal
 
 
-def planted_samples(n: int = 9000, seed: int = 4) -> tuple[pd.DataFrame, np.ndarray]:
+def planted_samples(
+    n: int = 9000, seed: int = 4, w_scale: float = 0.01, products: int = 1
+) -> tuple[pd.DataFrame, np.ndarray]:
     rng = np.random.default_rng(seed)
     x = rng.normal(size=(n, len(FLAT_COLUMNS)))
     df = pd.DataFrame(x, columns=list(FLAT_COLUMNS))
     edge = (x[:, FLAT_COLUMNS.index("ret_1d_bps")] + rng.normal(0, 1.0, n) > 0.3).astype(float)
     side = np.where(rng.uniform(size=n) < 0.8, "FLAT", "LONG")
     df["position_side"] = side
-    df["product"] = "BTC-EUR"
+    df["product"] = np.array(["BTC-EUR", "SOL-EUR"])[np.arange(n) % products]
     df["t"] = pd.date_range("2024-01-01", periods=n, freq="1h")
+    df["label_window_end"] = df["t"] + pd.Timedelta(hours=6)
     df["edge_target"] = edge
     df["vol_target"] = -1
     sell = (x[:, FLAT_COLUMNS.index("pos_unreal_bps")] < -1.0) & (side == "LONG")
     buy = (edge == 1) & (side == "FLAT") & (rng.uniform(size=n) < 0.5)
     df["action_target"] = np.where(sell, "SELL", np.where(buy, "BUY", "HOLD"))
-    df["w_action"] = df["w_edge"] = 0.01 * rng.uniform(0.5, 1.5, n)
+    df["w_action"] = df["w_edge"] = w_scale * rng.uniform(0.5, 1.5, n)
     df["w_vol"] = np.nan
     n_tr, n_va = int(n * 0.7), int(n * 0.15)
     member = np.array(["train"] * n_tr + ["val"] * n_va + ["test"] * (n - n_tr - n_va), dtype=object)
@@ -160,14 +164,15 @@ def planted_samples(n: int = 9000, seed: int = 4) -> tuple[pd.DataFrame, np.ndar
 @pytest.fixture(scope="module")
 def planted() -> tuple[pd.DataFrame, np.ndarray, dict]:
     df, member = planted_samples()
-    return df, member, fit_subset(df, member, TrainConfig(), tag=0, allow_degenerate=True)
+    return df, member, fit_subset(df, member, TrainConfig(), tag=0, allow_degenerate=True, rho=1.0)
 
 
 def test_the_booster_learns_the_planted_edge(planted: tuple[pd.DataFrame, np.ndarray, dict]) -> None:
     _, _, res = planted
     m = res["metrics"]["edge"]
     assert m["val_logloss_after"] < m["val_prior_logloss"] - 0.02  # clearly better than the base rate
-    assert m["val_ece_after"] < 0.05 and m["val_logloss_after"] <= m["val_logloss_before"] + 1e-6
+    # the Platt map is no longer fitted on the validation set, so "after <= before" holds only up to a small slack
+    assert m["val_ece_after"] < 0.05 and m["val_logloss_after"] <= m["val_logloss_before"] + 5e-3
 
 
 def test_test_metrics_use_the_test_rows_only(planted: tuple[pd.DataFrame, np.ndarray, dict]) -> None:
@@ -175,6 +180,112 @@ def test_test_metrics_use_the_test_rows_only(planted: tuple[pd.DataFrame, np.nda
     tm = bl.test_metrics(df, member, res)
     assert tm["edge_logloss"] < tm["edge_prior_logloss"] and tm["n_edge"] > 0
     assert "action_ece_buy" in tm
+
+
+def edge_inputs(df: pd.DataFrame, member: np.ndarray, which: str) -> tuple[pd.DataFrame, bl.SetData]:
+    return bl._edge_frame(df, member == which), bl._select(df, member == which, "edge", MARKET_FEATURES)
+
+
+def test_oof_calibration_never_uses_test_rows() -> None:
+    df, member = planted_samples(6000, w_scale=1.0)
+    seen: list[pd.DataFrame] = []
+    real = bl.oof_edge_scores
+
+    def spy(tr: pd.DataFrame, *a: object, **k: object) -> np.ndarray:
+        seen.append(tr)
+        return real(tr, *a, **k)  # type: ignore[arg-type]
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(bl, "oof_edge_scores", spy)
+        ref = fit_subset(df, member, TrainConfig(), tag=0, allow_degenerate=True, rho=1.0)
+        assert len(seen) == 1 and (seen[0]["t"] < df["t"][member == "test"].min()).all()
+        # destroy the test rows: labels flipped, features and weights replaced -> the calibration cannot move
+        bad = df.copy()
+        te = member == "test"
+        bad.loc[te, "edge_target"] = 1.0 - bad.loc[te, "edge_target"]
+        bad.loc[te, "w_edge"] = 7.0
+        bad.loc[te, list(FLAT_COLUMNS)] = 1e6
+        again = fit_subset(bad, member, TrainConfig(), tag=0, allow_degenerate=True, rho=1.0)
+    assert again["calibration"].platt_edge == ref["calibration"].platt_edge
+    assert again["edge_cal"] == ref["edge_cal"]
+    ec = ref["edge_cal"]
+    assert ec["n_rows_val"] == int(((member == "val") & (df["position_side"] == "FLAT")).sum())
+    assert 0 < ec["n_rows_oof"] <= int(((member == "train") & (df["position_side"] == "FLAT")).sum())
+
+
+def test_oof_blocks_are_purged() -> None:
+    n, emb = 2000, timedelta(hours=12)
+    t = pd.date_range("2024-01-01", periods=n, freq="1h")
+    tr = pd.DataFrame({"t": t, "product": "BTC-EUR", "label_window_end": t + pd.Timedelta(hours=30), "w_edge": 1.0})
+    tr = tr.sample(frac=1.0, random_state=0).reset_index(drop=True)  # the function must not rely on the input order
+    blocks = bl._cal_blocks(tr, emb)
+    assert len(blocks) == bl.CAL_FOLDS and sorted(np.concatenate([b for b, _ in blocks])) == list(range(n))
+    for block, fit in blocks:
+        start, last = tr["t"].iloc[block].min(), tr["label_window_end"].iloc[block].max()
+        assert not set(block) & set(fit)
+        f = tr.iloc[fit]
+        assert ((f["label_window_end"] < start - emb) | (f["t"] > last + emb)).all()
+        # nothing is purged that did not have to be: every other row outside the block is within the embargo
+        rest = tr.drop(index=np.concatenate([block, fit]))
+        assert ((rest["label_window_end"] >= start - emb) & (rest["t"] <= last + emb)).all()
+    # the scores: NaN where the fit set is too small to train on
+    x, y = np.random.default_rng(0).normal(size=(n, 3)), np.random.default_rng(1).integers(0, 2, n)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setitem(bl.LGBM_PARAMS, "min_data_in_leaf", 30)
+        assert np.isfinite(bl.oof_edge_scores(tr, x, y, 5, emb, 1)).all()
+        mp.setitem(bl.LGBM_PARAMS, "min_data_in_leaf", 800)  # 2 x 800 exceeds every fit set
+        assert np.isnan(bl.oof_edge_scores(tr, x, y, 5, emb, 1)).all()
+
+
+def test_cal_neff_below_200_marks_fold_and_fails_final(tmp_path: Path) -> None:
+    low, member = planted_samples(w_scale=0.01, products=2)
+    res = fit_subset(low, member, TrainConfig(), tag=0, allow_degenerate=True, rho=1.0)
+    ec = res["edge_cal"]
+    assert ec["n_eff"] < bl.CAL_NEFF_MIN == 200.0 and ec["ok"] is False and ec["n_eff_min"] == 200.0
+    assert res["calibration"].platt_edge.a != 1.0  # a not-ok calibration is still saved
+    high, member = planted_samples(w_scale=1.0, products=2)
+    ok = fit_subset(high, member, TrainConfig(), tag=0, allow_degenerate=True, rho=1.0)["edge_cal"]
+    assert ok["ok"] is True and ok["n_eff"] >= 200.0
+    # N_eff = sum(w) / (1 + (K - 1) rho): rho 0 -> K independent products, rho 1 -> one
+    free = fit_subset(high, member, TrainConfig(), tag=0, allow_degenerate=True, rho=0.0)["edge_cal"]
+    assert free["n_eff"] == pytest.approx(2.0 * ok["n_eff"])
+    # the final model refuses an uncalibrated edge (exit 1) and writes nothing for itself
+    frames = {p: synthetic_bars(days=DAYS, seed=31 + i, zero_volume_day=None, constant_days=None)
+              for i, p in enumerate(("BTC-EUR", "SOL-EUR"))}  # fmt: skip
+    cfg = TrainConfig(products=list(frames), sentiment_history_db=str(tmp_path / "none.db"), **CFG_KW)
+    lc = tmp_path / "label_config.json"
+    lc.write_text("{}")
+    run = build_dataset(cfg, LABEL, frames, tmp_path / "ds", label_config_path=lc, write_jsonl=False,
+                        now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))  # fmt: skip
+    samples = pd.read_parquet(run / "samples.parquet")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(bl, "CAL_NEFF_MIN", 1e9)
+        with pytest.raises(TrainingError, match="final: edge calibration"):
+            train_baseline(samples, LABEL, cfg, run, tmp_path / "models", label_config_path=lc,
+                           allow_degenerate_final=True)  # fmt: skip
+    assert list((tmp_path / "models").glob("*/fold_0/calibration.json")) != []  # the folds were saved anyway
+    assert not list((tmp_path / "models").glob("*/final/*"))
+
+
+def test_platt_is_the_only_edge_calibrator() -> None:
+    df, member = planted_samples(6000, w_scale=1.0)
+    res = fit_subset(df, member, TrainConfig(), tag=0, allow_degenerate=True, rho=1.0)
+    cal = res["calibration"]
+    assert "isotonic" not in inspect.getsource(bl).lower() and "isotonic" not in cal.model_dump_json().lower()
+    # rebuild C independently (OOF scores of the train rows + validation scores) and fit the same 2-parameter map
+    ftr, tr = edge_inputs(df, member, "train")
+    fva, va = edge_inputs(df, member, "val")
+    n_star = res["best_iteration"]["edge"]
+    z_oof = bl.oof_edge_scores(ftr, tr.x, tr.y, n_star, timedelta(days=TrainConfig().embargo_days), 0)
+    done = np.isfinite(z_oof)
+    z_val = np.asarray(res["boosters"]["edge"].predict(va.x, raw_score=True))
+    w = np.concatenate([ftr["w_edge"].to_numpy()[done], fva["w_edge"].to_numpy()])
+    z_c, y_c = np.concatenate([z_oof[done], z_val]), np.concatenate([tr.y[done], va.y]).astype(float)
+    a, b = fit_platt(z_c, y_c, w / w.mean())
+    assert (cal.platt_edge.a, cal.platt_edge.b) == pytest.approx((a, b), rel=1e-6)
+    assert res["edge_cal"]["n_rows_oof"] == int(done.sum()) and res["edge_cal"]["scheme"] == "OOF_PLATT_V1"
+    z = np.linspace(-3, 3, 7)  # the map is a sigmoid of an affine function of the raw score, nothing else
+    np.testing.assert_allclose(cal.edge_probs(z), special.expit(cal.platt_edge.a * z + cal.platt_edge.b))
 
 
 def test_the_action_head_finds_the_planted_sell_rule(planted: tuple[pd.DataFrame, np.ndarray, dict]) -> None:
@@ -192,14 +303,14 @@ def test_the_regime_head_is_degenerate_without_labels_and_forbidden_for_the_fina
     df, member, res = planted
     assert res["degenerate"] == {"vol_regime": True} and "vol_regime" not in res["boosters"]
     with pytest.raises(TrainingError, match="vol_regime"):
-        fit_subset(df, member, TrainConfig(), tag=99, allow_degenerate=False)
+        fit_subset(df, member, TrainConfig(), tag=99, allow_degenerate=False, rho=1.0)
 
 
 def test_empty_validation_is_an_error() -> None:
     df, member = planted_samples(3000)
     member[member == "val"] = ""
     with pytest.raises(TrainingError):
-        fit_subset(df, member, TrainConfig(), tag=0, allow_degenerate=True)
+        fit_subset(df, member, TrainConfig(), tag=0, allow_degenerate=True, rho=1.0)
 
 
 def test_features_of_edge_and_regime_exclude_the_position_block() -> None:
@@ -222,8 +333,10 @@ def trained(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path, Path]
     run = build_dataset(cfg, LABEL, frames, tmp / "ds", label_config_path=lc, write_jsonl=False,
                         now=datetime(2026, 10, 18, 12, 0, tzinfo=UTC))  # fmt: skip
     samples = pd.read_parquet(run / "samples.parquet")
-    root = train_baseline(samples, LABEL, cfg, run, tmp / "models", label_config_path=lc, allow_degenerate_final=True,
-                          now=datetime(2026, 10, 18, 12, 5, tzinfo=UTC))  # fmt: skip
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(bl, "CAL_NEFF_MIN", 1.0)  # the synthetic history is far below the real N_eff floor
+        root = train_baseline(samples, LABEL, cfg, run, tmp / "models", label_config_path=lc,
+                              allow_degenerate_final=True, now=datetime(2026, 10, 18, 12, 5, tzinfo=UTC))  # fmt: skip
     return root, run, lc
 
 
@@ -239,6 +352,11 @@ def test_model_files_and_card(trained: tuple[Path, Path, Path]) -> None:
     assert card["label_config"]["sha256"] == LABEL.sha256 and card["data"]["dataset_run_id"] == run.name
     assert card["lgbm"]["params"]["num_leaves"] == 7 and card["lgbm"]["params"]["lambda_l2"] == 10.0
     assert card["degenerate"]["final"] == {"vol_regime": True}
+    assert card["calibration_scheme"] == "OOF_PLATT_V1"
+    for sub in ("fold_0", "fold_1", "final"):
+        ec = card["folds"][sub]["edge_cal"]
+        assert ec["scheme"] == "OOF_PLATT_V1" and ec["ok"] and ec["n_rows_oof"] > 0 and ec["n_rows_val"] > 0
+        assert json.loads((root / sub / "calibration.json").read_text())["edge_cal"] == ec
     assert set(card["folds"]) == {"fold_0", "fold_1", "final"} and card["folds"]["final"]["metrics_test"] == {}
 
 

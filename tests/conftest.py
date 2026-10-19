@@ -8,7 +8,6 @@ collect_ignore = [
     "test_data_fetch.py",
     "test_data_preprocessing.py",
     "test_monitoring.py",
-    "test_order_execution.py",
     "test_sentiment_analysis.py",
     "test_trading_logic.py",
     "test_vector_storage.py",

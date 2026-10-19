@@ -50,7 +50,11 @@ data/probe/
 data/ws_recordings/
 data/decisions/
 data/live_labels/
+data/events/
+data/equity/
 data/reports/
+telemetry/
+models/registry/
 data/backup/
 state/
 .venv/
@@ -64,3 +68,5 @@ data/datasets/
 data/labels/
 models/baseline/
 data/backtest_cache/
+
+docs/STATO.md

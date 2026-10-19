@@ -2,12 +2,13 @@
 
 Order of the rules:
 1. mask the actions the position state forbids (C1: FLAT cannot SELL, LONG cannot BUY: no pyramiding) and renormalize;
-2. regime = argmax of ``vol_regime.probabilities``; the entry veto on the regime exists ONLY here;
-3. thresholds of the model's ``policy.json``:
-   BUY  (FLAT)  if ``p(BUY) >= tau_buy`` and ``confidence >= c_min`` and ``p_edge >= p_edge_min`` and
-                ``regime in allowed_regimes_for_entry``;
-   SELL (LONG)  if ``p(SELL) >= tau_sell``;
-   otherwise HOLD, with the reason that stopped it.
+2. thresholds of the model's ``policy.json``: BUY (FLAT) needs ``p(BUY) >= tau_buy`` and ``confidence >= c_min``;
+   SELL (LONG) needs ``p(SELL) >= tau_sell``; otherwise HOLD, with the reason that stopped it;
+3. regime = the state token ``atr_1d_pctile_365d`` cut at fixed points (``REGIME_EDGES_PCT``); the entry veto on the
+   regime exists ONLY here and never reads the model's ``vol_regime`` answer (diagnostics only). Entries are allowed in
+   ``ENTRY_REGIMES``; an unavailable token means no entry.
+The economic floor on ``p_edge`` is not a threshold of the policy: it is the live break-even of the single decision plus
+``p_be_buffer`` and lives in the RiskManager (EV gate).
 The confidence is recomputed here from the backend's action probabilities (``1 - H/ln K``, K = 3) so that all
 backends are comparable; a confidence sent by the backend is ignored. A decider failure is not decided here: the engine
 builds ``Decision.unavailable()``.
@@ -17,19 +18,52 @@ from __future__ import annotations
 
 import json
 import math
+from bisect import bisect_right
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Final, Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from modules.decision.protocol import DecisionAnswers, confidence_from_probs, regime_from_probs
+from modules.decision.protocol import DecisionAnswers, confidence_from_probs
 
-__all__ = ["Decision", "DecisionPolicy", "PolicyConfig", "PolicyMismatchError", "load_policy"]
+__all__ = [
+    "ENTRY_REGIMES",
+    "REGIME_EDGES_PCT",
+    "REGIME_FEATURE",
+    "REGIME_RULE",
+    "Decision",
+    "DecisionPolicy",
+    "PolicyConfig",
+    "PolicyMismatchError",
+    "load_policy",
+    "regime_from_pctile",
+    "regimes_from_pctile",
+]
 
 Action = Literal["BUY", "SELL", "HOLD"]
 Side = Literal["FLAT", "LONG"]
+
+REGIME_FEATURE: Final = "atr_1d_pctile_365d"  # column of FLAT_COLUMNS = state.volatility.atr_1d_pctile_365d (0..100)
+REGIME_EDGES_PCT: Final = (5.0, 35.0, 65.0, 95.0)  # fixed before tuning, never optimised
+REGIME_RULE: Final = "ATR1D_PCTILE365:5/35/65/95"
+ENTRY_REGIMES: Final = (1, 2, 3)
+_LEGACY_KEYS: Final = ("p_edge_min", "allowed_regimes_for_entry")
+
+
+def regime_from_pctile(pctile: float | None) -> int | None:
+    """Regime 0..4 of an ATR percentile (0..100); ``None`` when the token is missing or not finite."""
+    if pctile is None or not math.isfinite(pctile):
+        return None
+    return bisect_right(REGIME_EDGES_PCT, pctile)
+
+
+def regimes_from_pctile(pctile: np.ndarray) -> np.ndarray:
+    """Vector twin of ``regime_from_pctile``: int64, -1 where the percentile is NaN."""
+    x = np.asarray(pctile, dtype=np.float64)
+    out = np.searchsorted(np.asarray(REGIME_EDGES_PCT), x, side="right").astype(np.int64)
+    return np.where(np.isfinite(x), out, -1)
 
 
 class PolicyMismatchError(Exception):
@@ -45,9 +79,19 @@ class PolicyConfig(BaseModel):
     tau_buy: float = Field(ge=0, le=1)
     tau_sell: float = Field(ge=0, le=1)
     c_min: float = Field(ge=0, le=1)
-    p_edge_min: float = Field(ge=0, le=1)
-    allowed_regimes_for_entry: tuple[int, ...]
+    p_be_buffer: float = Field(ge=0, le=0.20)
+    regime_rule: Literal["ATR1D_PCTILE365:5/35/65/95"]
     label_config_sha256: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _refuse_legacy_keys(cls, data: object) -> object:
+        """A policy.json from before the regime rule (or edited by hand) does not load: fail closed."""
+        if isinstance(data, dict):
+            old = [k for k in _LEGACY_KEYS if k in data]
+            if old:
+                raise ValueError(f"legacy policy keys {old} are no longer valid; retune the policy")
+        return data
 
 
 def load_policy(path: Path, label_config_sha256: str) -> PolicyConfig:
@@ -78,12 +122,13 @@ class DecisionPolicy:
     def __init__(self, config: PolicyConfig) -> None:
         self.config = config
 
-    def resolve(self, answers: DecisionAnswers, side: Side) -> Decision:
+    def resolve(self, answers: DecisionAnswers, side: Side, *, vol_pctile: float | None) -> Decision:
+        """``vol_pctile`` is the state token ``atr_1d_pctile_365d``; ignored while LONG but always required."""
         cfg = self.config
         raw = answers.action.probabilities
         confidence = confidence_from_probs(raw)
         p_edge = answers.edge.noul
-        regime = regime_from_probs(answers.vol_regime.probabilities)
+        regime = regime_from_pctile(vol_pctile)
 
         valid = ("BUY", "HOLD") if side == "FLAT" else ("SELL", "HOLD")
         total = sum(raw[a] for a in valid)
@@ -101,19 +146,20 @@ class DecisionPolicy:
 
         if masked["BUY"] < cfg.tau_buy or confidence < cfg.c_min:
             return hold("below_threshold")
-        if p_edge < cfg.p_edge_min:
-            return hold("edge_veto")
-        if regime not in cfg.allowed_regimes_for_entry:
+        if regime is None:
+            return hold("regime_unavailable")
+        if regime not in ENTRY_REGIMES:
             return hold("regime_veto")
         return Decision("BUY", "thresholds_met", p_edge, regime, confidence, masked)
 
     # ------------------------------------------------------------------------------ vectorised twins
 
-    def buy_mask(self, p_action: np.ndarray, p_edge: np.ndarray, p_regime: np.ndarray) -> np.ndarray:
+    def buy_mask(self, p_action: np.ndarray, vol_pctile: np.ndarray) -> np.ndarray:
         """``resolve(...) == BUY`` for many FLAT states at once (the backtest scores millions of minutes).
 
         Same rules as ``resolve`` and pinned to it by ``tests/test_decision_policy.py``: masked P(BUY) over BUY+HOLD,
-        confidence from the raw action probabilities, edge and regime gates.
+        confidence from the raw action probabilities, regime from the state token. It receives neither the edge nor
+        the model's regime answer: neither decides an entry here.
         """
         cfg = self.config
         p = np.asarray(p_action, dtype=np.float64)
@@ -122,12 +168,8 @@ class DecisionPolicy:
             masked_buy = np.where(total > 0, p[:, 0] / total, 0.0)
             h = -np.where(p > 0, p * np.log(np.where(p > 0, p, 1.0)), 0.0).sum(axis=1)
         confidence = np.clip(1.0 - h / math.log(p.shape[1]), 0.0, 1.0)
-        regime = np.argmax(np.asarray(p_regime, dtype=np.float64), axis=1)
-        allowed = np.isin(regime, np.array(cfg.allowed_regimes_for_entry))
-        return np.asarray(
-            (total > 0) & (masked_buy >= cfg.tau_buy) & (confidence >= cfg.c_min)
-            & (np.asarray(p_edge) >= cfg.p_edge_min) & allowed
-        )  # fmt: skip
+        allowed = np.isin(regimes_from_pctile(vol_pctile), np.array(ENTRY_REGIMES))
+        return np.asarray((total > 0) & (masked_buy >= cfg.tau_buy) & (confidence >= cfg.c_min) & allowed)
 
     def sell_mask(self, p_action: np.ndarray) -> np.ndarray:
         """``resolve(...) == SELL`` for many LONG states: masked P(SELL) over SELL+HOLD against ``tau_sell``."""

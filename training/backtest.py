@@ -33,7 +33,7 @@ import pandas as pd
 
 from modules.config import EntryTimeout, FallbackFees, RiskConfig
 from modules.decision.baseline import AnswerArrays, BaselineDecider
-from modules.decision.policy import Decision, DecisionPolicy, PolicyConfig
+from modules.decision.policy import REGIME_FEATURE, Decision, DecisionPolicy, PolicyConfig, regimes_from_pctile
 from modules.dryrun.bar_gateway import (
     BarExecutionGateway,
     ClosedTrade,
@@ -46,6 +46,7 @@ from modules.dryrun.sim_exchange import BracketOutcome, MarketBars, SimulatedExc
 from modules.dryrun.virtual_account import VirtualAccount
 from modules.execution.balance_guard import BalanceGuard
 from modules.execution.spot import SpotRegistry
+from modules.features.serializer import FLAT_COLUMNS
 from modules.features.state_matrix import flat_matrix, long_matrix
 from modules.ledger.positions import PositionLedger
 from modules.market.indicators_batch import compute_indicators
@@ -58,6 +59,7 @@ from training.labeling import label_window_end, triple_barrier
 __all__ = [
     "BacktestConfig",
     "BacktestResult",
+    "FlatAnswers",
     "FlatProbCache",
     "LongProbCache",
     "ProductMarket",
@@ -71,6 +73,8 @@ CHUNK: Final = 200_000
 EVAL_DECISION_EVERY_MIN: Final = 1
 TUNE_DECISION_EVERY_MIN: Final = 15
 QUOTE: Final = "EUR"
+FLAT_CACHE_VERSION: Final = "v2"  # v2: the cache also holds the regime token; older caches are never read
+_REGIME_COL: Final = FLAT_COLUMNS.index(REGIME_FEATURE)
 _NS_MIN: Final = np.timedelta64(1, "m")
 
 
@@ -159,16 +163,25 @@ def model_key(decider: BaselineDecider, label: LoadedLabelConfig) -> str:
     return hashlib.sha256(f"{decider.model_key}|{label.sha256}".encode()).hexdigest()[:16]
 
 
+@dataclass(frozen=True)
+class FlatAnswers:
+    """Model answers for the FLAT states of ``rows`` plus the state token the policy cuts the regime from."""
+
+    answers: AnswerArrays
+    vol_pctile: np.ndarray  # state.volatility.atr_1d_pctile_365d as the integer token (NaN = missing), per row
+
+
 class FlatProbCache:
-    """Answers of the model for the FLAT states of a (model, product, span, cadence); optionally on disk (parquet)."""
+    """Answers of the model for the FLAT states of a (model, product, span, cadence); optionally on disk (npz)."""
 
     def __init__(self, directory: Path | None = None) -> None:
         self._dir = directory
-        self._mem: dict[str, tuple[np.ndarray, AnswerArrays]] = {}
+        self._mem: dict[str, tuple[np.ndarray, FlatAnswers]] = {}
 
     def get(
         self, key: str, decider: BaselineDecider, pm: ProductMarket, label: LoadedLabelConfig, rows: np.ndarray
-    ) -> AnswerArrays:
+    ) -> FlatAnswers:
+        key = f"{FLAT_CACHE_VERSION}|{key}"
         mem_key = (
             f"{key}|{pm.name}|{rows.size}|{int(rows[0]) if rows.size else -1}|{int(rows[-1]) if rows.size else -1}"
         )
@@ -183,21 +196,26 @@ class FlatProbCache:
         )
         if path is not None and path.exists():
             z = np.load(path)
-            ans = AnswerArrays(z["p_action"], z["p_edge"], z["p_regime"])
+            ans = FlatAnswers(AnswerArrays(z["p_action"], z["p_edge"], z["p_regime"]), z["vol_pctile"])
         else:
-            parts = []
+            parts, pct = [], []
             for lo in range(0, rows.size, CHUNK):
                 r = rows[lo : lo + CHUNK]
                 x = flat_matrix(pm.ind, r, pm.name, label, pm.btc_ind, None if pm.btc_rows is None else pm.btc_rows[r])
                 parts.append(decider.answers_batch(x))
-            ans = AnswerArrays(
-                np.concatenate([p.p_action for p in parts]) if parts else np.empty((0, 3)),
-                np.concatenate([p.p_edge for p in parts]) if parts else np.empty(0),
-                np.concatenate([p.p_regime for p in parts]) if parts else np.empty((0, 5)),
+                pct.append(x[:, _REGIME_COL])
+            ans = FlatAnswers(
+                AnswerArrays(
+                    np.concatenate([p.p_action for p in parts]) if parts else np.empty((0, 3)),
+                    np.concatenate([p.p_edge for p in parts]) if parts else np.empty(0),
+                    np.concatenate([p.p_regime for p in parts]) if parts else np.empty((0, 5)),
+                ),
+                np.concatenate(pct) if pct else np.empty(0),
             )
             if path is not None:
                 path.parent.mkdir(parents=True, exist_ok=True)
-                np.savez(path, p_action=ans.p_action, p_edge=ans.p_edge, p_regime=ans.p_regime)
+                a = ans.answers
+                np.savez(path, p_action=a.p_action, p_edge=a.p_edge, p_regime=a.p_regime, vol_pctile=ans.vol_pctile)
         self._mem[mem_key] = (rows, ans)
         return ans
 
@@ -285,9 +303,9 @@ async def run_backtest(
     for p in names:
         pm = markets[p]
         rows = decision_rows(pm, label, span, d_every)
-        ans = flat_cache.get(f"{key}-{span.tag()}-D{d_every}", decider, pm, label, rows)
-        buy = pol.buy_mask(ans.p_action, ans.p_edge, ans.p_regime)
-        cand[p] = (rows[buy], ans.p_edge[buy], np.argmax(ans.p_regime[buy], axis=1))
+        fa = flat_cache.get(f"{key}-{span.tag()}-D{d_every}", decider, pm, label, rows)
+        buy = pol.buy_mask(fa.answers.p_action, fa.vol_pctile)
+        cand[p] = (rows[buy], fa.answers.p_edge[buy], regimes_from_pctile(fa.vol_pctile[buy]))
 
     # ---- the book: the same classes as the live one
     now_box: list[datetime] = [_dt(_naive(span.entry_start))]
@@ -417,7 +435,7 @@ async def run_backtest(
             plan = rm.plan_entry(
                 decision=decision, decision_id=did, intent_id=f"int-{did}", now=now_box[0], product_id=p, quote=quote,
                 atr=Decimal(repr(float(pm.atr[t]))), fees=label.fees, meta=registry.meta(p), equity=equity,
-                free_quote=account.balances.free(QUOTE), p_edge_min=policy.p_edge_min,
+                free_quote=account.balances.free(QUOTE), p_be_buffer=policy.p_be_buffer,
                 position=ledger.view(cfg.book, p),
             )  # fmt: skip
             if isinstance(plan, Skip):

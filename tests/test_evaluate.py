@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
 import pytest
 
+from tests.label_fixtures import loaded_label
+from training.backtest import Span
 from training.evaluate import (
     Boot,
     Candidates,
+    _ge,
+    always_invested,
     block_bootstrap,
+    buy_and_hold,
     concentration,
     edge_status,
     effective_trades,
     holdout_consistency,
     permutation_pvalue,
 )
+from training.fold_spans import FoldSpans, SpanSet
 
 T0 = pd.Timestamp("2025-01-01", tz="UTC")
 
@@ -190,3 +197,91 @@ def test_reasons_name_the_failed_checks() -> None:
     v = edge_status(True, chk(E3=False, E4=False), 50.0, 3.0)
     assert v.status == "NO-GO" and v.reasons == ["E3", "E4"]
     assert edge_status(False, chk(), 0, 0).reasons == ["regime_change"]
+
+
+# ------------------------------------------------------------------------ P1c: flat folds, E5, baselines
+
+LABEL = loaded_label({"A": 3.0})
+
+
+def span_set() -> SpanSet:
+    def sp(a: int, b: int, fold: int) -> Span:
+        return Span(T0 + pd.Timedelta(days=a), T0 + pd.Timedelta(days=b), None, fold)
+
+    folds = [FoldSpans(i, sp(0, 1, i), sp(60 * i, 60 * i + 60, i)) for i in range(5)]
+    return SpanSet(folds, sp(0, 1, -2), sp(300, 330, -1), T0 + pd.Timedelta(days=300), pd.Timedelta(days=2))
+
+
+def book(folds: list[int], per_fold: int, ret_bps: float = 100.0, pnl: float = 1.0) -> pd.DataFrame:
+    """Trades of product A, ``per_fold`` per listed fold, one per day, two hours long."""
+    rows = []
+    for f in folds:
+        for i in range(per_fold):
+            fill = T0 + pd.Timedelta(days=60 * f + i, hours=3)
+            rows.append({"product": "A", "fold": f, "fill_ts": fill, "exit_ts": fill + pd.Timedelta(hours=2),
+                         "net_ret_bps": ret_bps, "label_net_bps": ret_bps, "pnl_eur": pnl})  # fmt: skip
+    return pd.DataFrame(rows)
+
+
+def candidates_everywhere() -> dict[tuple[int, str], Candidates]:
+    t = np.arange(400, dtype=np.int64) * 10
+    return {(f, "A"): Candidates(t, t + 5, np.full(400, -100.0)) for f in range(5)}
+
+
+def holdout(n: int) -> pd.DataFrame:
+    return book([5], n).assign(fold=-1).assign(fill_ts=lambda d: d["fill_ts"] + pd.Timedelta(days=0))
+
+
+def test_flat_fold_is_zero_and_not_positive() -> None:
+    """Two positive folds and three flat ones: the five folds are listed, 0.0 is not positive, E4 fails."""
+    out = _ge(book([0, 1], 80), holdout(10), candidates_everywhere(), LABEL, span_set(), True, 0.5)
+    assert out["pnl_by_fold"] == {0: 80.0, 1: 80.0, 2: 0.0, 3: 0.0, 4: 0.0}
+    assert out["n_positive_folds"] == 2 and out["checks"]["E4"] is False
+
+
+def test_all_five_positive_folds_pass_the_concentration_check() -> None:
+    out = _ge(book(range(5), 40), holdout(10), candidates_everywhere(), LABEL, span_set(), True, 0.5)  # type: ignore[arg-type]
+    assert out["n_positive_folds"] == 5 and out["checks"]["E4"] is True and out["max_fold_share"] == pytest.approx(0.2)
+
+
+def test_bootstrap_uses_only_real_trades() -> None:
+    trades_ = book([0, 2], 90, ret_bps=40.0)  # fold 1, 3, 4 have none: no fictitious zeros enter the mean
+    out = _ge(trades_, holdout(10), candidates_everywhere(), LABEL, span_set(), True, 0.5)
+    assert out["bootstrap"]["mean_bps"] == pytest.approx(40.0)
+    assert out["n_oos_trades"] == 180
+
+
+def test_e5_false_without_holdout_trades() -> None:
+    out = _ge(book(range(5), 40), pd.DataFrame(), candidates_everywhere(), LABEL, span_set(), True, 0.5)  # type: ignore[arg-type]
+    assert out["checks"]["E5"] is False
+    assert out["status"] == "NO-GO" and "holdout_no_trades" in out["reasons"]
+
+
+def test_e5_none_with_one_to_four_trades() -> None:
+    for n in (1, 4):
+        out = _ge(book(range(5), 40), holdout(n), candidates_everywhere(), LABEL, span_set(), True, 0.5)  # type: ignore[arg-type]
+        assert out["checks"]["E5"] is None and out["status"] == "INCONCLUSO"
+
+
+def test_no_trades_at_all_is_no_go_with_five_flat_folds() -> None:
+    out = _ge(pd.DataFrame(), pd.DataFrame(), {}, LABEL, span_set(), True, 0.5)
+    assert out["status"] == "NO-GO" and out["pnl_by_fold"] == dict.fromkeys(range(5), 0.0)
+
+
+def test_always_invested_is_a_greedy_chain_per_fold_and_product() -> None:
+    c = {(0, "A"): Candidates(np.array([0, 5, 10, 30]), np.array([8, 12, 20, 40]), np.array([10.0, -50.0, 30.0, 5.0]))}
+    r = always_invested(c)
+    assert r["n"] == 3 and r["mean_label_bps"] == pytest.approx((10.0 + 30.0 + 5.0) / 3)  # 5 starts before 8: skipped
+    assert always_invested({}) == {"n": 0, "mean_label_bps": None}
+
+
+def test_buy_and_hold_pays_the_round_trip_and_reports_the_drawdown() -> None:
+    n = 3 * 1440
+    ts = (np.datetime64("2025-01-01T00:01") + np.arange(n).astype("timedelta64[m]")).astype("datetime64[ns]")
+    pm = SimpleNamespace(bars=SimpleNamespace(ts_close=ts, c=np.full(n, 100.0)))
+    span = Span(T0, T0 + pd.Timedelta(days=3), None, 0)
+    r = buy_and_hold({"A": pm}, LABEL, span)  # type: ignore[dict-item]
+    cost = 25 + 50 + 3.0 / 2 + 5  # maker in, taker out, half the spread, slippage buffer (bps)
+    assert r["n_products"] == 1 and r["return_bps"] == pytest.approx(-cost, abs=1.0) and r["max_drawdown"] == 0.0
+    assert r["bps_per_day"] == pytest.approx(r["return_bps"] / 3.0, rel=1e-3)
+    assert buy_and_hold({}, LABEL, span) == {"n_products": 0}

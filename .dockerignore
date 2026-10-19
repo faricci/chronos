@@ -32,6 +32,17 @@ model_checkpoints/
 
 # Config with secrets
 config/config.yml
+.env
+.env.*
+!.env.example
+
+# Runtime data, models, state and local artifacts (mounted as volumes, never baked into the image)
+data/
+models/
+state/
+tasks/
+docs/
+.claude/
 
 # Documentation
 *.md

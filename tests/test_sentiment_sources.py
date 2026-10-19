@@ -224,12 +224,13 @@ def test_build_sources_from_default_config() -> None:
         "coindesk_rss",
         "cointelegraph_rss",
         "decrypt_rss",
+        "theblock_rss",
         "cryptoslate_rss",
         "cryptopanic",
         "fear_greed",
     ]
-    assert [s.enabled for s in sources] == [True, True, True, True, False, True]
-    assert build_sources(SentimentConfig(), env={"CRYPTOPANIC_TOKEN": "x"})[4].enabled is True
+    assert [s.enabled for s in sources] == [True, True, True, True, True, False, True]
+    assert build_sources(SentimentConfig(), env={"CRYPTOPANIC_TOKEN": "x"})[5].enabled is True
 
 
 def test_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:

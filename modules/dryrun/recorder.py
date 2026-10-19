@@ -25,6 +25,7 @@ import re
 import shutil
 import threading
 import time
+import zlib
 from collections import Counter
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass, field
@@ -161,7 +162,12 @@ class WsRecorder:
         if entry is None:
             folder = self.root / day.isoformat()
             folder.mkdir(parents=True, exist_ok=True)
-            fh = open(folder / f"{_safe(channel)}-{_safe(product)}.jsonl.gz", "ab")  # noqa: SIM115
+            base = f"{_safe(channel)}-{_safe(product)}"
+            path, part = folder / f"{base}.jsonl.gz", 0
+            while path.exists():  # never append to a file a crash may have left with a truncated gzip member
+                part += 1
+                path = folder / f"{base}.part{part}.jsonl.gz"
+            fh = open(path, "xb")  # noqa: SIM115
             entry = (fh, gzip.GzipFile(fileobj=fh, mode="wb"))
             self._open[key] = entry
             self.stats.files_opened += 1
@@ -213,14 +219,22 @@ class WsRecorder:
 
 
 def read_recording(path: Path) -> Iterator[tuple[float, str]]:
-    """Yield ``(arrival epoch, raw message)``. A file cut short by a crash yields what is readable."""
+    """Yield ``(arrival epoch, raw message)``. A file cut short by a crash yields what is readable.
+
+    A crash can leave a truncated gzip member that an older recorder then appended a new member to (every start now
+    writes a new ``.partN`` file): the decompressor fails in the middle of the stream (``zlib.error``). What comes
+    before the damage is returned; the messages of the members after it are NOT recovered by this reader."""
     with gzip.open(path, "rb") as fh:
         try:
             for line in fh:
                 text = line.decode("utf-8").rstrip("\n")
                 recv, _, raw = text.partition("\t")
-                yield float(recv), raw
-        except (EOFError, gzip.BadGzipFile):
+                try:
+                    arrival = float(recv)
+                except ValueError:  # the decompressor produced garbage before it failed: this is the damage
+                    return
+                yield arrival, raw
+        except (EOFError, gzip.BadGzipFile, zlib.error):
             return
 
 

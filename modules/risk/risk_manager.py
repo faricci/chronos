@@ -9,7 +9,8 @@ the value the label used and it is never re-read when the order is sent. ``k_tp`
 ``entry_mode`` come from the ``label_config`` of the model (they are what ``p_edge`` was trained for), never from
 the risk config.
 
-Order of the gates: fee floor -> EV gate -> sizing (coverage cap included) -> kill switch. The ``BalanceGuard`` is the
+Order of the gates: fee floor -> EV gate (with ``p_be_buffer`` over the live break-even) -> sizing (coverage cap
+included) -> kill switch. The ``BalanceGuard`` is the
 final authority on coverage and acts later, at submission.
 """
 
@@ -23,7 +24,7 @@ from typing import Final, Literal, Protocol
 from pydantic import BaseModel, ConfigDict
 
 from modules.config import EntryTimeout, FallbackFees, RiskConfig
-from modules.decision.policy import Decision
+from modules.decision.policy import ENTRY_REGIMES, Decision
 from modules.execution.orders import ProductMeta
 from modules.execution.rounding import ceil_to, floor_to
 from modules.ledger.positions import PositionView
@@ -43,7 +44,14 @@ __all__ = [
 
 _BPS: Final = Decimal(10_000)
 SkipReason = Literal[
-    "fee_floor", "ev_negative", "below_min_size", "insufficient_balance", "kill_switch", "invalid_levels", "no_quote"
+    "fee_floor",
+    "ev_negative",
+    "ev_buffer",
+    "below_min_size",
+    "insufficient_balance",
+    "kill_switch",
+    "invalid_levels",
+    "no_quote",
 ]
 
 
@@ -110,6 +118,7 @@ class _RiskBlock(BaseModel):
     cost_tp_bps: int
     cost_sl_bps: int
     p_breakeven: float | None
+    p_be_buffer: float
     spread_bps: int
     min_size_bump: bool
 
@@ -162,6 +171,11 @@ class RiskManager:
         self._timeout = entry_timeout
         self._gate = gate
         self._costs = costs or CostParams(slippage_buffer_bps=risk.slippage_buffer_bps)
+        missing = set(ENTRY_REGIMES) - set(risk.regime_multipliers)
+        if missing:
+            raise ValueError(
+                f"risk.regime_multipliers lacks the entry regimes {sorted(missing)}: the policy breaks the contract"
+            )
 
     def plan_entry(
         self,
@@ -177,7 +191,7 @@ class RiskManager:
         meta: ProductMeta,
         equity: Decimal,
         free_quote: Decimal,
-        p_edge_min: float,
+        p_be_buffer: float,
         position: PositionView,
     ) -> OrderIntent | Skip:
         if decision.action != "BUY" or position.side != "FLAT":
@@ -207,10 +221,15 @@ class RiskManager:
         ev = model.ev_bps(decision.p_edge, tp_bps, sl_bps)
         if not ev > self._risk.ev_min_bps:
             return Skip(reason="ev_negative", detail=f"ev_bps={ev:.1f}")
+        win, loss = model.tp_net_bps(tp_bps), model.sl_loss_bps(sl_bps)
+        if ev < p_be_buffer * (win + loss):  # same as p_edge < p_breakeven(t) + p_be_buffer
+            need = p_be_buffer * (win + loss)
+            return Skip(reason="ev_buffer", detail=f"ev_bps={ev:.1f} need={need:.1f} buffer={p_be_buffer}")
+        p_floor = loss / (win + loss) + p_be_buffer  # the floor of this decision: live break-even plus the buffer
 
         sized = compute_size(
             equity=equity, free_quote=free_quote, entry=entry, stop_loss=stop_loss, cost_sl_bps=model.cost_sl,
-            p_edge=decision.p_edge, p_edge_min=p_edge_min, p_edge_full=self._risk.p_edge_full, m_reg=m_reg,
+            p_edge=decision.p_edge, p_edge_min=p_floor, p_edge_full=self._risk.p_edge_full, m_reg=m_reg,
             risk_frac=self._risk.risk_per_trade, max_position_frac=self._risk.max_position_frac,
             max_order_quote=self._risk.max_order_quote, meta=meta, fees=fees, fallback_fees=self._fallback,
         )  # fmt: skip
@@ -245,6 +264,7 @@ class RiskManager:
                 cost_tp_bps=round_bps(model.cost_tp),
                 cost_sl_bps=round_bps(model.cost_sl),
                 p_breakeven=_round4(model.p_breakeven(tp_bps, sl_bps)),
+                p_be_buffer=p_be_buffer,
                 spread_bps=round_bps(spread),
                 min_size_bump=sized.min_size_bump,
             ),  # fmt: skip

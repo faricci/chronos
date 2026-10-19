@@ -45,7 +45,7 @@ def plan(rm: RiskManager | None = None, **kw: object) -> OrderIntent | Skip:
     args: dict[str, object] = {
         "decision": buy(), "decision_id": "dec-1", "intent_id": "int-1", "now": NOW, "product_id": "SOL-EUR",
         "quote": MarketQuote(D("92.03"), D("92.06")), "atr": D("4.2334"), "fees": ASSUMED, "meta": SOL,
-        "equity": D("100"), "free_quote": D("100"), "p_edge_min": 0.44, "position": FLAT,
+        "equity": D("100"), "free_quote": D("100"), "p_be_buffer": 0.05, "position": FLAT,
     }  # fmt: skip
     return (rm or manager()).plan_entry(**{**args, **kw})  # type: ignore[arg-type]
 
@@ -55,10 +55,13 @@ def test_reference_example_of_the_spec() -> None:
     assert isinstance(i, OrderIntent)
     assert i.entry.limit_price == D("92.03") and i.entry.type == "limit_post_only" and i.entry.time_in_force_s == 1800
     assert i.bracket.take_profit == D("108.96") and i.bracket.stop_loss == D("83.57")
-    assert i.base_size == D("0.024") and not i.risk.min_size_bump
+    assert i.base_size == D("0.023") and not i.risk.min_size_bump
     assert i.risk.cost_tp_bps == 120 and i.risk.cost_sl_bps == 197  # 60+60 and 60+120+1.6+5+10
     assert i.risk.ev_bps == pytest.approx(358, abs=3) and i.risk.p_breakeven == pytest.approx(0.39, abs=0.005)
-    assert (i.risk.regime, i.risk.m_reg, i.risk.scale_p) == (2, 1.0, 0.5) and i.risk.risk_eur == D("0.25")
+    # the floor of the decision is the live break-even plus the buffer (0.05): scale_p = (0.52 - 0.4435) / 0.1565
+    assert (i.risk.regime, i.risk.m_reg, i.risk.p_be_buffer) == (2, 1.0, 0.05)
+    assert i.risk.scale_p == pytest.approx(0.4887, abs=1e-3)
+    assert i.risk.risk_eur == pytest.approx(D("0.2443"), abs=D("0.001"))
     assert i.bracket.atr == D("4.2334") and i.bracket.atr_tf == "1d" and i.side == "BUY"
 
 
@@ -87,7 +90,7 @@ def test_taker_entry_is_marketable_and_rounded_up() -> None:
 
 def test_barriers_come_from_the_label_config() -> None:
     lab = LabelConfig(atr_tf="6h", k_tp=3.0, k_sl=2.0, entry_mode="maker", horizon_min=21600)
-    i = plan(manager(label=lab), atr=D("1.10"), fees=REAL, decision=buy(p_edge=0.55))
+    i = plan(manager(label=lab), atr=D("1.10"), fees=REAL, decision=buy(p_edge=0.55), p_be_buffer=0.0)
     assert isinstance(i, OrderIntent)
     assert (i.bracket.k_tp, i.bracket.k_sl, i.bracket.atr_tf) == (3.0, 2.0, "6h")
     assert i.bracket.take_profit == D("95.33") and i.bracket.stop_loss == D("89.83")
@@ -164,7 +167,8 @@ def test_only_buy_on_flat_reaches_plan_entry() -> None:
 
 
 def test_regime_multiplier_changes_only_the_size() -> None:
-    normal, high = plan(decision=buy(p_edge=0.60, regime=2)), plan(decision=buy(p_edge=0.60, regime=3))
+    rm = manager(regime_multipliers={1: 0.75, 2: 1.0, 3: 0.6})  # the default is 1.0 for the three entry regimes
+    normal, high = plan(rm, decision=buy(p_edge=0.60, regime=2)), plan(rm, decision=buy(p_edge=0.60, regime=3))
     assert isinstance(normal, OrderIntent) and isinstance(high, OrderIntent)
     assert high.base_size < normal.base_size
     assert (high.bracket.take_profit, high.bracket.stop_loss) == (normal.bracket.take_profit, normal.bracket.stop_loss)
@@ -193,3 +197,51 @@ def test_intent_json_snapshot() -> None:
     assert isinstance(i, OrderIntent)
     path = GOLDEN / "intent_sol_reference.json"
     assert i.model_dump_json() == path.read_text(encoding="utf-8")
+
+
+# ----------------------------------------------------------------------------------- p_be_buffer (P1c)
+
+
+def break_even() -> float:
+    i = plan(p_be_buffer=0.0)
+    assert isinstance(i, OrderIntent) and i.risk.p_breakeven is not None
+    return i.risk.p_breakeven
+
+
+def test_ev_buffer_gate() -> None:
+    be, buf = break_even(), 0.04
+    s = plan(decision=buy(p_edge=be + buf - 0.001), p_be_buffer=buf)
+    assert isinstance(s, Skip) and s.reason == "ev_buffer"
+    assert isinstance(plan(decision=buy(p_edge=be + buf + 0.001), p_be_buffer=buf), OrderIntent)
+    # buffer 0: the EV gate of before (strict at the break-even)
+    assert isinstance(plan(decision=buy(p_edge=be + 0.001), p_be_buffer=0.0), OrderIntent)
+    s0 = plan(decision=buy(p_edge=be - 0.001), p_be_buffer=0.0)
+    assert isinstance(s0, Skip) and s0.reason == "ev_negative"
+
+
+def test_negative_ev_is_reported_before_the_buffer() -> None:
+    s = plan(decision=buy(p_edge=0.30), p_be_buffer=0.08)
+    assert isinstance(s, Skip) and s.reason == "ev_negative"
+
+
+def test_scale_p_uses_the_decision_floor() -> None:
+    be = break_even()
+    lo, hi = plan(decision=buy(p_edge=be + 0.05 + 0.02), p_be_buffer=0.05), plan(
+        decision=buy(p_edge=be + 0.05 + 0.08), p_be_buffer=0.05
+    )
+    assert isinstance(lo, OrderIntent) and isinstance(hi, OrderIntent)
+    full = 0.60 - (be + 0.05)
+    assert lo.risk.scale_p == pytest.approx(0.02 / full, abs=2e-3)
+    assert hi.risk.scale_p == pytest.approx(0.08 / full, abs=2e-3) and hi.risk.scale_p > lo.risk.scale_p
+
+
+def test_floor_above_p_edge_full_gives_full_scale() -> None:
+    be = break_even()
+    i = plan(manager(p_edge_full=0.45), decision=buy(p_edge=0.70), p_be_buffer=0.10)  # floor = be + 0.10 > 0.45
+    assert be + 0.10 > 0.45 and isinstance(i, OrderIntent) and i.risk.scale_p == 1.0
+
+
+def test_entry_regimes_need_multipliers() -> None:
+    with pytest.raises(ValueError, match="entry regimes"):
+        manager(regime_multipliers={1: 1.0, 2: 1.0})
+    assert manager(regime_multipliers={1: 1.0, 2: 1.0, 3: 1.0})

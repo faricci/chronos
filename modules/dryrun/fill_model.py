@@ -5,8 +5,9 @@ Single source of truth for how a limit/stop/market order is filled from OHLCV ba
 re-implements fill rules. The scalar kernels are ``numba.njit`` so the labeling loop can call them in nopython
 mode, and plain Python can call them too (same compiled code, same numbers).
 
-The tick-level face (``TickFillModel``, order book + market trades) belongs to the dry-run phase (P3) and will
-live in this file with the same ``FillModelParams``.
+The tick-level face (``TickFillModel``, order book + market trades, Decimal arithmetic) lives at the end of this file
+with the same ``FillModelParams``: it holds the exit-side rules of the ``BracketSimulator`` (take profit through a
+trade, stop trigger, stop liquidation with the extra slip); the SAME strict comparisons as the bar face.
 
 Price rules (``spread_bps`` = s, ``slip_bps`` = slip, ``x_bps`` = stop_extra_slip_bps; sez. 0.3 and 3.1.3):
 
@@ -26,14 +27,18 @@ Price rules (``spread_bps`` = s, ``slip_bps`` = slip, ``x_bps`` = stop_extra_sli
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from pathlib import Path
 
 import numba
 from pydantic import BaseModel, ConfigDict, Field
 
+from modules.execution.rounding import floor_to
+
 __all__ = [
     "BarFillModel",
     "FillModelParams",
+    "TickFillModel",
     "maker_entry_limit",
     "maker_entry_filled",
     "market_exit_px",
@@ -130,3 +135,38 @@ class BarFillModel:
 
     def market_exit(self, px: float, spread_bps: float) -> float:
         return float(market_exit_px(px, spread_bps, self.params.slippage_buffer_bps))
+
+
+class TickFillModel:
+    """Tick face of the fill model (spec sez. 5.1.3, column "Regola dry"): exits of a virtual bracket.
+
+    Inputs are exact ``Decimal`` prices and sizes (a trade of the ``market_trades`` channel, a ``WalkResult`` of the
+    ``LocalOrderBook``). The take-profit test is the bar face's own kernel (``tp_touched``: strictly above), so the
+    two faces cannot disagree on the boundary.
+
+    | event                          | rule                                                                      |
+    |--------------------------------|---------------------------------------------------------------------------|
+    | TP (limit sell)                | a trade prints strictly above TP; quantity <= ``queue_haircut`` x trade   |
+    | stop trigger                   | ``last <= stop``                                                          |
+    | stop liquidation               | walk of the bids, then ``stop_extra_slip_bps`` off the VWAP, taker fee    |
+    """
+
+    def __init__(self, params: FillModelParams | None = None) -> None:
+        self.params = params or FillModelParams()
+        self._haircut = Decimal(repr(float(self.params.queue_haircut)))
+        self._extra_slip = Decimal(repr(float(self.params.stop_extra_slip_bps))) / Decimal(10_000)
+
+    def tp_touched(self, trade_price: Decimal, tp: Decimal) -> bool:
+        return bool(tp_touched(float(trade_price), float(tp)))
+
+    def tp_fill_qty(self, trade_size: Decimal, remaining: Decimal, base_increment: Decimal) -> Decimal:
+        """Base quantity a resting sell gets from one trade through its price: the haircut share of the trade, on the
+        increment, never more than what is left."""
+        return min(remaining, floor_to(self._haircut * trade_size, base_increment))
+
+    def stop_triggered(self, last: Decimal, stop: Decimal) -> bool:
+        return last <= stop
+
+    def stop_exit_price(self, vwap: Decimal, quote_increment: Decimal) -> Decimal:
+        """Price of the stop liquidation: the VWAP of the bids walked, minus the extra stop slip, rounded down."""
+        return floor_to(vwap * (1 - self._extra_slip), quote_increment)

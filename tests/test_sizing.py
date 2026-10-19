@@ -85,8 +85,6 @@ def test_not_enough_free_quote_is_reported_as_insufficient_balance() -> None:
 def test_invalid_levels_are_programming_errors() -> None:
     with pytest.raises(ValueError):
         size_of(stop_loss=D("92.03"))
-    with pytest.raises(ValueError):
-        size_of(p_edge_full=0.44)
 
 
 GEN = dict(
@@ -137,3 +135,13 @@ def test_sizing_never_refused_by_guard(equity, free_frac, entry, sl_frac, cost_s
     except InsufficientCoverage as e:  # pragma: no cover - the failure this test exists to catch
         pytest.fail(f"guard refused a size the sizing allowed: {e}")
     assert ticket is not None
+
+
+def test_floor_at_or_above_p_edge_full_is_full_or_zero_conviction() -> None:
+    """The floor is the break-even of this decision plus a buffer: when it reaches p_edge_full, conviction is 0/1."""
+    full = size_of(p_edge=0.70, p_edge_min=0.62, p_edge_full=0.60)
+    assert isinstance(full, SizingResult) and full.scale_p == 1 and full.risk_eur == D("0.5")
+    zero = size_of(p_edge=0.55, p_edge_min=0.62, p_edge_full=0.60)
+    assert isinstance(zero, SizingResult) and zero.scale_p == 0
+    equal = size_of(p_edge=0.60, p_edge_min=0.60, p_edge_full=0.60)
+    assert isinstance(equal, SizingResult) and equal.scale_p == 1

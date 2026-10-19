@@ -55,7 +55,7 @@ def market(n: int = 500, price: float = 92.5) -> MarketBars:
 def intent() -> OrderIntent:
     i = plan()
     assert isinstance(i, OrderIntent)
-    return i  # SOL-EUR: BUY 0.024 @ 92.03, TP 108.96, SL 83.57 (maker, book 'champion')
+    return i  # SOL-EUR: BUY 0.023 @ 92.03, TP 108.96, SL 83.57 (maker, book 'champion')
 
 
 @pytest.fixture
@@ -98,11 +98,11 @@ async def test_entry_fill_tp_exit_exact_accounting(env: Env) -> None:
     trade = await env.gateway.entry_terminal(pending, m)
     assert trade is not None and trade.bracket is not None and trade.bracket.reason == "TP" and trade.bracket.bar == 60
     pos = env.ledger.view("champion", "SOL-EUR")
-    assert pos.is_long and pos.base_qty == D("0.024") and pos.avg_entry == D("92.03") and pos.bracket_order_id
-    assert env.account.balances.reserved("SOL") == D("0.024") and env.account.balances.reserved("EUR") == 0
+    assert pos.is_long and pos.base_qty == D("0.023") and pos.avg_entry == D("92.03") and pos.bracket_order_id
+    assert env.account.balances.reserved("SOL") == D("0.023") and env.account.balances.reserved("EUR") == 0
     closed = await env.gateway.close(trade, trade.bracket, m)
-    entry_cost = D("92.03") * D("0.024") * (1 + D("25") / 10000)
-    proceeds = D("108.96") * D("0.024") * (1 - D("25") / 10000)
+    entry_cost = D("92.03") * D("0.023") * (1 + D("25") / 10000)
+    proceeds = D("108.96") * D("0.023") * (1 - D("25") / 10000)
     assert closed.exit_reason == "TP" and closed.pnl_quote == proceeds - entry_cost
     assert env.account.balances.free("EUR") == D("100") - entry_cost + proceeds
     assert env.account.balances.free("SOL") == 0 and env.account.balances.reserved("SOL") == 0
