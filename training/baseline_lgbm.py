@@ -52,8 +52,8 @@ from modules.decision.baseline import (
 from modules.decision.protocol import ACTIONS, REGIME_LEGEND
 from modules.decision.questions import build_questions
 from modules.risk.label_config import LoadedLabelConfig, load_label_config
+from training.build_dataset import flat_splits
 from training.config import TrainConfig, load_train_config_or_exit
-from training.splits import purged_walk_forward
 
 LGBM_PARAMS: Final[dict[str, Any]] = {
     "boosting_type": "gbdt",
@@ -276,17 +276,13 @@ def oof_edge_scores(
 def set_membership(samples: pd.DataFrame, label: LoadedLabelConfig, cfg: TrainConfig) -> dict[str, np.ndarray]:
     """``{'fold_0': per-row 'train'|'val'|'test'|'', ..., 'final': ...}``; LONG rows inherit their FLAT row."""
     flat = samples[samples["position_side"] == "FLAT"].sort_values(["t", "product"], kind="stable")
-    ts = pd.DatetimeIndex(flat["t"]).tz_localize("UTC")
-    t1 = pd.DatetimeIndex(flat["label_window_end"]).tz_localize("UTC")
-    embargo = timedelta(days=cfg.embargo_days)
-    splits = purged_walk_forward(
-        ts, t1, n_folds=cfg.n_folds, embargo=embargo, val_frac=cfg.val_frac, holdout_start=label.holdout_start
-    )
+    fs = flat_splits(flat, label, cfg)  # live rows (``source == 'live'``) are training rows only: see FlatSplits
     keys = flat[["product", "t"]].reset_index(drop=True)
     out: dict[str, np.ndarray] = {}
-    for f in splits.folds:
+    for f in fs.splits.folds:
         tag = np.full(len(flat), "", dtype=object)
         tag[f.train], tag[f.val], tag[f.test] = "train", "val", "test"
+        tag = fs.train_only(tag)
         merged = samples[["product", "t"]].merge(keys.assign(s=tag), on=["product", "t"], how="left")
         out[f"fold_{f.index}"] = merged["s"].fillna("").to_numpy(dtype=object)
     out[FINAL] = np.where(samples["final_split"].isin(["train", "val"]), samples["final_split"], "").astype(object)
@@ -426,6 +422,16 @@ def _save(sub: Path, res: Mapping[str, Any]) -> None:
     (sub / "calibration.json").write_text(res["calibration"].model_dump_json(indent=2), encoding="utf-8", newline="\n")
 
 
+def final_train_end(samples: pd.DataFrame) -> str | None:
+    """When the data of the ``final`` model ends: the largest ``label_window_end`` of the rows it trains and calibrates
+    on (``final_split`` train or val), UTC ISO. Rule L5 (V1) needs it to prove that a backtest window is out of sample:
+    ``final_train_end <= window start - embargo``. None: the model used no row at all."""
+    used = samples.loc[samples["final_split"].isin(["train", "val"]), "label_window_end"]
+    if used.empty:
+        return None
+    return str(pd.Timestamp(used.max()).strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
 def _git_commit() -> str | None:
     try:
         out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=10, check=True)
@@ -507,6 +513,7 @@ def train_baseline(
             "indicator_anchor": manifest["indicator_anchor"],
             "dataset_run_id": manifest["run_id"],
             "holdout": [manifest["holdout_start"], max(manifest["last_bar"].values())],
+            "final_train_end": final_train_end(samples),
             "rows": manifest["rows"],
         },  # fmt: skip
         "sentiment_available": False,
@@ -523,6 +530,8 @@ def train_baseline(
         "git_commit": _git_commit(),
         "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
+    if "live" in manifest:  # the live labels (rows, weight, exclusions) that shaped this model: reproducibility
+        card["data"]["live"] = manifest["live"]
     (root / "model_card.json").write_text(json.dumps(card, indent=2, sort_keys=True), encoding="utf-8", newline="\n")
     return root
 

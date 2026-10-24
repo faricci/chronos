@@ -8,6 +8,7 @@ before the book is built, everything the rebuild needs:
 * ``fills``: replayed by ``VirtualAccount.restore`` to get the balances, the fees paid and the realized PnL of the
   book exactly as they were (``free + reserved`` per currency is what the fills say, never a guess);
 * ``bracket_orders``: the standalone brackets that are still open and belong to a LONG position of the book; their base
+  (what the order was sent with, less what its fills already sold: in the tick fill mode a bracket can fill in parts)
   is a reservation of the rebuilt account, and the gateway re-registers them as simulated brackets;
 * ``open_orders``: every other order still open (an entry waiting for bars, an exit, a bracket of a closed position):
   none of them can be resumed (the simulated queue and the latency are gone), the gateway cancels them in the ledger
@@ -76,6 +77,11 @@ async def load_book_restore(
         )  # fmt: skip
     positions = {p.product_id: p for p in ledger.long_positions(book)}
     open_orders = tuple(await ledger.open_orders(book))
+    fills = tuple(await ledger.book_fills(book))
+    sold: dict[str, Decimal] = {}  # base already sold by each order: a bracket of the tick fill mode fills in parts
+    for f in fills:
+        if f.side == "SELL":
+            sold[f.client_order_id] = sold.get(f.client_order_id, Decimal(0)) + f.size
     brackets: list[OrderRecord] = []
     reservations: list[Reservation] = []
     for rec in open_orders:
@@ -83,16 +89,15 @@ async def load_book_restore(
         if rec.leg != "bracket" or rec.side != "SELL" or pos is None or pos.bracket_order_id != rec.client_order_id:
             continue
         size = _bracket_size(rec)
-        if size is None or size <= 0 or size > pos.base_qty:
+        left = None if size is None else size - sold.get(rec.client_order_id, Decimal(0))
+        if left is None or left <= 0 or left > pos.base_qty:
             log.error("restore_bracket_unreadable", book=book, client_order_id=rec.client_order_id)
             continue  # cancelled with the other open orders; the position gets a new bracket
         brackets.append(rec)
         reservations.append(
             Reservation(
                 client_order_id=rec.client_order_id, product_id=rec.product_id, side="SELL",
-                currency=registry.meta(rec.product_id).base_currency, amount=size,
+                currency=registry.meta(rec.product_id).base_currency, amount=left,
             )  # fmt: skip
         )
-    return BookRestore(
-        book, starting, tuple(await ledger.book_fills(book)), open_orders, tuple(brackets), tuple(reservations)
-    )
+    return BookRestore(book, starting, fills, open_orders, tuple(brackets), tuple(reservations))

@@ -283,10 +283,11 @@ async def test_the_tasks_of_the_group_are_the_documented_ones(tmp_path: Path) ->
         names = {s.name for s in rig.rt.task_specs()}
         assert names == {
             "market_stream", "bar_service", "bar_pump", "tickers", "health", "heartbeat", "fees",
-            "watchdog:champion", "telemetry_status", "telemetry_equity", "telemetry_ops",
+            "watchdog:champion", "telemetry_status", "telemetry_equity", "telemetry_ops", "schedule",
         }  # fmt: skip
         crit = {s.name for s in rig.rt.task_specs() if not s.critical}
-        assert crit == {"fees", "telemetry_status", "telemetry_equity", "telemetry_ops"}  # telemetry never stops us
+        # telemetry never stops us, and neither does the daily clock (00:15 learner child, 00:30 model reload)
+        assert crit == {"fees", "telemetry_status", "telemetry_equity", "telemetry_ops", "schedule"}
 
 
 async def test_telemetry_disabled_starts_no_telemetry_task_and_trading_is_the_same(tmp_path: Path) -> None:

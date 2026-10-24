@@ -88,6 +88,8 @@ class FakeFeed:
         self._spreads: dict[str, float | None] = {}
         self._last: datetime | None = None
         self.fail: Exception | None = None
+        self.on_trades_cb: Any = None  # what the runtime handed to the stream (the trade callback: tick fill mode only)
+        self.on_damage_cb: Any = None
 
     @property
     def books(self) -> Mapping[str, LocalOrderBook]:
@@ -343,10 +345,14 @@ async def make_rig(
         bars.queue, bars.finalizer, bars.writer = queue, finalizer, writer
         return bars
 
+    def stream(prods: Any, tap: Any, on_damage: Any, on_trades: Any = None) -> FakeFeed:
+        feed.on_damage_cb, feed.on_trades_cb = on_damage, on_trades
+        return feed
+
     deps = Deps(
         clock=clock, sleep=sleep, exchange=lambda c: ex, candle_source=NoCandles, backfill=no_backfill,
         history=lambda root, pid: history[pid], champion=lambda models_dir, spec: champion or make_champion(),
-        stream=lambda prods, tap, on_damage: feed, bar_service=bar_service, sentiment=sentiment_factory,
+        stream=stream, bar_service=bar_service, sentiment=sentiment_factory,
         **dep_overrides,
     )  # fmt: skip
     app_module.IndicatorEngine = CachedEngine  # type: ignore[misc]

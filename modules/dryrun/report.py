@@ -119,6 +119,95 @@ def _clean(obj: Any) -> Any:
     return obj
 
 
+def _impact_key(entry: Mapping[str, Any]) -> tuple[float, float, float]:
+    """Order of badness: an unmeasured R1 (``share`` None) is worse than any measured one."""
+    share = entry.get("share")
+    flip = float(entry.get("flip_share") or 0.0)
+    return (math.inf if share is None else float(share), float(entry["max_shift"]), flip)
+
+
+def _impact_entry(entry: Mapping[str, Any], blocks: Sequence[Mapping[str, Any]] | None, limit: float) -> dict[str, Any]:
+    """One ``ImpactDay`` of a book as the report carries it. ``share`` and ``flip_share`` are those of the BLOCK of
+    R1/R3 (rule v2, sez. 5.1.7) with the same version and day; ``day_share`` is the day's own. ``blocks`` None = a
+    learner document written before the blocks existed: a full day IS its own block, a partial day has no measured
+    R1 (``share`` None: unmeasured, never judged with the old per-day rule)."""
+    from modules.dryrun.revision_impact import STATES_PER_DAY
+
+    share: Any = None
+    flip: Any = None
+    r3 = entry.get("r3")
+    kind = block_states = revisions = max_cluster = None
+    if blocks is None:
+        if int(entry["states"]) >= STATES_PER_DAY:
+            share, flip, kind, block_states = entry["share"], entry.get("flip_share"), "day", entry["states"]
+    else:
+        same = [x for x in blocks if x.get("version") == entry["version"] and x.get("day") == entry.get("day")]
+        blk = same[0] if same else None
+        if blk is not None:
+            share, flip, r3 = blk["share"], blk.get("flip_share"), blk.get("r3")
+            kind, block_states = blk.get("kind"), blk.get("states")
+            revisions, max_cluster = blk.get("revisions"), blk.get("max_cluster")
+    return {
+        "version": entry.get("version"), "states": entry.get("states"), "share": share,
+        "max_shift": entry["max_shift"], "flip_share": flip, "r3": r3, "day_share": entry.get("share"),
+        "block_states": block_states, "block_kind": kind, "revisions": revisions, "max_cluster": max_cluster,
+        "r2_utilization": float(entry["max_shift"]) / limit, "top_shifts": list(entry.get("top_shifts") or []),
+        "first_at": entry.get("first_at"), "last_at": entry.get("last_at"),
+        "shifted_at": [x["t"] for x in entry.get("shifted_states") or []],
+    }  # fmt: skip
+
+
+def _worst_impact(entries: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """The worst entry of a book and product (a day with two versions: the worst one)."""
+    worst: Mapping[str, Any] = entries[0]
+    for e in entries[1:]:
+        if _impact_key(e) > _impact_key(worst):
+            worst = e
+    return dict(worst)
+
+
+def _impact_by_version(books: Mapping[str, Sequence[Mapping[str, Any]]]) -> dict[str, dict[str, Any]]:
+    """The worst entry of each model version used by any book on that product and day (R1-R3 belong to the
+    version: ``anomalies.revision_by_version``, shadow evidence of the challenger)."""
+    worst: dict[str, Mapping[str, Any]] = {}
+    for entries in books.values():
+        for e in entries:
+            cur = worst.get(str(e["version"]))
+            if cur is None or _impact_key(e) > _impact_key(cur):
+                worst[str(e["version"])] = e
+    return {v: dict(e) for v, e in sorted(worst.items())}
+
+
+def _rolling_diagnostic(
+    runs: Mapping[str, Sequence[Mapping[str, Any]]],
+) -> tuple[float | None, dict[str, Any]]:
+    """``revision_shift_rolling_max`` (no threshold): the window of 1440 consecutive states with the most shifted
+    states, per product, over the maximal runs of contiguous days of the window of the gate."""
+    from modules.dryrun.revision_impact import STATES_PER_DAY, rolling_max
+
+    best: float | None = None
+    detail: dict[str, Any] = {}
+    for product, entries in runs.items():
+        groups: list[list[Mapping[str, Any]]] = []
+        for e in entries:
+            if groups and _parse_t(groups[-1][-1]["last_at"]) + timedelta(minutes=1) == _parse_t(e["first_at"]):
+                groups[-1].append(e)
+            else:
+                groups.append([e])
+        found = []
+        for g in groups:
+            spans = [
+                (_parse_t(e["first_at"]), _parse_t(e["last_at"]), [_parse_t(t) for t in e["shifted_at"]]) for e in g
+            ]
+            r = rolling_max(spans, STATES_PER_DAY)
+            if r is not None:
+                found.append({"start": _iso_z(r["start"]), "end": _iso_z(r["end"]), "shifted": r["shifted"],
+                              "share": r["share"], "versions": sorted({str(e["version"]) for e in g})})  # fmt: skip
+                best = r["share"] if best is None else max(best, r["share"])
+        detail[product] = found
+    return best, detail
+
+
 # ------------------------------------------------------------------------------------------------ trades
 
 
@@ -137,6 +226,7 @@ class Trade:
     net_bps: float | None = None
     r_multiple: float | None = None
     held_min: int | None = None
+    model_version: str | None = None  # the model version the book ran when the trade closed (ledger ``set_trade_info``)
 
 
 def parse_trade(raw: Mapping[str, Any]) -> Trade:
@@ -166,6 +256,7 @@ def parse_trade(raw: Mapping[str, Any]) -> Trade:
         net_bps=None if bps is None else float(bps),
         r_multiple=None if r_mult is None else float(r_mult),
         held_min=None if raw.get("held_min") is None else int(raw["held_min"]),
+        model_version=None if raw.get("model_version") is None else str(raw["model_version"]),
     )
 
 
@@ -199,6 +290,8 @@ class SqliteTradeSource:
                 raw = json.loads(data["payload"]) if data.get("payload") else data
                 if "book" not in raw and "book" in data:
                     raw = {**raw, "book": data["book"]}
+                if raw.get("model_version") is None and data.get("model_version") is not None:
+                    raw = {**raw, "model_version": data["model_version"]}  # the ledger column
                 out.append(parse_trade(raw))
             except (ValueError, KeyError, TypeError, ArithmeticError):
                 self.bad_rows += 1
@@ -395,20 +488,80 @@ def evaluate_gate_ops(
     c.append(_crit("feature_psi", None if psi is None else max(psi) < cfg.max_feature_psi,
                    None if psi is None else max(psi), cfg.max_feature_psi))  # fmt: skip
 
+    # "Barre REST" (sez. 5.1.7, since 2.11): R1-R4 on the impact of the revisions; the raw ratio is a diagnostic
     ratios: list[float] = []
     missing = False
     structure: list[int] = []
+    impact_missing = completeness_missing = False
+    shares: list[float] = []
+    shifts: list[float] = []
+    flips: list[float] = []
+    r3_notes: set[str] = set()
+    share_missing = False
+    appeared = 0
+    runs: dict[str, list[Mapping[str, Any]]] = defaultdict(list)  # per product, by day: first_at / last_at / shifted_at
+    revisions_by: dict[str, Any] = {}
+    utilization: list[float] = []
     for d in days:
-        for b in (d.get("bars") or {}).values():
+        for pid, b in (d.get("bars") or {}).items():
             r = b.get("rest_revision_ratio")
-            missing = missing or r is None
             ratios += [] if r is None else [float(r)]
             structure += [(b.get("out_of_order") or 0) + (b.get("duplicates") or 0)]
+            counts = (b.get("rest_revisions_appeared"), b.get("rest_revisions_disappeared"))
+            completeness_missing = completeness_missing or None in counts
+            appeared += sum(int(v) for v in counts if v is not None)
+            imp = (b.get("revision_impact") or {}).get(book)
+            if imp is None:
+                impact_missing = True
+                continue
+            if imp.get("share") is None:
+                share_missing = True  # R1 not measured (partial day of an old learner document): R2 still is
+            else:
+                shares.append(float(imp["share"]))
+            shifts.append(float(imp["max_shift"]))
+            if imp.get("r3") == "measured" and imp.get("flip_share") is not None:
+                flips.append(float(imp["flip_share"]))
+            else:
+                r3_notes.add("block_unavailable" if imp.get("r3") == "measured" else str(imp.get("r3")))
+            if imp.get("first_at") and imp.get("last_at"):
+                runs[str(pid)].append(imp)
+            if imp.get("revisions") is not None:
+                revisions_by[f"{pid} {d.get('date')}"] = imp["revisions"]
+            if imp.get("r2_utilization") is not None:
+                utilization.append(float(imp["r2_utilization"]))
         missing = missing or not d.get("bars")
-    c.append(_crit("rest_revision_ratio", None if missing or not ratios else max(ratios) <= cfg.max_rest_revision_ratio,
-                   max(ratios) if ratios else None, cfg.max_rest_revision_ratio))  # fmt: skip
+    impact_missing = impact_missing or missing or not shifts
+    completeness_missing = completeness_missing or missing
     c.append(_crit("bars_in_order_no_duplicates", None if missing or not structure else sum(structure) == 0,
                    sum(structure) if structure else None, 0, "ops.bars.out_of_order / duplicates"))  # fmt: skip
+    r1_note = (f"R1: share of shifted states (> {cfg.revision_shift_threshold}) on blocks of 1440 states "
+               "(a full UTC day is its own block), worst product and day")  # fmt: skip
+    r1_unmeasured = impact_missing or share_missing or not shares
+    c.append(_crit("revision_shift_share", None if r1_unmeasured else max(shares) <= cfg.max_revision_shift_share,
+                   max(shares) if shares else None, cfg.max_revision_shift_share, r1_note))  # fmt: skip
+    c.append(_crit("revision_shift_max", None if impact_missing else max(shifts) <= cfg.max_revision_shift,
+                   max(shifts) if shifts else None, cfg.max_revision_shift, "R2: largest shift"))  # fmt: skip
+    r3_unmeasured = impact_missing or bool(r3_notes) or not flips
+    r3_note = "R3: not measured: " + ", ".join(sorted(r3_notes)) if r3_notes else "R3: flips of actionability"
+    c.append(_crit("revision_decision_flips", None if r3_unmeasured else max(flips) <= cfg.max_revision_flip_share,
+                   max(flips) if flips else None, cfg.max_revision_flip_share, r3_note))  # fmt: skip
+    r4_note = "R4: minutes appeared + disappeared on re-read"
+    c.append(_crit("rest_completeness", None if completeness_missing else appeared == 0,
+                   None if completeness_missing else appeared, 0, r4_note))  # fmt: skip
+    top_ratio = max(ratios) if ratios else None
+    diagnostics: list[dict[str, Any]] = [{
+        "name": "rest_revision_ratio", "value": top_ratio, "alarm_threshold": cfg.max_rest_revision_ratio,
+        "alarm": top_ratio is not None and top_ratio > cfg.max_rest_revision_ratio,
+        "note": "diagnostica, non entra nello stato del gate",
+    }]  # fmt: skip
+    nothing = "diagnostica senza soglia, non entra nello stato del gate"
+    rolled, rolled_detail = _rolling_diagnostic(runs)
+    diagnostics += [
+        {"name": "revision_shift_rolling_max", "value": rolled, "detail": rolled_detail, "note": nothing},
+        {"name": "revision_independent_revisions", "value": max(revisions_by.values(), default=None),
+         "detail": revisions_by, "note": nothing},
+        {"name": "revision_r2_utilization", "value": max(utilization, default=None), "detail": None, "note": nothing},
+    ]  # fmt: skip
 
     total_buys = sum(int(_book_block_of(d, book).get("BUY", 0)) for d in days)
     if expected_buy_rate is None:
@@ -438,7 +591,7 @@ def evaluate_gate_ops(
                        cfg.max_fee_floor_skip_ratio))  # fmt: skip
     return {
         "book": book, "days": n, "min_days": cfg.min_days, "status": _gate_status(c, n >= cfg.min_days),
-        "criteria": [x.to_dict() for x in c],
+        "criteria": [x.to_dict() for x in c], "diagnostics": diagnostics,
     }  # fmt: skip
 
 
@@ -479,6 +632,149 @@ def _curve_from_trades(trades: Sequence[Trade], starting_quote: Decimal) -> list
     return out
 
 
+# ------------------------------------------------------------------------------------------ rollback advice
+# Spec 5.1.7 (since 2.11): a RECOMMENDATION in the daily report, never an action. The rollback itself is
+# ``python -m modules.dryrun.registry rollback champion --reason "..."`` (a human, locally, effective at the next
+# reload). Nothing here writes the registry or the command inbox: the registry is only read.
+
+LOSS_GUARDS: Final = ("daily_loss", "loss_streak")  # kill switch guards that trip on losses (not on defects)
+ROLLBACK_COMMAND: Final = 'python -m modules.dryrun.registry rollback champion --reason "<why>"'
+Z_ROLLBACK: Final = -1.96  # E5's threshold: post-promotion mean significantly below the OOS mean
+
+
+@dataclass(frozen=True)
+class ChampionInfo:
+    """The champion version as the registry holds it (``loadable`` False: the alias or the files are damaged)."""
+
+    version: str | None
+    since: datetime | None
+    path: Path | None
+    loadable: bool = True
+    error: str | None = None
+
+
+class ChampionSource(Protocol):
+    def current(self) -> ChampionInfo | None: ...
+
+
+class RegistryChampionSource:
+    """Read only view of ``models/registry``: ``state`` and ``get`` never write."""
+
+    def __init__(self, root: Path | str) -> None:
+        self._root = Path(root)
+
+    def current(self) -> ChampionInfo | None:
+        from modules.dryrun.registry import FilesystemModelRegistry, RegistryError, UnknownAlias
+
+        registry = FilesystemModelRegistry(self._root)
+        try:
+            state = registry.state("champion")
+        except UnknownAlias:
+            return None
+        except RegistryError as exc:
+            return ChampionInfo(None, None, None, False, f"{type(exc).__name__}: {exc}")
+        since = _parse_t(state.updated_at)
+        try:
+            return ChampionInfo(state.version, since, registry.get("champion").path)
+        except RegistryError as exc:
+            return ChampionInfo(state.version, since, None, False, f"{type(exc).__name__}: {exc}")
+
+
+def oos_reference(path: Path | None) -> tuple[float, float, float] | None:
+    """``(mean net_ret_bps, standard error, rho)`` of the OOS trades a version was evaluated on
+    (``oos_trades.jsonl``, with the E1 effective count as ``n``). None: the version has no OOS artifacts."""
+    if path is None:
+        return None
+    try:
+        rows = [
+            json.loads(line) for line in (path / "oos_trades.jsonl").read_text(encoding="utf-8").splitlines() if line
+        ]
+        rho = float(json.loads((path / "oos_spans.json").read_text(encoding="utf-8"))["rho"])
+        bps = np.array([float(r["net_ret_bps"]) for r in rows])
+        n_eff = sum(float(r["neff_weight"]) for r in rows)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if len(rows) < 2 or n_eff <= 0:
+        return None
+    return float(bps.mean()), float(bps.std(ddof=1) / math.sqrt(n_eff)), rho
+
+
+def live_consistency(trades: Sequence[Trade], oos: tuple[float, float, float]) -> float | None:
+    """``z = (m_post - m_oos) / sqrt(se_post^2 + se_oos^2)`` (E5's own function, ``holdout_consistency``): ``m`` is
+    the mean ``net_bps`` per trade, ``se`` comes from the effective number of trades (E1 weights, ``rho`` of the
+    version). None: a trade without ``net_bps``, or fewer than two trades."""
+    bps = [t.net_bps for t in trades]
+    if len(bps) < 2 or any(b is None for b in bps):
+        return None
+    import pandas as pd
+
+    from training.evaluate import Boot, effective_trades, holdout_consistency
+
+    values = np.array([b for b in bps if b is not None])
+    n_eff = float(len(trades))
+    if all(t.entry_at is not None for t in trades):
+        frame = pd.DataFrame({
+            "product": [t.product for t in trades], "fill_ts": [t.entry_at for t in trades],
+            "exit_ts": [t.exit_at for t in trades],
+        })  # fmt: skip
+        n_eff = effective_trades(frame, oos[2])
+    se = float(values.std(ddof=1) / math.sqrt(n_eff)) if n_eff > 0 else math.inf
+    post = Boot(float(values.mean()), se, math.nan, math.nan, math.nan, len(values))
+    ref = Boot(oos[0], oos[1], math.nan, math.nan, math.nan, 0)
+    return holdout_consistency(post, ref)
+
+
+def rollback_advice(
+    info: ChampionInfo | None, *, trades: Sequence[Trade], oos: tuple[float, float, float] | None,
+    parity: float | None, min_parity: float, revision_failures: Sequence[str], fallback_ratio: float | None,
+    max_fallback_ratio: float, kill_switch_bug: int | None, loss_trips: int, min_trades: int,
+) -> dict[str, Any]:  # fmt: skip
+    """The daily ``rollback_advice`` block for the CURRENT champion version.
+
+    Defects (advised at once, no minimum of trades): decision parity under ``min_parity``, R1-R4 failed with the
+    version, decider fallbacks over ``max_fallback_ratio``, a version that cannot be loaded, a kill switch trip for a
+    bug. Economics (only with at least ``min_trades`` closed trades OF THE VERSION, ``MANUAL`` closes excluded): profit
+    factor below 1.0, post-promotion mean inconsistent with the OOS (``z < -1.96``), two or more kill switch trips
+    for losses since the version took over. Trades are attributed to the version through the version the ledger
+    recorded; trades without one make the economics ``unmeasured`` (never zero)."""
+    if info is None or (info.version is None and info.loadable):
+        return {"version": None, "advice": "none", "triggers": [], "note": "no champion alias"}
+    defects: list[str] = []
+    if not info.loadable:
+        defects.append("version_not_loadable")
+    if parity is not None and parity < min_parity:
+        defects.append(f"decision_parity:{parity:.4f}")
+    defects += [f"revision:{f}" for f in revision_failures]
+    if fallback_ratio is not None and fallback_ratio > max_fallback_ratio:
+        defects.append(f"decider_fallback_ratio:{fallback_ratio:.3f}")
+    if kill_switch_bug:
+        defects.append("kill_switch_bug")
+    mine = [t for t in trades if t.exit_reason != MANUAL and t.model_version == info.version]
+    economics: dict[str, Any] = {"closed_trades": len(mine), "min_trades": min_trades}
+    triggers_economic: list[str] = []
+    if not any(t.model_version is not None for t in trades):
+        economics |= {"status": "unmeasured", "reason": "trades_without_model_version", "closed_trades": None}
+    elif len(mine) < min_trades:
+        economics["status"] = "insufficient_trades"  # below the minimum: no economic recommendation at all
+    else:
+        pf = profit_factor(t.net_quote for t in mine)
+        z = None if oos is None else live_consistency(mine, oos)
+        economics |= {"status": "measured", "profit_factor": pf, "z_vs_oos": z, "loss_trips": loss_trips}
+        if pf is not None and pf < 1.0:
+            triggers_economic.append(f"profit_factor:{pf:.3f}")
+        if z is not None and z < Z_ROLLBACK:
+            triggers_economic.append(f"oos_inconsistency_z:{z:.2f}")
+        if loss_trips >= 2:
+            triggers_economic.append(f"kill_switch_loss_trips:{loss_trips}")
+    triggers = [*defects, *triggers_economic]
+    return {
+        "version": info.version, "since": None if info.since is None else _iso_z(info.since),
+        "closed_trades": len(mine), "defect_triggers": defects, "economic_triggers": triggers_economic,
+        "triggers": triggers, "economics": economics, "error": info.error,
+        "advice": "consider_rollback" if triggers else "none", "command": ROLLBACK_COMMAND,
+    }  # fmt: skip
+
+
 # ------------------------------------------------------------------------------------------- the reporter
 
 
@@ -501,6 +797,8 @@ class DryReporter:
     ops: OpsSource
     mode: str = "dry"
     expected_buy_rate: float | None = None
+    champion: ChampionSource | None = None  # where the rollback advice reads the champion version (read only)
+    max_fallback_ratio: float = 0.20  # risk.kill_switch.max_fallback_ratio_1h
     _trades: list[Trade] = field(default_factory=list, init=False)
 
     # ------------------------------------------------------------------------------------ readers
@@ -586,7 +884,37 @@ class DryReporter:
                                                for b in books},
         }  # fmt: skip
         doc["anomalies"] = self._anomalies(doc)
+        doc["alarms"] = self._alarms(doc)
+        doc["rollback_advice"] = self._rollback_advice(d, records, upto, doc)
         return doc
+
+    def _rollback_advice(
+        self, d: date, records: Sequence[Mapping[str, Any]], upto: Sequence[Trade], doc: Mapping[str, Any]
+    ) -> dict[str, Any]:  # fmt: skip
+        """B.7: a recommendation for the current champion version. Reads the registry and the files the report already
+        reads; writes nothing and sends nothing."""
+        info = self.champion.current() if self.champion is not None else None
+        mine = [r for r in records if r.get("book") == CHAMPION]
+        fallback = sum(1 for r in mine if r.get("fallback")) / len(mine) if mine else None
+        version = None if info is None else info.version
+        failed = ((doc.get("anomalies") or {}).get("revision_by_version") or {}).get(version, [])
+        loss_trips = 0
+        if info is not None and info.since is not None:
+            for k in range((d - info.since.date()).days + 1):
+                day_ops = self.ops.day(info.since.date() + timedelta(days=k))
+                loss_trips += 0 if day_ops is None else sum(
+                    1 for t in day_ops.kill_switch_trips
+                    if t.guard in LOSS_GUARDS and not t.bug and t.book in (CHAMPION, "*")
+                )  # fmt: skip
+        return rollback_advice(
+            info, trades=[t for t in upto if t.book == CHAMPION],
+            oos=oos_reference(None if info is None else info.path),
+            parity=(doc.get("parity") or {}).get("decision_match"),
+            min_parity=self.cfg.gate_ops.min_decision_parity, revision_failures=failed, fallback_ratio=fallback,
+            max_fallback_ratio=self.max_fallback_ratio,
+            kill_switch_bug=(doc.get("ops") or {}).get("kill_switch_bug_trips"),
+            loss_trips=loss_trips, min_trades=self.cfg.gate_econ.min_trades,
+        )  # fmt: skip
 
     def _book_block(
         self, name: str, starting: Decimal, upto: Sequence[Trade], today: Sequence[Trade],
@@ -654,13 +982,21 @@ class DryReporter:
         return out
 
     def _bars(self, ops: OpsDay | None, learner: Mapping[str, Any] | None) -> dict[str, Any]:
-        audit = (((learner or {}).get("steps") or {}).get("L0", {}).get("details", {}).get("rest_revisions") or {}).get(
-            "products", {}
-        )
+        l0 = ((learner or {}).get("steps") or {}).get("L0", {}).get("details", {})
+        audit = (l0.get("rest_revisions") or {}).get("products", {})
+        impact = (l0.get("revision_impact") or {}).get("products", {})
         out: dict[str, Any] = {}
-        for p in sorted(set(audit) | set(ops.bars if ops else {})):
+        for p in sorted(set(audit) | set(impact) | set(ops.bars if ops else {})):
             b = ops.bars.get(p) if ops else None
             a = audit.get(p) or {}
+            books = (impact.get(p) or {}).get("books") or {}
+            blocks = (impact.get(p) or {}).get("blocks")  # None: a document written before the blocks existed
+            limit = self.cfg.gate_ops.max_revision_shift
+            entries = {
+                k: [_impact_entry(e, None if blocks is None else blocks.get(k, []), limit) for e in v]
+                for k, v in books.items()
+                if v
+            }
             out[p] = {
                 "rest": None if b is None else b.rest, "flat": None if b is None else b.flat,
                 "flat_unproven": None if b is None else b.flat_unproven,
@@ -670,6 +1006,10 @@ class DryReporter:
                 "duplicates": None if b is None else b.duplicates,
                 "rest_revisions": a.get("revised"), "rest_revision_ratio": a.get("ratio"),
                 "rest_revision_max_close_bps": a.get("max_close_diff_bps"),
+                "rest_revisions_value": a.get("value_revised"), "rest_revisions_appeared": a.get("appeared"),
+                "rest_revisions_disappeared": a.get("disappeared"),
+                "revision_impact": {k: _worst_impact(v) for k, v in entries.items()},
+                "revision_impact_by_version": _impact_by_version(entries),
             }  # fmt: skip
         return out
 
@@ -746,11 +1086,24 @@ class DryReporter:
             if value is not None and bad(value):
                 operational += 1
                 notes.append(note)
+        by_version: dict[str, list[str]] = {}
         for p, b in doc["bars"].items():
-            r = b.get("rest_revision_ratio")
-            if r is not None and r > g.max_rest_revision_ratio:
+            # the raw ratio is an alarm (``_alarms``), no longer an anomaly; R4 is operational (all models alike)
+            gone = (b.get("rest_revisions_appeared") or 0) + (b.get("rest_revisions_disappeared") or 0)
+            if gone > 0:
                 operational += 1
-                notes.append(f"rest_revision_ratio:{p}")
+                notes.append(f"rest_completeness:{p}")
+            for version, s in (b.get("revision_impact_by_version") or {}).items():  # R1-R3 belong to the version
+                failed = [
+                    name
+                    for name, bad in (
+                        ("R1", s.get("share") is not None and s["share"] > g.max_revision_shift_share),
+                        ("R2", s["max_shift"] > g.max_revision_shift),
+                        ("R3", s.get("r3") == "measured" and (s.get("flip_share") or 0.0) > g.max_revision_flip_share),
+                    )
+                    if bad
+                ]
+                by_version.setdefault(version, []).extend(f"{name}:{p}" for name in failed)
         parity_checks: list[tuple[Any, Callable[[Any], bool], str]] = [
             (par.get("decision_match"), lambda v: v < g.min_decision_parity, "decision_parity"),
             (par.get("max_feature_psi"), lambda v: v >= g.max_feature_psi, "feature_psi"),
@@ -759,7 +1112,18 @@ class DryReporter:
             if value is not None and bad(value):
                 parity += 1
                 notes.append(note)
-        return {"operational": operational, "parity": parity, "notes": notes}
+        by_version = {v: sorted(f) for v, f in sorted(by_version.items()) if f}
+        notes += [f"revision_{name}" for fails in by_version.values() for name in fails]
+        return {"operational": operational, "parity": parity, "notes": notes, "revision_by_version": by_version}
+
+    def _alarms(self, doc: Mapping[str, Any]) -> list[str]:
+        """Diagnostics that ring without entering a gate or an anomaly: the raw ratio of revised minutes."""
+        limit = self.cfg.gate_ops.max_rest_revision_ratio
+        return [
+            f"rest_revision_ratio:{p}"
+            for p, b in doc["bars"].items()
+            if b.get("rest_revision_ratio") is not None and b["rest_revision_ratio"] > limit
+        ]
 
     # ------------------------------------------------------------------------------ the window
 
@@ -915,12 +1279,20 @@ def render_markdown(doc: Mapping[str, Any], ops_gate: Mapping[str, Any] | None, 
     lines.append(f"decision_match {_fmt(p['decision_match'])} (excluded_manual {p['excluded_manual']})")
     lines.append(f"max_feature_psi {_fmt(p['max_feature_psi'])} ({_fmt(p['worst_feature'])})")
     lines.append(f"state_match {_fmt(p['state_match'])}")
-    lines += ["", "## Bars", "", "| product | rest | flat | flat_unproven | lag_s_p99 | rest_revision_ratio |"]
-    lines += ["|---|---|---|---|---|---|"]
-    lines += [
-        f"| {k} | {_fmt(b['rest'])} | {_fmt(b['flat'])} | {_fmt(b['flat_unproven'])} | {_fmt(b['lag_s_p99'])} | "
-        f"{_fmt(b['rest_revision_ratio'])} |" for k, b in doc["bars"].items()
-    ]  # fmt: skip
+    lines += ["", "## Bars", "", "| product | rest | flat | flat_unproven | lag_s_p99 | rest_revision_ratio | R1 share "
+              "| R2 max | R3 flips | R4 appeared/disappeared |"]  # fmt: skip
+    lines += ["|---|---|---|---|---|---|---|---|---|---|"]
+    alarmed = {a.split(":", 1)[1] for a in doc.get("alarms", []) if a.startswith("rest_revision_ratio:")}
+    for k, b in doc["bars"].items():
+        imp = (b.get("revision_impact") or {}).get(CHAMPION) or {}
+        ratio = _fmt(b["rest_revision_ratio"]) + (" ALARM (diagnostic)" if k in alarmed else "")
+        r1 = _fmt(imp.get("share")) + (" (extended block)" if imp.get("block_kind") not in (None, "day") else "")
+        r4 = f"{_fmt(b.get('rest_revisions_appeared'))}/{_fmt(b.get('rest_revisions_disappeared'))}"
+        lines.append(
+            f"| {k} | {_fmt(b['rest'])} | {_fmt(b['flat'])} | {_fmt(b['flat_unproven'])} | {_fmt(b['lag_s_p99'])} | "
+            f"{ratio} | {r1} | {_fmt(imp.get('max_shift'))} | "
+            f"{_fmt(imp.get('flip_share')) if imp.get('r3') == 'measured' else _fmt(imp.get('r3'))} | {r4} |"
+        )
     c = doc["costs"]
     lines += ["", "## Costs (L4)", ""]
     lines.append(f"maker_fill_rate {_fmt(c['maker_fill_rate'])}, latency_ms_p75 {_fmt(c['latency_ms_p75'])}")
@@ -929,6 +1301,16 @@ def render_markdown(doc: Mapping[str, Any], ops_gate: Mapping[str, Any] | None, 
     lbl = doc["labels"]
     lines += ["", "## Labels", "", f"resolved_total {lbl['resolved_total']}, first resolution expected "
               f"{_fmt(lbl['first_resolution_expected'])}"]  # fmt: skip
+    adv = doc.get("rollback_advice") or {}
+    if adv:
+        lines += ["", "## Rollback advice (a recommendation, not an action)", ""]
+        lines.append(f"champion {_fmt(adv.get('version'))} since {_fmt(adv.get('since'))}: advice {adv['advice']}")
+        lines += [f"- trigger: {t}" for t in adv.get("triggers", [])]
+        eco = adv.get("economics") or {}
+        if eco:
+            lines.append(f"economics {_fmt(eco.get('status'))}, trades of the version {_fmt(eco.get('closed_trades'))}")
+        if adv["advice"] != "none":
+            lines.append(f"command (local, a human): `{adv['command']}`")
     for title, gate in (("G-DRY-OPS", ops_gate), ("G-DRY-ECON", econ)):
         if gate is None:
             continue
@@ -938,6 +1320,13 @@ def render_markdown(doc: Mapping[str, Any], ops_gate: Mapping[str, Any] | None, 
             f"| {c_['name']} | {c_['status']} | {_fmt(c_['value'])} | {_fmt(c_['threshold'])} | {_fmt(c_['note'])} |"
             for c_ in gate["criteria"]
         ]  # fmt: skip
+        for dg in gate.get("diagnostics", []):
+            if "alarm" not in dg:  # a diagnostic with no threshold at all
+                lines.append(f"\ndiagnostic {dg['name']}: {_fmt(dg['value'])} (no threshold, not in the gate status)")
+                continue
+            state = "ALARM (diagnostic, not in the gate status)" if dg["alarm"] else "ok (diagnostic)"
+            shown = f"{_fmt(dg['value'])} against {_fmt(dg['alarm_threshold'])}"
+            lines.append(f"\ndiagnostic {dg['name']}: {shown}: {state}")
     return "\n".join(lines) + "\n"
 
 
@@ -958,6 +1347,8 @@ def build_reporter(config_path: str, replay_dir: str | None, expected_buy_rate: 
     return DryReporter(
         app.dry_run, paths, SqliteTradeSource(app.dry_run.db_path), JsonOpsSource(data / "reports" / "ops"),
         mode=app.execution.mode, expected_buy_rate=expected_buy_rate,
+        champion=RegistryChampionSource(Path(app.paths.models_dir) / "registry"),
+        max_fallback_ratio=app.risk.kill_switch.max_fallback_ratio_1h,
     )  # fmt: skip
 
 

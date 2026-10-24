@@ -137,12 +137,34 @@ async def test_random_entry_without_its_source_book_is_not_started(tmp_path: Pat
 
 
 async def test_the_untunable_gate_is_per_model_and_covers_the_random_book_of_that_model(tmp_path: Path) -> None:
-    cfg = cfg_with(tmp_path, "champion", "random_entry", "buy_and_hold")
+    books = (
+        BookConfig(name="champion", decider="registry:champion"),
+        BookConfig(name="random_entry", decider="random", match_frequency_of="champion", seed=1),  # no forced rate
+        BookConfig(name="buy_and_hold", decider="buy_and_hold"),
+    )
+    cfg = make_cfg(tmp_path, books=books)
     async with make_rig(tmp_path, cfg=cfg, champion=make_champion(untunable="untunable_ev"), upto=None) as rig:
         gate = rig.rt.gates
         assert gate.entry_blocked("champion") == "policy_untunable:untunable_ev"
         assert gate.entry_blocked("random_entry") == "policy_untunable:untunable_ev"  # same model, same verdict
         assert gate.entry_blocked("buy_and_hold") is None  # the benchmark has no model
+
+
+async def test_a_forced_rate_test_book_is_not_blocked_by_the_untunable_verdict_of_the_model(tmp_path: Path) -> None:
+    books = (
+        BookConfig(name="champion", decider="registry:champion"),
+        BookConfig(
+            name="random_entry", decider="random", match_frequency_of="champion", seed=1,
+            forced_buy_rate=0.5, forced_edge=0.95,
+        ),  # fmt: skip
+        BookConfig(name="benchmark", decider="random", match_frequency_of="champion", seed=2),
+    )
+    cfg = make_cfg(tmp_path, books=books)
+    async with make_rig(tmp_path, cfg=cfg, champion=make_champion(untunable="untunable_ev"), upto=None) as rig:
+        gate = rig.rt.gates
+        assert gate.entry_blocked("champion") == "policy_untunable:untunable_ev"
+        assert gate.entry_blocked("benchmark") == "policy_untunable:untunable_ev"  # a real benchmark follows its model
+        assert gate.entry_blocked("random_entry") is None  # the forced TEST book trades through the other gates only
 
 
 # ===================================================================================== 2. the books at work

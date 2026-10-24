@@ -66,6 +66,7 @@ __all__ = [
     "Span",
     "build_market",
     "decision_rows",
+    "equity_sharpe_and_drawdown",
     "run_backtest",
 ]
 
@@ -540,6 +541,15 @@ def _result(
     return BacktestResult(trades, eq, dict(sorted(skips.items())), metrics, open_at_end=unresolved)
 
 
+def equity_sharpe_and_drawdown(eq: pd.Series) -> tuple[float, float]:
+    """``(annualised Sharpe, max drawdown fraction)`` of a daily equity curve with at least 3 points: THE definition,
+    used by the backtest metrics and by the paired OOS comparison of rule L5 (``training.oos_compare``)."""
+    ret = eq.pct_change().dropna()
+    sd = float(ret.std(ddof=1))
+    sharpe = float(ret.mean() / sd * math.sqrt(365)) if sd > 0 else 0.0
+    return sharpe, float(((eq.cummax() - eq) / eq.cummax()).max())
+
+
 def _metrics(trades: pd.DataFrame, eq: pd.Series, cfg: BacktestConfig) -> dict[str, float]:
     out: dict[str, float] = {
         "n_trades": float(len(trades)),
@@ -554,10 +564,7 @@ def _metrics(trades: pd.DataFrame, eq: pd.Series, cfg: BacktestConfig) -> dict[s
         out["profit_factor"] = float(gain / loss) if loss > 0 else math.inf
         out["win_rate"] = float((trades["pnl_eur"] > 0).mean())
     if len(eq) > 2:
-        ret = eq.pct_change().dropna()
-        sd = float(ret.std(ddof=1))
-        out["sharpe"] = float(ret.mean() / sd * math.sqrt(365)) if sd > 0 else 0.0
-        out["max_dd_frac"] = float(((eq.cummax() - eq) / eq.cummax()).max())
+        out["sharpe"], out["max_dd_frac"] = equity_sharpe_and_drawdown(eq)
         years = max((eq.index[-1] - eq.index[0]).days / 365.25, 1 / 365.25)
         if len(trades):
             out["turnover_per_year"] = float(2 * trades["notional_eur"].sum() / float(eq.mean()) / years)

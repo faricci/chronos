@@ -49,7 +49,7 @@ from modules.decision.baseline import MARKET_FEATURES, BaselineDecider, Calibrat
 from modules.decision.policy import PolicyConfig
 from modules.decision.questions import build_questions
 from modules.risk.costs import CostModel, net_return
-from modules.risk.label_config import LoadedLabelConfig, load_label_config
+from modules.risk.label_config import LabelConfig, LoadedLabelConfig, load_label_config
 from training import feasibility as fz
 from training.backtest import (
     EVAL_DECISION_EVERY_MIN,
@@ -83,6 +83,13 @@ MIN_HOLDOUT_TRADES: Final = 5
 ECE_MAX: Final = 0.05
 G2_MIN_FOLDS: Final = 4
 EXIT_INCONCLUSIVE: Final = 5
+OOS_TRADES: Final = "oos_trades.jsonl"
+OOS_SPANS: Final = "oos_spans.json"
+OOS_SPANS_SCHEMA: Final = "chronos.oos_spans.v1"
+OOS_TRADE_FIELDS: Final = (
+    "product", "fold", "decision_ts", "fill_ts", "exit_ts", "exit_reason", "net_ret_bps", "pnl_eur", "notional_eur",
+    "neff_weight",
+)  # fmt: skip
 
 Status = Literal["GO", "INCONCLUSO", "NO-GO"]
 
@@ -108,15 +115,20 @@ def effective_trades(trades: pd.DataFrame, rho: float) -> float:
     Three products always trading together count ``3 / (1 + 2 rho)``; disjoint trades count one each. Overlaps of the
     same product (fold boundaries) are ignored.
     """
+    return float(sum(trade_weights(trades, rho).tolist()))
+
+
+def trade_weights(trades: pd.DataFrame, rho: float) -> np.ndarray:
+    """The E1 weight of every trade (input order): ``1 / (1 + rho * c_i)``; their sum is ``effective_trades``."""
     if trades.empty:
-        return 0.0
+        return np.empty(0, dtype=np.float64)
     products = sorted(set(trades["product"]))
     by_product: dict[str, tuple[np.ndarray, np.ndarray]] = {}
     for p in products:
         g = trades[trades["product"] == p].sort_values("fill_ts")
         starts, ends = _ns(g["fill_ts"]), _ns(g["exit_ts"])
         by_product[p] = (starts, np.maximum.accumulate(ends))
-    total = 0.0
+    out: list[float] = []
     for p, f, e in zip(trades["product"], trades["fill_ts"], trades["exit_ts"], strict=True):
         f_ns, e_ns = _utc_value(f), _utc_value(e)
         c = 0
@@ -126,8 +138,58 @@ def effective_trades(trades: pd.DataFrame, rho: float) -> float:
             k = int(np.searchsorted(starts, e_ns, side="left")) - 1  # last interval starting before this one ends
             if k >= 0 and run_max[k] > f_ns:
                 c += 1
-        total += 1.0 / (1.0 + rho * c)
-    return total
+        out.append(1.0 / (1.0 + rho * c))
+    return np.asarray(out, dtype=np.float64)
+
+
+@dataclass(frozen=True)
+class BlockGrid:
+    """The circle of a span cut into the blocks of the circular block bootstrap. ONE definition: E2
+    (``block_bootstrap``) and the paired comparison of rule L5 (``training.oos_compare``) draw and assign blocks
+    through it."""
+
+    span_ns: int
+    block_ns: int
+    n_blocks: int  # blocks drawn per replicate: ceil(span / block)
+    start_ns: int  # the circle starts here (naive UTC nanoseconds)
+
+
+def block_grid(span_start: pd.Timestamp, span_end: pd.Timestamp, block: pd.Timedelta) -> BlockGrid:
+    span_ns = max(int(_utc_value(span_end) - _utc_value(span_start)), 1)
+    block_ns = min(int(block.value), span_ns)
+    return BlockGrid(span_ns, block_ns, max(1, math.ceil(span_ns / block_ns)), _utc_value(span_start))
+
+
+def draw_block_starts(grid: BlockGrid, n_rep: int, rng: np.random.Generator) -> np.ndarray:
+    """Random block starts on the hourly grid of the span: shape ``(n_rep, n_blocks)``, nanoseconds on the circle."""
+    hour = 3_600_000_000_000
+    return np.asarray(rng.integers(0, max(grid.span_ns // hour, 1), size=(n_rep, grid.n_blocks)) * hour)
+
+
+@dataclass(frozen=True)
+class BlockedValues:
+    """Values placed on the circle of a ``BlockGrid`` (sorted by position, doubled for the wrap-around) with prefix
+    sums, so that the count and the sum inside any block are two lookups."""
+
+    xs2: np.ndarray
+    pv: np.ndarray
+    block_ns: int
+
+    @classmethod
+    def place(cls, grid: BlockGrid, ts: Any, values: np.ndarray) -> BlockedValues:
+        """``ts``: the instant that assigns each value to a block (E2: the fill of the trade)."""
+        x = (_ns(ts) - grid.start_ns) % grid.span_ns
+        order = np.argsort(x, kind="stable")
+        xs, vs = x[order], np.asarray(values, dtype=np.float64)[order]
+        xs2 = np.concatenate([xs, xs + grid.span_ns])
+        pv = np.concatenate([[0.0], np.cumsum(np.concatenate([vs, vs]))])
+        return cls(xs2, pv, grid.block_ns)
+
+    def window_sums(self, starts: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``(count, sum)`` of the values in the blocks ``[u, u + block)`` of every replicate (rows of ``starts``)."""
+        lo = np.searchsorted(self.xs2, starts, side="left")
+        hi = np.searchsorted(self.xs2, starts + self.block_ns, side="left")
+        return (hi - lo).sum(axis=1), (self.pv[hi] - self.pv[lo]).sum(axis=1)
 
 
 @dataclass(frozen=True)
@@ -151,24 +213,13 @@ def block_bootstrap(
     n = len(v)
     if n == 0:
         return Boot(math.nan, math.nan, math.nan, math.nan, math.nan, 0)
-    span_ns = max(int(_utc_value(span_end) - _utc_value(span_start)), 1)
-    hour = 3_600_000_000_000
-    x = (_ns(ts) - _utc_value(span_start)) % span_ns
-    order = np.argsort(x, kind="stable")
-    xs, vs = x[order], v[order]
-    xs2 = np.concatenate([xs, xs + span_ns])
-    pv = np.concatenate([[0.0], np.cumsum(np.concatenate([vs, vs]))])
-    block_ns = min(int(block.value), span_ns)
-    n_blocks = max(1, math.ceil(span_ns / block_ns))
+    grid = block_grid(span_start, span_end, block)
+    placed = BlockedValues.place(grid, ts, v)
     rng = np.random.default_rng(seed)
     means: list[np.ndarray] = []
     got = 0
     while got < n_rep:
-        u = rng.integers(0, max(span_ns // hour, 1), size=(n_rep, n_blocks)) * hour
-        lo = np.searchsorted(xs2, u, side="left")
-        hi = np.searchsorted(xs2, u + block_ns, side="left")
-        cnt = (hi - lo).sum(axis=1)
-        tot = (pv[hi] - pv[lo]).sum(axis=1)
+        cnt, tot = placed.window_sums(draw_block_starts(grid, n_rep, rng))
         ok = cnt > 0
         means.append(tot[ok] / cnt[ok])  # an empty replicate is redrawn
         got += int(ok.sum())
@@ -457,6 +508,58 @@ class Evaluation:
     ok_except_ge: bool = False
     status: Status = "NO-GO"
     exit_code: int = 1
+    oos_trades: pd.DataFrame = field(default_factory=pd.DataFrame)  # the concatenated OOS trades GE was computed on
+    oos_spans: dict[str, Any] = field(default_factory=dict)  # their test spans, for ``oos_spans.json``
+
+
+def oos_block(cfg: LabelConfig) -> pd.Timedelta:
+    """Length of the bootstrap blocks of E2 (and of the paired comparison of rule L5): ``ceil_days(T_in + F + H)``."""
+    return pd.Timedelta(days=math.ceil((cfg.entry_first_bar + cfg.entry_timeout_min - 1 + cfg.horizon_min) / 1440))
+
+
+def _iso(ts: Any) -> str:
+    t = pd.Timestamp(ts)
+    return (t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")).isoformat()
+
+
+def oos_spans_doc(spans: SpanSet, label: LoadedLabelConfig, rho: float) -> dict[str, Any]:
+    """Content of ``oos_spans.json``: the test span ``[start, end)`` of every fold, the ``label_config`` it was run
+    under and the bootstrap block length (days)."""
+    return {
+        "v": OOS_SPANS_SCHEMA, "label_config_sha256": label.sha256, "rho": rho, "block_days": oos_block(label.cfg).days,
+        "spans": [
+            {"fold": f.index, "start": _iso(f.test.entry_start), "end": _iso(f.test.entry_end)} for f in spans.folds
+        ],
+    }  # fmt: skip
+
+
+def oos_trade_rows(trades: pd.DataFrame, rho: float) -> list[dict[str, Any]]:
+    """The rows of ``oos_trades.jsonl``: one OOS trade per row with its E1 weight (``neff_weight``)."""
+    if trades.empty:
+        return []
+    weights = trade_weights(trades, rho)
+    rows: list[dict[str, Any]] = []
+    for i, rec in enumerate(trades.to_dict("records")):
+        row = {k: rec[k] for k in OOS_TRADE_FIELDS if k not in ("neff_weight",)}
+        for k in ("decision_ts", "fill_ts", "exit_ts"):
+            row[k] = _iso(row[k])
+        row["fold"] = int(row["fold"])
+        for k in ("net_ret_bps", "pnl_eur", "notional_eur"):
+            row[k] = float(row[k])
+        row["neff_weight"] = float(weights[i])
+        rows.append(row)
+    return rows
+
+
+def write_oos_artifacts(model_dir: Path, ev: Evaluation) -> None:
+    """``oos_trades.jsonl`` and ``oos_spans.json`` next to ``evaluation.json``: they become part of the immutable
+    registered version (the learner registers AFTER ``evaluate``) and feed the paired comparison of rule L5."""
+    rho = float(ev.oos_spans.get("rho", 1.0))
+    lines = [json.dumps(r, sort_keys=True, allow_nan=False) for r in oos_trade_rows(ev.oos_trades, rho)]
+    (model_dir / OOS_TRADES).write_text("".join(f"{ln}\n" for ln in lines), encoding="utf-8", newline="\n")
+    (model_dir / OOS_SPANS).write_text(
+        json.dumps(ev.oos_spans, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8", newline="\n"
+    )
 
 
 async def evaluate_model(
@@ -540,15 +643,15 @@ async def evaluate_model(
     others = g0["passed"] and gates["G1"]["passed"] and gates["G2"]["passed"]
     status: Status = ge["status"]
     code = 0 if others and status == "GO" else EXIT_INCONCLUSIVE if others and status == "INCONCLUSO" else 1
-    return Evaluation(gates, others, status, code)
+    rho = float(label.raw.get("feasibility", {}).get("rho_raw", 1.0))
+    return Evaluation(gates, others, status, code, trades, oos_spans_doc(spans, label, rho))
 
 
 def _ge(
     trades: pd.DataFrame, hold: pd.DataFrame, cand: Mapping[tuple[int, str], Candidates], label: LoadedLabelConfig,
     spans: SpanSet, g0_ok: bool, rho: float,
 ) -> dict[str, Any]:  # fmt: skip
-    cfg = label.cfg
-    block = pd.Timedelta(days=math.ceil((cfg.entry_first_bar + cfg.entry_timeout_min - 1 + cfg.horizon_min) / 1440))
+    block = oos_block(label.cfg)
     n = len(trades)
     out: dict[str, Any] = {"n_oos_trades": n, "n_holdout_trades": len(hold), "block_days": block.days}
     pnl_by_fold: dict[int, float] = {f.index: 0.0 for f in spans.folds}  # a fold without trades counts as 0.0
@@ -676,6 +779,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     report = render(ev, model_dir.name)
     print(report)
     (model_dir / "evaluation.md").write_text(report, encoding="utf-8", newline="\n")
+    write_oos_artifacts(model_dir, ev)  # BEFORE evaluation.json: its mtime is how the learner sees a fresh run
     (model_dir / "evaluation.json").write_text(
         json.dumps(ev.gates, indent=2, default=str), encoding="utf-8", newline="\n"
     )

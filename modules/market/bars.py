@@ -295,6 +295,40 @@ class BarService:
 # ---------------------------------------------------------------------- revisions (audit, read only)
 
 
+@dataclass(frozen=True)
+class RevisionSet:
+    """The minutes the exchange has revised since the store consumed them, by kind (spec 5.1.7, R1-R4)."""
+
+    value: pd.DataFrame  # index ts UTC, OHLCV columns RE-READ, minutes present on both sides with a different field
+    stored_value: pd.DataFrame  # the same minutes as the store holds them (diagnostic)
+    appeared: pd.DatetimeIndex  # candle in REST, no row in the store (the minute was published flat)
+    disappeared: pd.DatetimeIndex  # row in the store, no candle in REST
+
+
+def classify_revisions(stored: pd.DataFrame, fresh: pd.DataFrame, start: datetime, end: datetime) -> RevisionSet:
+    """Split the differences stored vs re-read candles over ``[start, end)``: value / appeared / disappeared.
+
+    ``stored`` MUST be the REAL rows of the store (the Parquet files, ``BarStore.read_month``), never the grid that
+    ``load_bars``/``fill_flat_bars`` rebuilds: flat minutes have no row in the store and no candle in REST, and on a
+    filled grid they would all look "disappeared". ``fresh`` is ``candles_to_frame`` output. Exact comparison: both
+    sides went through the same parsing. Nothing is modified.
+    """
+    lo, hi = pd.Timestamp(start), pd.Timestamp(end)
+    a = stored[(stored["ts"] >= lo) & (stored["ts"] < hi)].set_index("ts")
+    b = fresh[(fresh["ts"] >= lo) & (fresh["ts"] < hi)].set_index("ts")
+    a.index, b.index = pd.DatetimeIndex(a.index).as_unit("ns"), pd.DatetimeIndex(b.index).as_unit("ns")
+    both = a.index.intersection(b.index)
+    cols = list(OHLCV)
+    x, y = a.loc[both, cols], b.loc[both, cols]
+    changed = (x != y).any(axis=1).to_numpy()
+    return RevisionSet(
+        value=y[changed].astype(float),
+        stored_value=x[changed].astype(float),
+        appeared=pd.DatetimeIndex(b.index.difference(a.index)),
+        disappeared=pd.DatetimeIndex(a.index.difference(b.index)),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RevisionStats:
     product_id: str
@@ -302,6 +336,9 @@ class RevisionStats:
     revised: int
     ratio: float
     max_close_diff_bps: float
+    value_revised: int = 0
+    appeared: int = 0
+    disappeared: int = 0
 
 
 def rest_revisions(
@@ -309,18 +346,27 @@ def rest_revisions(
 ) -> RevisionStats:
     """How many stored minutes the exchange has revised since. Both frames are ``candles_to_frame`` output.
 
-    A minute is revised if it is present on one side only, or if any OHLCV field differs (exact comparison: both
-    sides went through the same parsing). The store is never modified.
+    A minute is revised if it is present on one side only, or if any OHLCV field differs (``classify_revisions``).
+    ``ratio`` is a DIAGNOSTIC since spec 2.11 (alarm above ``gate_ops.max_rest_revision_ratio``). The store is never
+    modified.
     """
     lo, hi = pd.Timestamp(start), pd.Timestamp(end)
-    a = stored[(stored["ts"] >= lo) & (stored["ts"] < hi)].set_index("ts")
-    b = fresh[(fresh["ts"] >= lo) & (fresh["ts"] < hi)].set_index("ts")
-    union, both = a.index.union(b.index), a.index.intersection(b.index)
-    revised = len(union) - len(both)  # present on one side only
+    n_stored = int(((stored["ts"] >= lo) & (stored["ts"] < hi)).sum())
+    n_fresh = int(((fresh["ts"] >= lo) & (fresh["ts"] < hi)).sum())
+    rev = classify_revisions(stored, fresh, start, end)
+    n_both = n_stored - len(rev.disappeared)
+    minutes = n_stored + n_fresh - n_both  # size of the union
+    revised = len(rev.value) + len(rev.appeared) + len(rev.disappeared)
     max_bps = 0.0
-    if len(both):
-        x, y = a.loc[both, list(OHLCV)], b.loc[both, list(OHLCV)]
-        revised += int((x != y).any(axis=1).sum())
-        max_bps = float(((y["close"] / x["close"] - 1).abs() * 1e4).max())
-    minutes = len(union)
-    return RevisionStats(product_id, minutes, revised, revised / minutes if minutes else 0.0, max_bps)
+    if len(rev.value):
+        max_bps = float(((rev.value["close"] / rev.stored_value["close"] - 1).abs() * 1e4).max())
+    return RevisionStats(
+        product_id,
+        minutes,
+        revised,
+        revised / minutes if minutes else 0.0,
+        max_bps,
+        len(rev.value),
+        len(rev.appeared),
+        len(rev.disappeared),
+    )

@@ -70,3 +70,4 @@ models/baseline/
 data/backtest_cache/
 
 docs/STATO.md
+data/external/

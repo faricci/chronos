@@ -314,7 +314,14 @@ class FallbackFees(_Section):
         return self
 
 
+FillMode = Literal["bar", "tick"]
+
+
 class FillModelConfig(_Section):
+    # "bar": entries, brackets and exits are resolved a closed 1m bar at a time (parity with the backtest, the mode
+    # proven so far). "tick": the entry stays bar-driven, the brackets and the protective stops of the virtual
+    # positions follow the trades and the order book of the WebSocket (BracketSimulator, spec sez. 5.1.2-5.1.3).
+    mode: FillMode = "bar"
     path: str = "models/registry/fill_model.json"
     latency_ms: float = Field(default=300, ge=0)
     queue_haircut: float = Field(default=0.25, ge=0, le=1)
@@ -328,13 +335,23 @@ class RecordingConfig(_Section):
     retention_days: int = Field(default=30, ge=1)
 
 
+class PromotionConfig(_Section):
+    """Rule L5 (spec 5.1.6). The minimum of trades and the drawdown limit have NO key here: they are read from
+    ``dry_run.gate_econ`` (``min_trades``, ``max_drawdown_frac``) so that L5 and G-DRY-ECON cannot diverge. The
+    bootstrap replicates and seed are the constants of GE (``training.evaluate``)."""
+
+    backtest_recent_days: int = Field(default=90, ge=1)
+    min_shadow_days: int = Field(default=14, ge=1)
+    superiority_quantile: float = Field(default=0.05, gt=0, lt=0.5)  # S1: quantile of D = PnL_ch - PnL_cp must be > 0
+
+
 class LearnerConfig(_Section):
     run_at_utc: str = Field(default="00:15", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     reload_at_utc: str = Field(default="00:30", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
     refit_day_of_month: int = Field(default=1, ge=1, le=28)
     min_n_eff_calibration: int = Field(default=300, ge=1)
     live_weight: float = Field(default=2.0, gt=0)
-    promotion: dict[str, int] = {"backtest_recent_days": 90, "min_shadow_days": 14}
+    promotion: PromotionConfig = PromotionConfig()
 
 
 class GateOpsConfig(_Section):
@@ -346,7 +363,19 @@ class GateOpsConfig(_Section):
     min_maker_fill_rate: float = Field(default=0.50, ge=0, le=1)
     max_spread_ratio_vs_labels: float = Field(default=2.0, gt=0)
     max_fee_floor_skip_ratio: float = Field(default=0.80, gt=0, le=1)
+    # Raw share of re-read minutes that changed: since spec 2.11 a DIAGNOSTIC with an alarm at this value, not a gate.
+    # The gate "Barre REST" is R1-R4 below (spec 5.1.7): impact of the revisions on states and decisions.
     max_rest_revision_ratio: float = Field(default=0.005, gt=0, le=1)
+    revision_shift_threshold: float = Field(default=0.01, gt=0, lt=1)  # R1: a state is shifted if m > this
+    max_revision_shift_share: float = Field(default=0.005, gt=0, le=1)  # R1: max share of shifted states
+    max_revision_shift: float = Field(default=0.02, gt=0, lt=1)  # R2: max shift of any state
+    max_revision_flip_share: float = Field(default=0.001, ge=0, le=1)  # R3: max share of actionability flips
+
+    @model_validator(mode="after")
+    def _shift_threshold_not_above_max(self) -> GateOpsConfig:
+        if self.revision_shift_threshold > self.max_revision_shift:
+            raise ValueError("revision_shift_threshold cannot exceed max_revision_shift")
+        return self
 
 
 class GateEconConfig(_Section):

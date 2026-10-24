@@ -17,6 +17,8 @@ from modules.decision.policy import (
     PolicyConfig,
     PolicyMismatchError,
     load_policy,
+    masked_buy_prob,
+    masked_sell_prob,
     regime_from_pctile,
     regimes_from_pctile,
 )
@@ -254,6 +256,25 @@ def test_masks_equal_resolve_on_random_answers() -> None:
         p = None if np.isnan(pct[i]) else float(pct[i])
         assert (policy.resolve(a, "FLAT", vol_pctile=p).action == "BUY") == bool(buy[i]), i
         assert (policy.resolve(a, "LONG", vol_pctile=p).action == "SELL") == bool(sell[i]), i
+
+
+def test_masked_probs_match_buy_and_sell_mask() -> None:
+    """``masked_buy_prob`` / ``masked_sell_prob`` are the numbers the masks compare with the thresholds."""
+    rng = np.random.default_rng(3)
+    raw = rng.dirichlet(np.array([0.4, 0.3, 1.0]), size=500)
+    raw[:3] = [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
+    policy = DecisionPolicy(POLICY)
+    buy = masked_buy_prob(raw)
+    sell = masked_sell_prob(raw)
+    np.testing.assert_allclose(buy[3:], raw[3:, 0] / (raw[3:, 0] + raw[3:, 2]))  # BUY / (BUY + HOLD)
+    np.testing.assert_allclose(sell[3:], raw[3:, 1] / (raw[3:, 1] + raw[3:, 2]))  # SELL / (SELL + HOLD)
+    assert buy[:3].tolist() == [0.0, 1.0, 0.0] and sell[:3].tolist() == [1.0, 0.0, 0.0]  # BUY+HOLD = 0 gives 0
+    sell_ok = policy.sell_mask(raw)
+    assert sell_ok.tolist() == ((sell >= POLICY.tau_sell) & (raw[:, 1] + raw[:, 2] > 0)).tolist()
+    full = np.full(len(raw), NORMAL)
+    cond = (buy >= POLICY.tau_buy) & (raw[:, 0] + raw[:, 2] > 0)
+    assert (policy.buy_mask(raw, full) & ~cond).sum() == 0  # the BUY mask never accepts below the masked probability
+    assert sell_ok.any() and cond.any()
 
 
 def test_masks_handle_degenerate_probability_rows() -> None:

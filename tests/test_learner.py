@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +27,6 @@ from modules.dryrun.learner import (
     population_stability_index,
 )
 from modules.dryrun.registry import (
-    BacktestEvidence,
     FilesystemModelRegistry,
     RegistryError,
     artifacts_from_dir,
@@ -44,8 +42,6 @@ from tests.label_fixtures import loaded_label
 REFIT_DAY = date(2026, 11, 1)  # day 1 of the month = refit_day_of_month
 NOW = datetime(2026, 11, 1, 0, 15, tzinfo=UTC)
 LABEL = loaded_label({"BTC-EUR": 3.0, "SOL-EUR": 4.5})
-GOOD = BacktestEvidence(90.0, Decimal("10"), 2.0, 0.01)
-WORSE = BacktestEvidence(90.0, Decimal("1"), 0.5, 0.02)
 
 
 # ------------------------------------------------------------------------------------------- fixtures
@@ -68,8 +64,13 @@ def make_version(root: Path, name: str, *, n_eff: float = 673.0, edge_ok: bool =
 class FakePipeline:
     """Same four calls as ``TrainingPipeline`` without training anything."""
 
-    def __init__(self, root: Path, *, n_eff: float = 673.0, edge_ok: bool = True, untunable: bool = False) -> None:
+    def __init__(
+        self, root: Path, *, n_eff: float = 673.0, edge_ok: bool = True, untunable: bool = False,
+        live_block: dict[str, Any] | None = None,
+    ) -> None:  # fmt: skip
         self.root, self.n_eff, self.edge_ok, self.untunable = root, n_eff, edge_ok, untunable
+        self.live_block = live_block  # what the "dataset manifest" says about the live rows
+        self.live_seen: list[Any] = []  # the `live` argument of every build_dataset call
         self.calls: list[str] = []
         self.fail_on: str | None = None
         self.versions = 0
@@ -79,11 +80,13 @@ class FakePipeline:
         if self.fail_on == what:
             raise RuntimeError(f"{what} exploded")
 
-    def build_dataset(self) -> Path:
+    def build_dataset(self, live: Any = None) -> Path:
         self._maybe_fail("build")
+        self.live_seen.append(live)
         run = self.root / "datasets" / "run1"
         run.mkdir(parents=True, exist_ok=True)
-        (run / "manifest.json").write_text("{}", encoding="utf-8")
+        manifest = {} if self.live_block is None else {"live": self.live_block}
+        (run / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         return run
 
     def train(self, dataset: Path) -> Path:
@@ -101,21 +104,6 @@ class FakePipeline:
     def evaluate(self, model: Path, dataset: Path) -> dict[str, Any]:
         self._maybe_fail("evaluate")
         return {"exit_code": 1, "status": "NO-GO", "gates": {"G0": True, "GE": "NO-GO"}}
-
-
-class Evidence:
-    """Backtester stub: ``by_version[model dir name]``; counts the calls."""
-
-    def __init__(self, by_version: dict[str, BacktestEvidence], default: BacktestEvidence = WORSE) -> None:
-        self.by_version, self.default, self.calls = by_version, default, 0
-
-    def __call__(self, model_dir: Path, days: int, cutoff: datetime) -> BacktestEvidence:
-        self.calls += 1
-        return self.by_version.get(model_dir.name, self.default)
-
-
-def shadow_ok(version: str, cutoff: datetime) -> ShadowRecord:
-    return ShadowRecord(20.0, 0, 0)
 
 
 class Rig:
@@ -192,38 +180,8 @@ def test_a_bug_that_asks_for_a_champion_promotion_cannot_move_it(rig: Rig, monke
     assert rig.registry.get("champion").version == rig.champion
 
 
-def test_l5_reports_the_verdict_and_never_promotes(rig: Rig) -> None:
-    ev = Evidence({"baseline-lgbm@2026-11-01.1": GOOD, rig.champion: WORSE})
-    doc = rig.learner(backtester=ev, shadow=shadow_ok).run(REFIT_DAY)
-    l5 = doc["steps"]["L5"]
-    assert l5["outcome"] == "ok" and l5["details"]["verdict"] == "promote"
-    assert l5["details"]["promoted"] is False
-    assert rig.registry.get("champion").version == rig.champion
-
-
-@pytest.mark.parametrize(
-    ("challenger", "shadow", "verdict", "reason"),
-    [
-        (WORSE, ShadowRecord(20.0, 0, 0), "reject", "net_pnl_not_better"),
-        (GOOD, ShadowRecord(20.0, 1, 0), "reject", "operational_anomalies"),
-        (GOOD, ShadowRecord(3.0, 0, 0), "insufficient", "shadow_days_short"),
-    ],
-)
-def test_l5_verdicts_follow_the_registry_rule(
-    rig: Rig, challenger: BacktestEvidence, shadow: ShadowRecord, verdict: str, reason: str
-) -> None:
-    ev = Evidence({"baseline-lgbm@2026-11-01.1": challenger, rig.champion: WORSE})
-    doc = rig.learner(backtester=ev, shadow=lambda v, c: shadow).run(REFIT_DAY)
-    assert doc["steps"]["L5"]["details"]["verdict"] == verdict
-    assert reason in doc["steps"]["L5"]["details"]["reasons"]
-    assert rig.registry.get("champion").version == rig.champion
-
-
-def test_l5_without_a_champion_is_skipped(tmp_path: Path) -> None:
-    rig = Rig(tmp_path)
-    (tmp_path / "registry" / "aliases.json").unlink()
-    doc = rig.learner(backtester=Evidence({}), shadow=shadow_ok).run(REFIT_DAY)
-    assert doc["steps"]["L5"]["outcome"] == "skipped: no_champion"
+# The tests of rule L5 inside the learner (challenger of before the night, common window, gates, OOS, end to end)
+# are in tests/test_learner_promotion.py.
 
 
 # ------------------------------------------------------------------------------------- calendar and gates
@@ -246,7 +204,8 @@ def test_too_few_effective_samples_skip_the_calibration_and_everything_after(tmp
     doc = rig.learner().run(REFIT_DAY)
     o = outcomes(doc)
     assert o["L3"] == "ok" and o["L1"] == "skipped: insufficient_samples"
-    assert o["L2"] == "skipped: upstream_skipped" and o["L5"] == "skipped: upstream_skipped"
+    assert o["L2"] == "skipped: upstream_skipped"
+    assert o["L5"] == "skipped: no_evidence_source"  # L5 does not wait for L3/L1/L2 (tests/test_learner_promotion.py)
     assert doc["steps"]["L1"]["details"]["n_eff_min"] == 300
     assert rig.registry.versions() == [rig.champion]
     assert "tune" not in rig.pipeline.calls
@@ -277,7 +236,8 @@ def test_a_failing_step_is_recorded_and_the_champion_stays(rig: Rig) -> None:
     doc = rig.learner().run(REFIT_DAY)
     o = outcomes(doc)
     assert o["L3"] == "failed" and "train exploded" in doc["steps"]["L3"]["message"]
-    assert o["L1"] == o["L2"] == o["L5"] == "skipped: upstream_failed"
+    assert o["L1"] == o["L2"] == "skipped: upstream_failed"
+    assert o["L5"] == "skipped: no_evidence_source"  # L5 judges the challenger of before the night: independent
     assert doc["champion_after"] == rig.champion and doc["challenger_after"] is None
     assert rig.registry.versions() == [rig.champion]
 
@@ -295,7 +255,7 @@ def test_a_failing_step_does_not_stop_the_independent_ones(rig: Rig) -> None:
 
 def test_a_system_exit_inside_a_step_is_a_failure_not_an_exit(rig: Rig) -> None:
     class Exits(FakePipeline):
-        def build_dataset(self) -> Path:
+        def build_dataset(self, live: Any = None) -> Path:
             raise SystemExit(2)
 
     rig.pipeline = Exits(rig.tmp / "work")
@@ -405,10 +365,51 @@ def test_a_label_that_ends_exactly_at_the_cutoff_counts(rig: Rig) -> None:
     assert (info["used"], info["excluded_future"]) == (1, 1)
 
 
-def test_the_live_weight_is_declared_not_applied(rig: Rig) -> None:
+def test_without_a_live_labels_folder_the_dataset_is_built_without_live_input(rig: Rig) -> None:
     rig.learner().run(REFIT_DAY)
     d = rig.doc()["steps"]["L3"]["details"]
-    assert d["live_weight"] == 2.0 and d["live_weight_applied"] is False
+    assert rig.pipeline.live_seen == [None]
+    assert d["live_weight"] == 2.0 and d["live_weight_applied"] is False and d["live_dataset"] is None
+
+
+def test_the_live_labels_folder_weight_and_cutoff_reach_the_dataset_builder(rig: Rig) -> None:
+    write_labels(rig, [label_row("2026-10-10T10:00:00Z")])
+    rig.learner().run(REFIT_DAY)
+    (live,) = rig.pipeline.live_seen
+    assert live.labels_dir == rig.paths.live_labels_dir and live.weight == 2.0
+    assert live.cutoff == datetime(2026, 11, 1, tzinfo=UTC)  # the UTC midnight of the run date
+
+
+def test_an_empty_live_labels_folder_is_not_passed_on(rig: Rig) -> None:
+    rig.paths.live_labels_dir.mkdir(parents=True)
+    rig.learner().run(REFIT_DAY)
+    assert rig.pipeline.live_seen == [None]
+
+
+def test_the_configured_live_weight_is_the_one_passed_on(rig: Rig) -> None:
+    write_labels(rig, [label_row("2026-10-10T10:00:00Z")])
+    rig.learner(cfg=LearnerConfig(live_weight=3.5)).run(REFIT_DAY)
+    assert rig.pipeline.live_seen[0].weight == 3.5
+    assert rig.doc()["steps"]["L3"]["details"]["live_weight"] == 3.5
+
+
+def test_the_weight_is_applied_only_when_live_rows_are_in_the_dataset(tmp_path: Path) -> None:
+    block = {"rows": 120, "weight": 2.0, "rows_in_train": {"final": 120}, "excluded": {"holdout_period": 3}}
+    rig = Rig(tmp_path, pipeline_kw={"live_block": block})
+    write_labels(rig, [label_row("2026-10-10T10:00:00Z")])
+    rig.learner().run(REFIT_DAY)
+    d = rig.doc()["steps"]["L3"]["details"]
+    assert d["live_weight_applied"] is True and d["live_dataset"] == block
+    assert rig.registry.get("challenger").manifest["live_dataset"] == block  # the registry says what shaped the model
+
+
+def test_live_rows_that_were_all_excluded_do_not_count_as_applied(tmp_path: Path) -> None:
+    block = {"rows": 0, "weight": 2.0, "rows_in_train": {}, "excluded": {"holdout_period": 40}}
+    rig = Rig(tmp_path, pipeline_kw={"live_block": block})
+    write_labels(rig, [label_row("2026-10-10T10:00:00Z")])
+    rig.learner().run(REFIT_DAY)
+    d = rig.doc()["steps"]["L3"]["details"]
+    assert d["live_weight_applied"] is False and d["live_dataset"]["excluded"] == {"holdout_period": 40}
 
 
 def store_with_bars(root: Path, last: datetime) -> None:
@@ -555,6 +556,275 @@ def test_l0_never_modifies_the_store(tmp_path: Path) -> None:
     assert {p: p.read_bytes() for p in root.rglob("*.parquet")} == before
 
 
+class SteepVwap:
+    """A model that is steep in ``dist_vwap_1d_bps``: it moves with the revised closes (R1 and R2 must fail)."""
+
+    def answers_batch(self, x: np.ndarray) -> Any:
+        from modules.decision.baseline import AnswerArrays
+
+        vwap = np.nan_to_num(x[:, FLAT_COLUMNS.index("dist_vwap_1d_bps")], nan=0.0)
+        p_edge = 1 / (1 + np.exp(-vwap / 10.0))
+        return AnswerArrays(np.tile([0.2, 0.1, 0.7], (len(x), 1)), p_edge, np.zeros((len(x), 5)))
+
+
+class FlatAnswers:
+    """A model that does not read the state: nothing can shift (R1 and R2 pass)."""
+
+    def answers_batch(self, x: np.ndarray) -> Any:
+        from modules.decision.baseline import AnswerArrays
+
+        return AnswerArrays(np.tile([0.2, 0.1, 0.7], (len(x), 1)), np.full(len(x), 0.4), np.zeros((len(x), 5)))
+
+
+class Loader:
+    """``policy_version -> (decider, policy)`` as the learner is given it; remembers what was asked."""
+
+    def __init__(self, deciders: dict[str, Any]) -> None:
+        self.deciders, self.asked = deciders, []  # type: ignore[var-annotated]
+
+    def __call__(self, version: str) -> tuple[Any, Any]:
+        self.asked.append(version)
+        return self.deciders[version], None  # policy None: untunable, R3 not measurable
+
+
+def decisions_file(rig: Rig, day: str, books: dict[str, list[str]]) -> None:
+    rig.paths.decisions_dir.mkdir(parents=True, exist_ok=True)
+    rows = [
+        {"decision_id": f"{b}-{v}", "ts_bar_close": f"{day}T10:00:00Z", "book": b, "product": "SOL-EUR",
+         "policy": {"policy_version": v, "final": "HOLD"}}
+        for b, versions in books.items()
+        for v in versions
+    ]  # fmt: skip
+    (rig.paths.decisions_dir / f"{day}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def impact_rig(tmp_path: Path, deciders: dict[str, Any], books: dict[str, list[str]], **kw: Any) -> tuple[Rig, Loader]:
+    """Two days of SOL bars; REST revises 10 closes a day by 50 bps. The first run audits the first day (its
+    revisions file), the second run audits the second one and measures the impact."""
+    rig = Rig(tmp_path)
+    root = day_store(tmp_path)[0]
+    rig.paths = LearnerPaths(**{**rig.paths.__dict__, "bars_root": root})
+    loader = Loader(deciders)
+    rig.kw.update(candle_source=Perturbed(root, changed=True), deciders=loader, **kw)
+    decisions_file(rig, "2024-01-02", books)
+    rig.learner().run(date(2024, 1, 2))  # audits 2024-01-01: no decisions that day, the revisions file is written
+    return rig, loader
+
+
+def l0_impact(rig: Rig) -> dict[str, Any]:
+    doc = rig.learner().run(date(2024, 1, 3))  # audits 2024-01-02
+    details: dict[str, Any] = doc["steps"]["L0"]["details"]["revision_impact"]
+    return details
+
+
+def test_l0_persists_revisions_file(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    root = day_store(tmp_path)[0]
+    rig.paths = LearnerPaths(**{**rig.paths.__dict__, "bars_root": root})
+    before = {p: p.read_bytes() for p in root.rglob("*.parquet")}
+    rig.learner(candle_source=Perturbed(root, changed=True, dropped=True)).run(date(2024, 1, 2))
+    path = rig.paths.reports_dir / "revisions" / "2024-01-01.parquet"
+    table = pd.read_parquet(path)
+    assert list(table.columns) == ["product", "ts", "kind", "open", "high", "low", "close", "volume", "stored_close",
+                                   "stored_volume"]  # fmt: skip
+    assert table["kind"].value_counts().to_dict() == {"value": 10, "disappeared": 5}
+    value = table[table["kind"] == "value"]
+    assert ((value["close"] - value["stored_close"]).round(6) == 0.5).all()  # the RE-READ close next to the stored one
+    gone = table[table["kind"] == "disappeared"]
+    assert gone["close"].isna().all() and gone["stored_close"].notna().all()
+    assert not list((rig.paths.reports_dir / "revisions").glob("*.tmp"))  # atomic
+    assert {p: p.read_bytes() for p in root.rglob("*.parquet")} == before  # the store is never written
+    details = rig.doc(date(2024, 1, 2))["steps"]["L0"]["details"]["rest_revisions"]
+    assert details["products"]["SOL-EUR"]["value_revised"] == 10 and details["products"]["SOL-EUR"]["disappeared"] == 5
+    assert details["products"]["SOL-EUR"]["appeared"] == 0 and details["revisions_file"] == "2024-01-01.parquet"
+    clean = Rig(tmp_path / "clean")
+    clean.paths = LearnerPaths(**{**clean.paths.__dict__, "bars_root": day_store(tmp_path / "clean")[0]})
+    clean.learner(candle_source=Perturbed(clean.paths.bars_root)).run(date(2024, 1, 2))
+    assert len(pd.read_parquet(clean.paths.reports_dir / "revisions" / "2024-01-01.parquet")) == 0  # day audited, none
+
+
+def test_l0_revised_world_applies_all_known_revisions(tmp_path: Path) -> None:
+    """The revised world of day D carries the revisions found by the audits of D and of the days BEFORE it (the daily
+    tokens read them too) and nothing from the days after."""
+    rig, _ = impact_rig(tmp_path, {"m@1": SteepVwap()}, {"champion": ["m@1"]})
+    from modules.dryrun.revision_impact import write_revisions
+
+    later = pd.read_parquet(rig.paths.reports_dir / "revisions" / "2024-01-01.parquet").head(1)
+    write_revisions(rig.paths.reports_dir / "revisions" / "2024-01-09.parquet", [later])  # an audit of the future
+    d = l0_impact(rig)
+    assert d["revisions_applied"] == 20 and d["audited_days"] == ["2024-01-01", "2024-01-02"]
+    assert "2024-01-01" not in d["days_without_audit"] and "2023-12-31" in d["days_without_audit"]
+    day = d["products"]["SOL-EUR"]["books"]["champion"][0]
+    assert day["states"] == 1440 and day["token_diff_by_column"]["dist_vwap_1d_bps"] > 0
+    assert d["products"]["SOL-EUR"]["verdict"]["champion"]["R1"] == "fail"  # a steep model moves with 20 revisions
+
+
+def test_l0_impact_uses_version_from_decision_records(tmp_path: Path) -> None:
+    rig, loader = impact_rig(
+        tmp_path, {"m@1": FlatAnswers(), "m@2": SteepVwap()}, {"champion": ["m@1"], "challenger": ["m@2"]}
+    )
+    d = l0_impact(rig)
+    assert sorted(set(loader.asked)) == ["m@1", "m@2"]  # the version of the DecisionRecords, not an alias
+    books = d["products"]["SOL-EUR"]["books"]
+    assert [e["version"] for e in books["champion"]] == ["m@1"]
+    assert [e["version"] for e in books["challenger"]] == ["m@2"]
+    verdict = d["products"]["SOL-EUR"]["verdict"]
+    assert verdict["champion"] == {"R1": "pass", "R2": "pass", "R3": "unmeasured"}  # untunable policy: no flips
+    assert verdict["challenger"]["R1"] == "fail"
+    assert books["champion"][0]["r3"] == "policy_untunable" and books["champion"][0]["flips"] is None
+
+
+def test_l0_impact_two_versions_in_one_day_takes_worst(tmp_path: Path) -> None:
+    rig, _ = impact_rig(tmp_path, {"m@0": FlatAnswers(), "m@1": SteepVwap()}, {"champion": ["m@0", "m@1"]})
+    d = l0_impact(rig)
+    entries = d["products"]["SOL-EUR"]["books"]["champion"]
+    assert [e["version"] for e in entries] == ["m@0", "m@1"] and entries[0]["max_shift"] == 0.0
+    assert entries[1]["max_shift"] > 0.02
+    assert d["products"]["SOL-EUR"]["verdict"]["champion"]["R2"] == "fail"  # the worst version decides
+    # and the report charges R1/R2 to the version that failed (see tests/test_report.py)
+
+
+def cut_store(tmp_path: Path, days: int, keep: Any, drop: Any = None) -> Path:
+    """SOL bars of ``days`` synthetic days, every minute a row (as ``day_store``), keeping the rows with ``keep(ts)``
+    and dropping those with ``drop(ts)`` (minutes without trades have no row in the real store)."""
+    root = tmp_path / "bars"
+    bars = synthetic_bars(days=days, seed=3, zero_volume_day=None, constant_days=None)
+    df = bars.rename_axis("ts").reset_index()
+    df["ts"] = df["ts"].astype("datetime64[ns, UTC]")
+    mask = df["ts"].map(keep)
+    if drop is not None:
+        mask &= ~df["ts"].map(drop)
+    BarStore(root).write("SOL-EUR", df[mask.astype(bool)])
+    return root
+
+
+class Reclose:
+    """REST seen through the store, with the close of ONE minute revised."""
+
+    def __init__(self, root: Path, minute: datetime, delta: float = 0.5) -> None:
+        self.inner, self.minute, self.delta = StoreCandleSource(root), minute, delta
+
+    def fetch(self, product_id: str, start_s: int, end_s: int) -> list[dict[str, Any]]:
+        out = self.inner.fetch(product_id, start_s, end_s)
+        for r in out:
+            if int(r["start"]) == int(self.minute.timestamp()):
+                r["close"] = repr(float(r["close"]) + self.delta)
+        return out
+
+
+def l0_run(tmp_path: Path, root: Path, source: Any, day: date, books: dict[str, list[str]], vwap: bool = True) -> Any:
+    rig = Rig(tmp_path)
+    rig.paths = LearnerPaths(**{**rig.paths.__dict__, "bars_root": root})
+    loader = Loader({"m@1": SteepVwap() if vwap else FlatAnswers()})
+    rig.kw.update(candle_source=source, deciders=loader)
+    decisions_file(rig, (day - timedelta(days=1)).isoformat(), books)
+    doc = rig.learner().run(day)
+    return doc["steps"]["L0"]["details"]["revision_impact"], loader
+
+
+def test_l0_full_day_measures_one_day_and_no_helper(tmp_path: Path) -> None:
+    root = cut_store(tmp_path, 3, lambda ts: True)
+    d, _ = l0_run(tmp_path, root, Perturbed(root, changed=True), date(2024, 1, 3), {"champion": ["m@1"]})
+    sol = d["products"]["SOL-EUR"]
+    assert [e["states"] for e in sol["books"]["champion"]] == [1440] and sol["helper_days"]["champion"] == []
+    assert [b["kind"] for b in sol["blocks"]["champion"]] == ["day"] and sol["blocks"]["champion"][0]["states"] == 1440
+    assert d["thresholds"]["block_states"] == 1440 and sol["verdict"]["champion"]["R1"] in ("pass", "fail")
+
+
+def test_l0_partial_day_extends_into_previous_day_same_version(tmp_path: Path) -> None:
+    """The store stops at noon of the audited day: 720 states. The block of R1/R3 extends back over the day before,
+    measured with the SAME version on the same worlds; that day is an auxiliary one and is never judged."""
+    root = cut_store(tmp_path, 3, lambda ts: ts < pd.Timestamp("2024-01-03 12:00", tz="UTC"))
+    d, loader = l0_run(tmp_path, root, Perturbed(root, changed=True), date(2024, 1, 4), {"champion": ["m@1"]})
+    sol = d["products"]["SOL-EUR"]
+    (judged,) = sol["books"]["champion"]
+    (aux,) = sol["helper_days"]["champion"]
+    assert judged["day"] == "2024-01-03" and judged["states"] == 721  # t 00:00 .. 12:00
+    assert aux["day"] == "2024-01-02" and aux["states"] == 1440 and aux["version"] == judged["version"] == "m@1"
+    (block,) = sol["blocks"]["champion"]
+    assert block["kind"] == "extended_back" and block["states"] == 1440 and block["day"] == "2024-01-03"
+    assert block["end"] == judged["last_at"] and block["shifted"] >= judged["shifted"]
+    assert sorted(set(loader.asked)) == ["m@1"]  # one load, the same version for the helper day
+    # R2 is judged on the audited day alone: the auxiliary day cannot fail it
+    assert sol["verdict"]["champion"]["R2"] == ("pass" if judged["max_shift"] <= 0.02 else "fail")
+
+
+def test_l0_trailing_flat_minutes_are_states(tmp_path: Path) -> None:
+    """K16: the last trade of D-1 is at 23:40 and the store goes on after midnight. The minutes 23:41-23:58 are flat,
+    proven by the later row; the engine consumed them, so they are states of D-1: 1440 states, and with the close
+    of 23:40 revised they carry the re-read close and are measured."""
+    last = pd.Timestamp("2024-01-02 23:40", tz="UTC")
+    gap_end = pd.Timestamp("2024-01-03 00:05", tz="UTC")
+    root = cut_store(tmp_path, 3, lambda ts: True, drop=lambda ts: last < ts < gap_end)
+    d, _ = l0_run(tmp_path, root, Reclose(root, last.to_pydatetime()), date(2024, 1, 3), {"champion": ["m@1"]})
+    sol = d["products"]["SOL-EUR"]
+    (day,) = sol["books"]["champion"]
+    assert day["states"] == 1440 and sol["helper_days"]["champion"] == []
+    assert [b["kind"] for b in sol["blocks"]["champion"]] == ["day"]
+    # the bars 23:41-23:58 close at 23:42-23:59: flat in S, they carry the re-read close of 23:40 in F
+    assert any(x["t"] >= "2024-01-02T23:42:00Z" for x in day["shifted_states"])
+    assert day["last_at"] == "2024-01-02T23:59:00Z" and day["first_at"] == "2024-01-02T00:00:00Z"
+
+
+def test_l0_store_stopped_before_midnight_keeps_partial_day(tmp_path: Path) -> None:
+    """K16, negative case: no row at or after the end of the day, so the trailing minutes are NOT proven flat: the day
+    stays partial (1422 states) and its block extends back over the day before."""
+    last = pd.Timestamp("2024-01-02 23:40", tz="UTC")
+    root = cut_store(tmp_path, 3, lambda ts: ts <= last)
+    d, _ = l0_run(tmp_path, root, Perturbed(root, changed=True), date(2024, 1, 3), {"champion": ["m@1"]})
+    sol = d["products"]["SOL-EUR"]
+    (day,) = sol["books"]["champion"]
+    assert day["states"] == 1422 and len(sol["helper_days"]["champion"]) == 1  # t 00:00 .. 23:41
+    assert [b["kind"] for b in sol["blocks"]["champion"]] == ["extended_back"]
+
+
+def test_l0_blocks_in_document(tmp_path: Path) -> None:
+    root = cut_store(tmp_path, 3, lambda ts: True)
+    books = {"champion": ["m@1"], "challenger": ["m@1"]}
+    d, _ = l0_run(tmp_path, root, Perturbed(root, changed=True), date(2024, 1, 3), books)
+    sol = d["products"]["SOL-EUR"]
+    assert set(sol) == {"books", "blocks", "helper_days", "verdict"}
+    assert set(sol["blocks"]) == set(sol["verdict"]) == {"champion", "challenger"}
+    (block,) = sol["blocks"]["champion"]
+    assert {"start", "end", "states", "kind", "shifted", "share", "flips", "flip_share", "r3", "revisions",
+            "max_cluster", "version", "day"} <= set(block)  # fmt: skip
+    (day,) = sol["books"]["champion"]
+    assert len(day["shifted_states"]) == day["shifted"] and day["first_at"] == "2024-01-02T00:00:00Z"
+    assert all(x["origin"] is not None for x in day["shifted_states"])  # revisions of the day explain them
+    assert day["top_shifts"] == sorted(day["top_shifts"], key=lambda x: (-x["m"], x["t"]))[: len(day["top_shifts"])]
+    assert d["errors"] == {}
+
+
+def test_l0_long_states_come_from_the_dry_ledger(tmp_path: Path) -> None:
+    db = tmp_path / "ledger.db"
+    con = sqlite3.connect(db)
+    con.executescript(LEDGER_SCHEMA)
+    con.execute(
+        "INSERT INTO closed_trades (trade_id, book, product_id, entry_decision_id, entry_avg_price, entry_at, tp, sl, "
+        "k_tp, k_sl, exit_reason, exit_at, net_quote, payload) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("t1", "champion", "SOL-EUR", "d1", "100", "2024-01-02T12:00:00+00:00", "106", "97", 3.0, 1.5, "TP",
+         "2024-01-02T14:00:00+00:00", "1", "{}"),
+    )  # fmt: skip
+    con.commit()
+    con.close()
+    rig, _ = impact_rig(tmp_path, {"m@1": SteepVwap()}, {"champion": ["m@1"]}, ledger_db=db)
+    day = l0_impact(rig)["products"]["SOL-EUR"]["books"]["champion"][0]
+    assert day["long_states"] == 120 and day["flat_states"] == 1320 and day["p99_ds"] is not None
+
+
+def test_l0_impact_is_skipped_without_decisions_or_deciders(tmp_path: Path) -> None:
+    rig = Rig(tmp_path)
+    root = day_store(tmp_path)[0]
+    rig.paths = LearnerPaths(**{**rig.paths.__dict__, "bars_root": root})
+    rig.kw.update(candle_source=Perturbed(root, changed=True))
+    first = rig.learner(deciders=Loader({"m@1": FlatAnswers()})).run(date(2024, 1, 2))
+    assert first["steps"]["L0"]["details"]["revision_impact"] == {"skipped": "no_decisions"}
+    decisions_file(rig, "2024-01-02", {"champion": ["m@1"]})
+    none = rig.learner().run(date(2024, 1, 3))  # no loader given
+    assert none["steps"]["L0"]["details"]["revision_impact"] == {"skipped": "no_deciders"}
+    assert none["steps"]["L0"]["details"]["rest_revisions"]["products"]["SOL-EUR"]["value_revised"] == 10
+
+
 def test_l0_with_nothing_to_audit_is_skipped(rig: Rig) -> None:
     assert rig.learner().run(date(2026, 11, 2))["steps"]["L0"]["outcome"] == "skipped: insufficient_samples"
 
@@ -695,6 +965,26 @@ def test_shadow_evidence_counts_the_days_of_the_version_in_the_challenger_book(t
     assert got == ShadowRecord(2.0, 1, 2)
 
 
+def test_shadow_evidence_counts_only_own_version(tmp_path: Path) -> None:
+    """R1-R3 of the revisions failed by the CHAMPION's version are not an anomaly of the challenger, and vice versa
+    (``anomalies.revision_by_version``); R4 and the other anomalies are global."""
+    dec, rep = tmp_path / "decisions", tmp_path / "dry"
+    dec.mkdir()
+    rep.mkdir()
+    line = json.dumps({"book": "challenger", "policy": {"policy_version": "v2"}}) + "\n"
+    (dec / "2026-10-20.jsonl").write_text(line, encoding="utf-8")
+    by_version = {"v1": ["R1:BTC-EUR", "R2:BTC-EUR"], "v2": ["R3:SOL-EUR"]}
+    block = {"operational": 1, "parity": 1, "revision_by_version": by_version}
+    (rep / "2026-10-20.json").write_text(json.dumps({"anomalies": block}), encoding="utf-8")
+    cutoff = datetime(2026, 11, 1, tzinfo=UTC)
+    assert ReportShadowEvidence(dec, rep)("v2", cutoff) == ShadowRecord(1.0, 1, 1 + 1)  # its own R3, not the 2 of v1
+    (dec / "2026-10-20.jsonl").write_text(line.replace("v2", "v3"), encoding="utf-8")
+    assert ReportShadowEvidence(dec, rep)("v3", cutoff) == ShadowRecord(1.0, 1, 1)  # no failure charged to v3
+    old = {"anomalies": {"operational": 0, "parity": 0}}  # a report from before the key existed
+    (rep / "2026-10-20.json").write_text(json.dumps(old), encoding="utf-8")
+    assert ReportShadowEvidence(dec, rep)("v3", cutoff) == ShadowRecord(1.0, 0, 0)
+
+
 def test_training_pipeline_chains_the_offline_tools_and_reads_their_outputs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -816,3 +1106,27 @@ def test_a_skipped_step_is_final_for_the_day_and_not_asked_again(rig: Rig) -> No
 def test_psi_needs_enough_history_too() -> None:
     rng = np.random.default_rng(3)
     assert population_stability_index(rng.normal(0, 1, 500), rng.normal(0, 1, 99)) is None
+
+
+def test_training_pipeline_passes_live_labels_to_build_dataset(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from training.build_dataset import LiveInput
+
+    datasets = tmp_path / "datasets"
+    cfg = tmp_path / "train.yml"
+    cfg.write_text(f"datasets_dir: {datasets.as_posix()}\nmodels_dir: {(tmp_path / 'm').as_posix()}\n", "utf-8")
+    seen: list[list[str]] = []
+
+    def fake_build(argv: list[str]) -> int:
+        seen.append(argv)
+        (datasets / f"run-{len(seen)}").mkdir(parents=True)
+        return 0
+
+    monkeypatch.setattr("training.build_dataset.main", fake_build)
+    pipe = TrainingPipeline(cfg)
+    pipe.build_dataset()
+    live = LiveInput(tmp_path / "live", 2.0, datetime(2026, 11, 1, tzinfo=UTC))
+    pipe.build_dataset(live)
+    assert "--live-labels" not in seen[0]
+    assert seen[1][-6:] == [
+        "--live-labels", str(tmp_path / "live"), "--live-weight", "2.0", "--live-cutoff", "2026-11-01T00:00:00Z",
+    ]

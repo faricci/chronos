@@ -19,7 +19,12 @@ What it does, step by step (ids of the spec table):
   on them, never fitted).
 * L2 policy thresholds: ``tune_policy`` on the most recent validation, then the version is registered and proposed as
   the ``challenger`` alias (the book that shadows it).
-* L5 promotion: the learner only CALLS ``registry.decide_promotion`` and reports the verdict. It never promotes.
+* L5 promotion (refit day only): the learner CALLS ``registry.decide_promotion`` and reports the verdict. It never
+  promotes. It judges the ``challenger`` that was in charge BEFORE the night (``challenger_before``): L2 moves the
+  alias onto the version it has just trained, which has no shadow days, so judging the alias after L2 could never
+  promote anything. L5 therefore does not depend on the outcome of L3/L1/L2. Both models are backtested on ONE common
+  window (the latest ``backtest_recent_days``, not before the holdout of either), and the OOS proof (V1), the gates
+  of ``evaluation.json`` and the paired OOS comparison come from the registered versions themselves.
 
 Invariants (each one has a test):
 
@@ -32,10 +37,15 @@ Invariants (each one has a test):
   same date skips the steps that ended ``ok`` or ``skipped`` and retries the ``failed`` ones, resuming inside L3/L2
   from the ``progress`` block (dataset, model, tuned, evaluated). ``--force`` redoes everything.
 
-Limits that are written in the output instead of hidden: ``live_weight`` (2.0 in the spec) is NOT applied to the
-training because ``training.build_dataset`` has no live-label input (``live_weight_applied: false``); the spread, REST
-latency and fee observations of L4 need a source that nobody persists yet (``CostSource``): without one the step
-reports what it could measure and nothing else.
+Live labels (L3): when ``live_labels_dir`` exists the dataset is built with them (``training.build_dataset`` option
+``--live-labels``): the folder, ``dry_run.learner.live_weight`` and the cutoff go to the builder, which weighs the live
+rows (uniqueness weight x ``live_weight``, before the normalisation of the training) and lets them train only the sets
+the purge allows. What really entered is read back from the dataset manifest (``details.live_dataset``) and
+``live_weight_applied`` is true only when at least one live row is in the dataset: with the holdout frozen in the
+label_config a live row of the holdout period never trains anything, exactly like a historical row of that period.
+
+Limits that are written in the output instead of hidden: the spread, REST latency and fee observations of L4 need a
+source that nobody persists yet (``CostSource``): without one the step reports what it could measure and nothing else.
 """
 
 from __future__ import annotations
@@ -55,18 +65,25 @@ from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Final, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 import numpy as np
 import pandas as pd
 import structlog
 
-from modules.config import LearnerConfig
+from modules.config import GateEconConfig, GateOpsConfig, LearnerConfig, RiskConfig
 from modules.dryrun.fill_model import FillModelParams
 from modules.dryrun.registry import (
     CHALLENGER,
     CHAMPION,
+    GE_GO,
+    GE_INCONCLUSIVE,
+    GE_NO_GO,
+    REQUIRED_GATES,
     BacktestEvidence,
+    GateSummary,
+    GeStatus,
+    OosEvidence,
     PromotionEvidence,
     PromotionRule,
     RegistryError,
@@ -75,10 +92,14 @@ from modules.dryrun.registry import (
     artifacts_from_dir,
     decide_promotion,
 )
+from modules.dryrun.revision_impact import ImpactSkip, day_impact, revisions_frame, write_revisions
 from modules.features.schemas import DecisionState
 from modules.features.serializer import FLAT_COLUMNS, flatten_state
 from modules.market.backfill import BarStore, CandleSource, candles_to_frame
-from modules.market.bars import rest_revisions
+from modules.market.bars import classify_revisions, rest_revisions
+
+if TYPE_CHECKING:
+    from training.build_dataset import LiveInput
 
 __all__ = [
     "CostSample",
@@ -87,6 +108,7 @@ __all__ = [
     "LearnerPaths",
     "LedgerCostSource",
     "NightlyLearner",
+    "PairedOosComparator",
     "ReportShadowEvidence",
     "TrainingPipeline",
     "feature_parity",
@@ -106,6 +128,7 @@ PSI_MIN_SAMPLES: Final = 100  # implementation choice (10 per bin): the spec giv
 PSI_FLOOR: Final = 1e-4
 PSI_ALERT: Final = 0.25
 REST_CHUNK_MIN: Final = 300
+OOS_EMBARGO: Final = timedelta(days=2)  # the embargo of ``training.splits.purged_walk_forward`` (V1 of rule L5)
 _DONE_PREFIXES: Final = ("ok", "skipped")
 Registry = Any  # FilesystemModelRegistry-like: register / get / promote (see _ChallengerOnly)
 
@@ -242,9 +265,10 @@ class LedgerCostSource:
 
 
 class Pipeline(Protocol):
-    """The offline pipeline as the learner needs it. Each call returns the directory it produced."""
+    """The offline pipeline as the learner needs it. Each call returns the directory it produced. ``live``: the live
+    labels the dataset is built with (``training.build_dataset.LiveInput``), None for the historical dataset only."""
 
-    def build_dataset(self) -> Path: ...
+    def build_dataset(self, live: LiveInput | None = None) -> Path: ...
     def train(self, dataset: Path) -> Path: ...
     def tune(self, model: Path, dataset: Path) -> None: ...
     def evaluate(self, model: Path, dataset: Path) -> dict[str, Any]: ...
@@ -271,12 +295,15 @@ class TrainingPipeline:
             raise RuntimeError(f"{what} produced {len(fresh)} directories in {root}, expected 1")
         return fresh[0]
 
-    def build_dataset(self) -> Path:
+    def build_dataset(self, live: LiveInput | None = None) -> Path:
         from training.build_dataset import main
 
-        return self._new_dir(
-            Path(self._cfg.datasets_dir), lambda: main(["--config", str(self._config), "--no-jsonl"]), "build_dataset"
-        )
+        argv = ["--config", str(self._config), "--no-jsonl"]
+        if live is not None:
+            argv += ["--live-labels", str(live.labels_dir), "--live-weight", repr(live.weight)]
+            if live.cutoff is not None:
+                argv += ["--live-cutoff", _iso(live.cutoff)]
+        return self._new_dir(Path(self._cfg.datasets_dir), lambda: main(argv), "build_dataset")
 
     def train(self, dataset: Path) -> Path:
         from training.baseline_lgbm import main
@@ -316,23 +343,85 @@ def _call_main(run: Callable[[], int]) -> int:
 
 
 def _gate_flags(gates: Mapping[str, Any]) -> dict[str, Any]:
-    return {k: gates[k].get("passed", gates[k].get("status")) for k in ("G0", "G1", "G2", "GE") if k in gates}
+    """The verdict of every gate of ``evaluation.json`` for the manifest. G3 is ``None`` when the candidate is not an
+    LLM (``applicable: false``), G4 is a boolean; GE is its status string."""
+    return {
+        k: gates[k].get("passed", gates[k].get("status")) for k in ("G0", "G1", "G2", "G3", "G4", "GE") if k in gates
+    }
+
+
+def gate_summary(model_dir: Path) -> GateSummary:
+    """The gates of a registered version, from its ``evaluation.json`` (rule L5, P1). A missing or unreadable file is
+    ``ge=None`` with every required gate ``None`` (= missing): L5 then says ``insufficient``. G3 is required only when
+    the evaluation says it applies (an LLM backend)."""
+    try:
+        gates = json.loads((model_dir / "evaluation.json").read_text(encoding="utf-8"))
+        if not isinstance(gates, dict):
+            raise ValueError("evaluation.json is not an object")
+    except (OSError, ValueError):
+        return GateSummary(None, dict.fromkeys(REQUIRED_GATES))
+
+    def flag(name: str) -> bool | None:
+        value = (gates.get(name) or {}).get("passed")
+        return value if isinstance(value, bool) else None
+
+    passed = {k: flag(k) for k in REQUIRED_GATES}
+    if (gates.get("G3") or {}).get("applicable") is True:
+        passed["G3"] = flag("G3")
+    status = (gates.get("GE") or {}).get("status")
+    ge: GeStatus | None = (
+        GE_GO if status == GE_GO else GE_INCONCLUSIVE if status == GE_INCONCLUSIVE
+        else GE_NO_GO if status == GE_NO_GO else None
+    )  # fmt: skip
+    return GateSummary(ge, passed)
+
+
+def final_train_end(model_dir: Path) -> datetime | None:
+    """``data.final_train_end`` of the model card (UTC), None if the card does not say (an older version): V1 of rule
+    L5 cannot be proven then."""
+    try:
+        card = json.loads((model_dir / "model_card.json").read_text(encoding="utf-8"))
+        return datetime.fromisoformat(str(card["data"]["final_train_end"]).replace("Z", "+00:00")).astimezone(UTC)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def holdout_start(model_dir: Path) -> datetime | None:
+    """Where the frozen holdout of the model's label_config starts (model card ``label_config.selection``)."""
+    try:
+        card = json.loads((model_dir / "model_card.json").read_text(encoding="utf-8"))
+        text = str(card["label_config"]["selection"]["holdout_start"])
+        t = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return t.replace(tzinfo=UTC) if t.tzinfo is None else t.astimezone(UTC)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 class RecentBacktester(Protocol):
-    def __call__(self, model_dir: Path, days: int, cutoff: datetime) -> BacktestEvidence: ...
+    def __call__(self, model_dir: Path, start: datetime, end: datetime) -> BacktestEvidence: ...
+
+
+class OosComparator(Protocol):
+    """The paired OOS evidence of two registered versions (P2, S3); None when the challenger has no OOS artifacts."""
+
+    def __call__(
+        self, challenger_dir: Path, champion_dir: Path, *, champion_go: bool, quantile: float
+    ) -> OosEvidence | None: ...
 
 
 class HoldoutBacktester:
-    """Rule L5 (a): the ``final`` model and policy of a version on the most recent ``days`` days. The window is cut
-    inside the holdout of the model's label_config (``holdout_start`` is fixed, so no version trained on it: the
-    window is out of sample for the challenger and for the champion). A model whose policy is ``untunable`` runs as
-    "no entry": zero PnL and no defined Sharpe, hence ``insufficient`` in ``decide_promotion``."""
+    """Rule L5, P3: the ``final`` model and policy of a version over the window ``[start, end)`` that the learner
+    computed ONCE for both models (a window per model would compare different periods). The window starts at or after
+    the frozen holdout of each label_config, which no version trained on: it is out of sample for both (proved by
+    ``data.final_train_end``, V1). The metrics are those of the backtest (``run_backtest``), one definition.
+
+    A model whose policy is ``untunable`` does not trade: PnL 0, Sharpe 0.0, drawdown 0 and ``n_trades == 0`` (defined
+    metrics: the old ``Sharpe None`` made L5 answer ``insufficient`` forever)."""
 
     def __init__(self, train_config: Path, probe: Path = Path("data/probe/coinbase_probe.json")) -> None:
         self._train_config, self._probe = Path(train_config), Path(probe)
 
-    def __call__(self, model_dir: Path, days: int, cutoff: datetime) -> BacktestEvidence:
+    def __call__(self, model_dir: Path, start: datetime, end: datetime) -> BacktestEvidence:
         from modules.decision.baseline import BaselineDecider
         from modules.decision.policy import PolicyConfig
         from modules.decision.questions import build_questions
@@ -347,15 +436,15 @@ class HoldoutBacktester:
         from training.config import load_train_config
         from training.tune_policy import backtest_config, load_markets, probe_registry
 
+        days = (end - start).total_seconds() / 86400.0
         raw = json.loads((model_dir / "final" / "policy.json").read_text(encoding="utf-8"))
         if raw.get("untunable"):
-            return BacktestEvidence(float(days), Decimal(0), None, 0.0)
+            return BacktestEvidence(start, end, days, 0, Decimal(0), 0.0, 0.0)
         cfg = load_train_config(self._train_config)
         label = load_label_config(model_dir / "label_config.json")
         markets = load_markets(Path(cfg.data_root) / "bars" / "1m", cfg.products, label)
-        last = min(max(pd.Timestamp(pm.bars.ts_close[-1], tz="UTC") for pm in markets.values()), pd.Timestamp(cutoff))
-        start = max(label.holdout_start, last - pd.Timedelta(days=days))
-        span = Span(start, last, last, -1)
+        t0, t1 = pd.Timestamp(start), pd.Timestamp(end)
+        span = Span(t0, t1, t1, -1)
         questions = build_questions(label.cfg.horizon_min, label.cfg.k_tp, label.cfg.k_sl, label.cfg.atr_tf)
         decider = BaselineDecider.load(model_dir, label=label, questions=questions, subset="final")
         result = asyncio.run(
@@ -367,10 +456,32 @@ class HoldoutBacktester:
             )
         )  # fmt: skip
         m = result.metrics
+        n = len(result.trades)
         sharpe = m.get("sharpe")
         return BacktestEvidence(
-            (last - start).total_seconds() / 86400.0, Decimal(str(m.get("pnl_eur", 0.0))),
-            None if sharpe is None else float(sharpe), float(m.get("max_dd_frac", 0.0)),
+            start, end, days, n, Decimal(str(m.get("pnl_eur", 0.0))),
+            (0.0 if n == 0 else None) if sharpe is None else float(sharpe), float(m.get("max_dd_frac", 0.0)),
+        )  # fmt: skip
+
+
+class PairedOosComparator:
+    """``training.oos_compare.compare_models`` with the constants of GE (replicates and seed of E2 from
+    ``training.evaluate``) and the starting capital of the backtests (``train.yml``)."""
+
+    def __init__(self, train_config: Path) -> None:
+        self._train_config = Path(train_config)
+
+    def __call__(
+        self, challenger_dir: Path, champion_dir: Path, *, champion_go: bool, quantile: float
+    ) -> OosEvidence | None:
+        from training.config import load_train_config
+        from training.evaluate import N_BOOT, SEED
+        from training.oos_compare import compare_models
+
+        cfg = load_train_config(self._train_config)
+        return compare_models(
+            challenger_dir, champion_dir, champion_go=champion_go, reps=N_BOOT, seed=SEED, q=quantile,
+            starting_quote=float(cfg.backtest.starting_quote),
         )  # fmt: skip
 
 
@@ -412,6 +523,8 @@ class ReportShadowEvidence:
                 continue
             operational += int(block.get("operational", 0))
             parity += int(block.get("parity", 0))
+            # R1-R3 of the revisions are charged to the model version that failed them, not to the whole day
+            parity += len((block.get("revision_by_version") or {}).get(version, []))
         return ShadowRecord(float(len(days)), operational, parity)
 
 
@@ -441,10 +554,14 @@ class _ChallengerOnly:
     def get(self, alias: str) -> Any:
         return self._inner.get(alias)
 
-    def promote(self, version: str, alias: str = CHALLENGER) -> None:
+    def get_version(self, version: str) -> Any:
+        """A registered version by name (read only): L5 judges the challenger that was in charge before the night."""
+        return self._inner.get_version(version)
+
+    def promote(self, version: str, alias: str = CHALLENGER, *, reason: str = "") -> None:
         if alias != CHALLENGER:
             raise RegistryError(f"the nightly learner may only move the {CHALLENGER!r} alias, not {alias!r}")
-        self._inner.promote(version, alias)
+        self._inner.promote(version, alias, reason=reason)
 
 
 @dataclass(frozen=True)
@@ -475,15 +592,26 @@ class NightlyLearner:
         pipeline: Pipeline | None = None,
         backtester: RecentBacktester | None = None,
         shadow: ShadowEvidence | None = None,
+        oos: OosComparator | None = None,
+        econ: GateEconConfig | None = None,
         markets: MarketsLoader | None = None,
         label: Any | None = None,
         psi_alert: float = PSI_ALERT,
+        gate_ops: GateOpsConfig | None = None,
+        risk: RiskConfig | None = None,
+        deciders: Callable[[str], tuple[Any, Any]] | None = None,
+        ledger_db: Path | None = None,
     ) -> None:
         self._cfg, self._paths, self._products = cfg, paths, tuple(products)
+        self._econ = econ or GateEconConfig()
+        # L0 impact of the REST revisions (spec 5.1.7 "Barre REST"): thresholds, risk costs, the models in use
+        # (policy_version -> (decider, policy)) and the dry ledger for the LONG states
+        self._gate_ops, self._risk = gate_ops or GateOpsConfig(), risk or RiskConfig()
+        self._deciders, self._ledger_db = deciders, ledger_db
         self._registry = _ChallengerOnly(registry)
         self._clock = clock
         self._candles, self._costs = candle_source, cost_source
-        self._pipeline, self._backtester, self._shadow = pipeline, backtester, shadow
+        self._pipeline, self._backtester, self._shadow, self._oos = pipeline, backtester, shadow, oos
         self._markets_loader, self._label = markets, label
         self._psi_alert = psi_alert
         self._markets_cache: Mapping[str, Any] | None = None
@@ -502,12 +630,16 @@ class NightlyLearner:
         day = day or started.astimezone(UTC).date()
         self._cutoff = datetime(day.year, day.month, day.day, tzinfo=UTC)
         do_refit = (day.day == self._cfg.refit_day_of_month) if refit is None else refit
-        previous = {} if force else self._load(day)
+        existing = self._load(day)
+        previous = {} if force else existing
         self._doc = {
             "v": SCHEMA, "date": day.isoformat(), "audited_day": (day - timedelta(days=1)).isoformat(),
             "cutoff": _iso(self._cutoff), "refit_day": do_refit,
             "started_at": previous.get("started_at", _iso(started)), "updated_at": _iso(started),
             "champion_before": previous.get("champion_before", self._alias_version(CHAMPION)),
+            # the challenger in charge when the night began: what L5 judges. Kept even under --force, because by then
+            # L2 may already have moved the alias onto the version trained tonight.
+            "challenger_before": existing.get("challenger_before", self._alias_version(CHALLENGER)),
             "champion_after": None, "challenger_after": None,
             "progress": previous.get("progress", {}), "steps": previous.get("steps", {}),
         }  # fmt: skip
@@ -551,7 +683,9 @@ class NightlyLearner:
     def _gate_model_step(self, step: str, do_refit: bool) -> None:
         if not do_refit:
             raise Skip("not_refit_day")
-        order = ("L3", "L1", "L2", "L5")
+        if step == "L5":
+            return  # L5 judges the challenger of BEFORE the night: independent of how L3/L1/L2 ended
+        order = ("L3", "L1", "L2")
         for before in order[: order.index(step)]:
             outcome = str(self._doc["steps"].get(before, {}).get("outcome", ""))
             if outcome == "failed":
@@ -587,7 +721,8 @@ class NightlyLearner:
         result = StepResult()
         errors: list[str] = []
         parts: dict[str, Callable[[date], dict[str, Any]]] = {
-            "rest_revisions": self._rest_audit, "state_parity": self._state_parity,
+            "rest_revisions": self._rest_audit, "revision_impact": self._revision_impact,
+            "state_parity": self._state_parity,
         }  # fmt: skip
         for name, part in parts.items():
             try:
@@ -611,10 +746,14 @@ class NightlyLearner:
         hi = lo + timedelta(days=1)
         store = BarStore(self._paths.bars_root)
         out: dict[str, Any] = {}
+        tables: list[pd.DataFrame] = []
         for product in self._products:
             months = [m for m in store.months(product) if (lo.year, lo.month) <= m <= (hi.year, hi.month)]
             if not months:
-                out[product] = {"minutes": 0, "revised": 0, "ratio": 0.0, "max_close_diff_bps": 0.0}
+                out[product] = {
+                    "minutes": 0, "revised": 0, "ratio": 0.0, "max_close_diff_bps": 0.0, "value_revised": 0,
+                    "appeared": 0, "disappeared": 0,
+                }  # fmt: skip
                 continue
             stored = pd.concat([store.read_month(product, *m) for m in months])
             raw: list[dict[str, Any]] = []
@@ -625,11 +764,37 @@ class NightlyLearner:
                 cursor = upper
             fresh = candles_to_frame(raw, int(lo.timestamp()), int(hi.timestamp()))
             stats = rest_revisions(product, stored, fresh, lo, hi)
+            tables.append(revisions_frame(product, classify_revisions(stored, fresh, lo, hi), stored, fresh))
             out[product] = {
                 "minutes": stats.minutes, "revised": stats.revised, "ratio": stats.ratio,
-                "max_close_diff_bps": stats.max_close_diff_bps,
+                "max_close_diff_bps": stats.max_close_diff_bps, "value_revised": stats.value_revised,
+                "appeared": stats.appeared, "disappeared": stats.disappeared,
             }  # fmt: skip
-        return {"products": out, "rest_revision_ratio_max": max((v["ratio"] for v in out.values()), default=0.0)}
+        # the revisions of the day, kept for the impact audit of the following days (never applied to the store)
+        rows = write_revisions(self._revisions_path(audited), tables)
+        return {
+            "products": out, "rest_revision_ratio_max": max((v["ratio"] for v in out.values()), default=0.0),
+            "revisions_file": self._revisions_path(audited).name, "revisions_rows": rows,
+        }  # fmt: skip
+
+    def _revisions_path(self, audited: date) -> Path:
+        return self._paths.reports_dir / "revisions" / f"{audited.isoformat()}.parquet"
+
+    def _revision_impact(self, audited: date) -> dict[str, Any]:
+        """R1-R3 of the audited day for every registry book and model version in use (revision_impact.day_impact)."""
+        if self._label is None:
+            raise Skip("no_label_config")
+        if self._deciders is None:
+            raise Skip("no_deciders")
+        try:
+            return day_impact(
+                audited=audited, products=self._products, bars_root=self._paths.bars_root,
+                revisions_dir=self._paths.reports_dir / "revisions",
+                decisions_path=self._paths.decisions_dir / f"{audited.isoformat()}.jsonl", loader=self._deciders,
+                label=self._label, risk=self._risk, gate=self._gate_ops, ledger_db=self._ledger_db,
+            )  # fmt: skip
+        except ImpactSkip as skip:
+            raise Skip(skip.reason, skip.details) from skip
 
     def _markets(self) -> Mapping[str, Any]:
         if self._markets_loader is None:
@@ -814,7 +979,7 @@ class NightlyLearner:
         live = self._live_labels()
         dataset = self._reuse("dataset")
         if dataset is None:
-            dataset = pipe.build_dataset()
+            dataset = pipe.build_dataset(self._live_input())
             self._progress["dataset"] = str(dataset)
             self._save(day)
         model = self._reuse("model")
@@ -822,15 +987,25 @@ class NightlyLearner:
             model = pipe.train(dataset)
             self._progress["model"] = str(model)
             self._save(day)
+        in_dataset = _dataset_live_block(dataset)
+        used = int(in_dataset.get("rows", 0)) if in_dataset else 0
         return StepResult(
             {
                 "dataset": str(dataset), "model": model.name, "live_labels": live,
-                "live_weight": self._cfg.live_weight, "live_weight_applied": False,
-                "live_weight_reason": "training.build_dataset has no live-label input",
-                "cutoff": _iso(self._cutoff),
+                "live_weight": self._cfg.live_weight, "live_weight_applied": used > 0,
+                "live_dataset": in_dataset, "cutoff": _iso(self._cutoff),
             },
             [str(model)],
         )  # fmt: skip
+
+    def _live_input(self) -> LiveInput | None:
+        """The live labels for the dataset builder: None when the folder is absent or holds no label file."""
+        from training.build_dataset import LiveInput
+
+        folder = self._paths.live_labels_dir
+        if not folder.is_dir() or not any(folder.glob("*.jsonl")):
+            return None
+        return LiveInput(folder, self._cfg.live_weight, self._cutoff)
 
     def _reuse(self, key: str) -> Path | None:
         value = self._progress.get(key)
@@ -877,12 +1052,13 @@ class NightlyLearner:
             "metrics": {"evaluation": evaluation, "final_policy": "untunable" if untunable else "tuned",
                         "edge_cal": card.get("calibration", {}).get("edge_cal")},
             "live_labels": self._doc["steps"]["L3"]["details"]["live_labels"],
+            "live_dataset": self._doc["steps"]["L3"]["details"].get("live_dataset"),
         }  # fmt: skip
         try:
             version = self._registry.register(artifacts_from_dir(model), _clean(manifest))
         except VersionExists:
             version = model.name  # a previous run registered it before it could record the step
-        self._registry.promote(version, CHALLENGER)
+        self._registry.promote(version, CHALLENGER, reason=f"nightly learner {day.isoformat()} (L2)")
         self._progress["registered"] = version
         return StepResult(
             {"version": version, "alias": CHALLENGER, "final_policy_untunable": untunable, "evaluation": evaluation},
@@ -891,32 +1067,73 @@ class NightlyLearner:
 
     # ------------------------------------------------------------------------------------------------ L5
 
+    def _common_end(self) -> datetime:
+        """End of the common backtest window: the earliest close of the last bar of the products that have bars, never
+        past the cutoff. (No bars at all: the cutoff; the real backtester then fails on its own, loudly.)"""
+        store = BarStore(self._paths.bars_root)
+        lasts = [t for p in self._products if (t := store.last_ts(p)) is not None]
+        return min(min(lasts) + MINUTE, self._cutoff) if lasts else self._cutoff
+
     def _l5(self, day: date) -> StepResult:
-        """Verdict of rule L5. The learner reports it and does nothing else: ``promoted`` is always false."""
+        """Verdict of rule L5 on the challenger that was in charge BEFORE tonight's refit. The learner reports it and
+        does nothing else: ``promoted`` is always false (promotion is a local act)."""
         if self._backtester is None or self._shadow is None:
             raise Skip("no_evidence_source")
-        challenger = self._registry.get(CHALLENGER)
+        before = self._doc.get("challenger_before")
+        if not before:
+            raise Skip("no_previous_challenger")
         try:
             champion = self._registry.get(CHAMPION)
         except UnknownAlias:
             raise Skip("no_champion") from None
-        days = PromotionRule.from_config(self._cfg).backtest_recent_days
+        if before == champion.version:
+            raise Skip("challenger_is_champion", {"version": before})
+        challenger = self._registry.get_version(before)
+        rule = PromotionRule.from_config(self._cfg, self._econ)
+        # ONE window for both models: not before the holdout of either label_config, not past the last bar
+        end = self._common_end()
+        holdouts = [h for h in (holdout_start(challenger.path), holdout_start(champion.path)) if h is not None]
+        start = max([end - timedelta(days=rule.backtest_recent_days), *holdouts])
+        challenger_gates, champion_gates = gate_summary(challenger.path), gate_summary(champion.path)
+        champion_go = champion_gates.ge == GE_GO
+        embargo_ok = [
+            (t := final_train_end(m.path)) is not None and t <= start - OOS_EMBARGO for m in (challenger, champion)
+        ]  # V1: neither model trained on data that ends after the window starts (minus the embargo)
         shadow = self._shadow(challenger.version, self._cutoff)
         evidence = PromotionEvidence(
-            challenger=self._backtester(challenger.path, days, self._cutoff),
-            champion=self._backtester(champion.path, days, self._cutoff),
+            challenger=self._backtester(challenger.path, start, end),
+            champion=self._backtester(champion.path, start, end),
+            challenger_gates=challenger_gates, champion_gates=champion_gates,
+            oos=(
+                None if self._oos is None else self._oos(
+                    challenger.path, champion.path, champion_go=champion_go, quantile=rule.superiority_quantile
+                )
+            ),
+            oos_provable=all(embargo_ok),
             shadow_days=shadow.days, operational_anomalies=shadow.operational_anomalies,
             parity_anomalies=shadow.parity_anomalies,
         )  # fmt: skip
-        decision = decide_promotion(evidence, PromotionRule.from_config(self._cfg))
+        decision = decide_promotion(evidence, rule)
         return StepResult(
             {
                 "challenger": challenger.version, "champion": champion.version, "verdict": decision.verdict,
                 "reasons": list(decision.reasons), "promoted": False,
-                "note": "promotion is a local act (python -m modules.dryrun.registry promote)",
+                "window": {"start": _iso(start), "end": _iso(end), "days": (end - start).total_seconds() / 86400.0},
+                "command": f'python -m modules.dryrun.registry promote {challenger.version} --reason "<why>"',
+                "note": "promotion is a local act; a manual promote overrides this verdict (decision U2)",
                 "evidence": _clean(asdict(evidence)),
             }
         )  # fmt: skip
+
+
+def _dataset_live_block(dataset: Path) -> dict[str, Any] | None:
+    """The ``live`` block of the dataset manifest (rows, weight, rows per training set, exclusions), None if absent."""
+    try:
+        manifest = json.loads((dataset / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    block = manifest.get("live") if isinstance(manifest, dict) else None
+    return block if isinstance(block, dict) else None
 
 
 def _inputs_hash(dataset: Path, label_config: Path) -> str:
@@ -953,12 +1170,13 @@ def _lower_priority() -> None:
 def build_learner(config_path: str, train_config: str) -> NightlyLearner:
     from modules.config import load_config
     from modules.dryrun.registry import FilesystemModelRegistry
+    from modules.dryrun.revision_impact import RegistryDeciderLoader
     from modules.market.backfill import CoinbaseCandleSource, bars_root
     from modules.risk.label_config import load_label_config
 
     app = load_config(config_path)
     data = Path(app.paths.data_dir)
-    registry_root = Path(app.paths.models_dir) / "registry"
+    registry = FilesystemModelRegistry(Path(app.paths.models_dir) / "registry")
     label_path = Path(train_config and _label_path(train_config))
     label = load_label_config(label_path) if label_path.exists() else None
 
@@ -975,12 +1193,15 @@ def build_learner(config_path: str, train_config: str) -> NightlyLearner:
         work_dir=data / "reports" / "learner" / "work",
     )  # fmt: skip
     return NightlyLearner(
-        cfg=app.dry_run.learner, paths=paths, registry=FilesystemModelRegistry(registry_root),
+        cfg=app.dry_run.learner, paths=paths, registry=registry,
         products=app.market.products, candle_source=CoinbaseCandleSource(),
         cost_source=LedgerCostSource(app.dry_run.db_path), pipeline=TrainingPipeline(Path(train_config)),
         backtester=HoldoutBacktester(Path(train_config)),
         shadow=ReportShadowEvidence(data / "decisions", data / "reports" / "dry"),
+        oos=PairedOosComparator(Path(train_config)), econ=app.dry_run.gate_econ,
         markets=markets, label=label, psi_alert=app.risk.kill_switch.psi_threshold,
+        gate_ops=app.dry_run.gate_ops, risk=app.risk, ledger_db=Path(app.dry_run.db_path),
+        deciders=None if label is None else RegistryDeciderLoader(registry, label),
     )  # fmt: skip
 
 

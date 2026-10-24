@@ -19,6 +19,7 @@ from modules.market.bars import (
     BarService,
     BarStoreWriter,
     bars_to_frame,
+    classify_revisions,
     rest_revisions,
 )
 from modules.market.indicators import IndicatorEngine
@@ -395,6 +396,51 @@ def test_rest_revisions_without_changes_and_window_restriction() -> None:
     assert rest_revisions(P, same, other, at(0), at(1)).revised == 0  # minute 10:01 is outside [start, end)
     empty = rest_revisions(P, same.iloc[:0], other.iloc[:0], at(0), at(10))
     assert (empty.minutes, empty.ratio) == (0, 0.0)
+
+
+def test_classify_revisions_value_appeared_disappeared() -> None:
+    stored = frame([(0, 100, 1), (1, 100, 1), (2, 100, 1), (3, 100, 1), (4, 100, 1)])
+    fresh = frame([(0, 100, 1), (1, 101, 1), (2, 100, 2), (4, 100, 1), (5, 100, 1)])
+    r = classify_revisions(stored, fresh, at(0), at(10))
+    assert list(r.value.index) == [pd.Timestamp(at(1)), pd.Timestamp(at(2))]
+    assert r.value["close"].tolist() == [101.0, 100.0] and r.value["volume"].tolist() == [1.0, 2.0]  # RE-READ values
+    assert r.stored_value["close"].tolist() == [100.0, 100.0] and r.stored_value["volume"].tolist() == [1.0, 1.0]
+    assert list(r.appeared) == [pd.Timestamp(at(5))] and list(r.disappeared) == [pd.Timestamp(at(3))]
+    same = classify_revisions(stored, stored.copy(), at(0), at(10))
+    assert same.value.empty and len(same.appeared) == len(same.disappeared) == 0
+
+
+def test_classify_revisions_window_end_exclusive() -> None:
+    """A candle exactly at ``end`` is ignored (the 05:40 artifact of the research scripts, END was inclusive there)."""
+    stored = frame([(0, 100, 1), (1, 100, 1)])
+    fresh = frame([(0, 100, 1), (1, 100, 1), (2, 100, 1)])
+    assert len(classify_revisions(stored, fresh, at(0), at(2)).appeared) == 0
+    assert list(classify_revisions(stored, fresh, at(0), at(3)).appeared) == [pd.Timestamp(at(2))]
+    assert len(classify_revisions(stored, fresh, at(1), at(3)).appeared) == 1  # start is inclusive, minute 0 left out
+
+
+def test_classify_revisions_on_store_rows_counts_no_flat_minute(tmp_path: Path) -> None:
+    """Minutes without trades have no row in the store and no candle in REST: neither appeared nor disappeared. On the
+    FILLED grid they would all look "disappeared" (the reason ``classify_revisions`` takes the real rows)."""
+    real = frame([(0, 100, 1), (5, 101, 2)])  # minutes 1..4 are flat: no row, no candle
+    store = BarStore(tmp_path)
+    store.write(P, real)
+    rows = store.read_month(P, T0.year, T0.month)
+    r = classify_revisions(rows, real.copy(), at(0), at(10))
+    assert r.value.empty and len(r.appeared) == 0 and len(r.disappeared) == 0
+    grid = load_bars(tmp_path, P, store_complete_until_end=False).reset_index()
+    assert len(classify_revisions(grid, real.copy(), at(0), at(10)).disappeared) == 4  # what the filled grid would say
+
+
+def test_rest_revisions_counts_unchanged() -> None:
+    """The ratio of the old criterion (now a diagnostic) is what it always was; the new fields only split it."""
+    stored = frame([(0, 100, 1), (1, 100, 1), (2, 100, 1), (3, 100, 1), (4, 100, 1)])
+    fresh = frame([(0, 100, 1), (1, 101, 1), (2, 100, 2), (4, 100, 1), (5, 100, 1)])
+    r = rest_revisions(P, stored, fresh, at(0), at(10))
+    assert (r.minutes, r.revised, r.value_revised, r.appeared, r.disappeared) == (6, 4, 2, 1, 1)
+    assert r.ratio == pytest.approx(4 / 6) and r.max_close_diff_bps == pytest.approx(100.0)
+    only = rest_revisions(P, stored, fresh, at(1), at(3))  # window [1, 3): minutes 1 and 2, both revised by value
+    assert (only.minutes, only.revised, only.appeared, only.disappeared) == (2, 2, 0, 0)
 
 
 def test_bar_closed_properties() -> None:

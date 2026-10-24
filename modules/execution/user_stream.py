@@ -39,11 +39,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from typing import Any, Final, Literal, Protocol
 
 import structlog
@@ -67,8 +67,11 @@ log = structlog.get_logger(__name__)
 ZERO: Final = Decimal(0)
 CHANNELS: Final = ("user", "heartbeats")
 SILENCE_S: Final = 5.0  # heartbeats arrive every second
+SUPERVISE_S: Final = 1.0  # how often the silence check runs
 BACKOFF_MIN_S: Final = 1.0
 BACKOFF_MAX_S: Final = 30.0
+CONNECT_TIMEOUT_S: Final = 30.0  # open + subscribe: the SDK has no timeout of its own by default
+CLOSE_TIMEOUT_S: Final = 10.0  # a close that never returns must not freeze the stream (seen with a real feed)
 
 AlarmHandler = Callable[[CoverageAlarm], None]
 ResyncRequest = Callable[[str], None]
@@ -395,7 +398,22 @@ class CoinbaseUserTransport:
         self._ws.open()
 
     def close(self) -> None:
-        self._ws.close()
+        try:
+            self._ws.close()
+        except Exception:
+            self._stop_sdk_thread()  # a dead socket makes the SDK raise BEFORE it stops its loop: one thread per drop
+            raise
+
+    def _stop_sdk_thread(self) -> None:
+        loop, thread = getattr(self._ws, "loop", None), getattr(self._ws, "thread", None)
+        if loop is None or loop.is_closed():
+            return
+        if loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if thread is not None:
+            thread.join(timeout=5.0)
+        if not loop.is_running():
+            loop.close()
 
     def subscribe(self, product_ids: Sequence[str], channels: Sequence[str]) -> None:
         self._ws.subscribe(product_ids=list(product_ids), channels=list(channels))
@@ -427,6 +445,8 @@ class UserStreamStats:
     parse_errors: int = 0
     sink_errors: int = 0
     heartbeats: int = 0
+    stale_dropped: int = 0  # items of a transport that was already replaced
+    connect_failures: int = 0
     errors: list[str] = field(default_factory=list)
 
 
@@ -451,8 +471,13 @@ class CoinbaseUserStream:
         self._silence_s = silence_s
         self._seq = SequenceMonitor()
         self._transport: UserTransport | None = None
-        self._queue: asyncio.Queue[tuple[float, str | None]] | None = None
+        self._queue: asyncio.Queue[tuple[int, str | None]] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Every transport gets a generation; what an older one says (its messages, and the ``on_close`` that its own
+        # ``close()`` makes the SDK call) is not about the connection we hold now.
+        self._generation = 0
+        self._connected_at: datetime | None = None
+        self._reconnecting = False
         self._silent = False
         self._resync_reason: str | None = None
         self._backoff = BACKOFF_MIN_S
@@ -517,51 +542,75 @@ class CoinbaseUserStream:
     # ------------------------------------------------------------------------------ supervision
 
     def check_silence(self, now: datetime) -> bool:
-        """True (once per silence) if the stream has been quiet for longer than ``silence_s``."""
-        if self.last_message_at is None or self._silent:
+        """True (once per silence) if nothing has arrived for longer than ``silence_s``, counted from the last message
+        or from the connection, whichever is later (a connection that opens and says nothing is an outage too)."""
+        reference = self.last_message_at
+        if self._connected_at is not None and (reference is None or self._connected_at > reference):
+            reference = self._connected_at
+        if reference is None or self._silent:
             return False
-        if (now - self.last_message_at).total_seconds() <= self._silence_s:
+        if (now - reference).total_seconds() <= self._silence_s:
             return False
         self._silent = True
-        log.warning("user_ws_silent", since=self.last_message_at)
+        log.warning("user_ws_silent", since=reference)
         return True
 
     # --------------------------------------------------------------------------------- asyncio
 
-    def _on_message_thread(self, raw: str) -> None:
+    def _on_message_thread(self, generation: int, raw: str) -> None:
         """Called by the SDK thread: hand the message to the event loop."""
         if self._loop is not None and self._queue is not None:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, (time.time(), raw))
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, (generation, raw))
 
-    def _on_close_thread(self) -> None:
+    def _on_close_thread(self, generation: int) -> None:
         if self._loop is not None and self._queue is not None:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, (time.time(), None))
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, (generation, None))
 
     async def _connect(self) -> None:
         self._seq.reset()
-        self._transport = self._factory(self._on_message_thread, self._on_close_thread)
-        await asyncio.to_thread(self._transport.open)
-        await asyncio.to_thread(self._transport.subscribe, self.products, CHANNELS)
+        self._generation += 1
+        generation = self._generation
+        self._transport = self._factory(
+            partial(self._on_message_thread, generation), partial(self._on_close_thread, generation)
+        )
+        async with asyncio.timeout(CONNECT_TIMEOUT_S):
+            await asyncio.to_thread(self._transport.open)
+            await asyncio.to_thread(self._transport.subscribe, self.products, CHANNELS)
+        self._connected_at = self._clock()
+        self._silent = False  # a new connection: a new silence can be detected
 
     async def _disconnect(self) -> None:
+        self._generation += 1  # from now on the old transport is not heard, ``on_close`` of our own close included
         transport, self._transport = self._transport, None
         if transport is not None:
             try:
-                await asyncio.to_thread(transport.close)
-            except Exception as exc:  # closing a dead socket may raise: nothing more to do about it
-                log.debug("user_ws_close_failed", error=str(exc))
+                async with asyncio.timeout(CLOSE_TIMEOUT_S):
+                    await asyncio.to_thread(transport.close)
+            except Exception as exc:  # closing a dead socket may raise (or hang): nothing more to do about it
+                log.debug("user_ws_close_failed", error=f"{type(exc).__name__}: {exc}")
 
     async def _reconnect(self, reason: str) -> None:
-        self.stats.reconnects += 1
-        log.warning("user_ws_reconnecting", reason=reason, backoff_s=self._backoff)
-        self._resync_reason = f"ws_{reason.replace(' ', '_')}"  # events may be lost: reconcile at the first message
-        await self._disconnect()
-        await asyncio.sleep(self._backoff)
-        self._backoff = min(self._backoff * 2, BACKOFF_MAX_S)
+        """Drop the transport and connect again, retrying with a back-off until it works. One at a time."""
+        if self._reconnecting:
+            return
+        self._reconnecting = True
         try:
-            await self._connect()
-        except Exception as exc:
-            log.error("user_ws_connect_failed", error=f"{type(exc).__name__}: {exc}")
+            self.stats.reconnects += 1
+            log.warning("user_ws_reconnecting", reason=reason, backoff_s=self._backoff)
+            self._resync_reason = f"ws_{reason.replace(' ', '_')}"  # events may be lost: reconcile at the first message
+            await self._disconnect()
+            while True:
+                await asyncio.sleep(self._backoff)
+                self._backoff = min(self._backoff * 2, BACKOFF_MAX_S)
+                try:
+                    await self._connect()
+                    return
+                except Exception as exc:
+                    self.stats.connect_failures += 1
+                    log.error("user_ws_connect_failed", error=f"{type(exc).__name__}: {exc}", retry_in_s=self._backoff)
+                    await self._disconnect()  # a transport that opened but could not subscribe must not stay open
+        finally:
+            self._reconnecting = False
 
     async def run(self) -> None:
         """Connect and keep the stream alive until cancelled."""
@@ -572,7 +621,9 @@ class CoinbaseUserStream:
                 await self._connect()
                 break
             except Exception as exc:
+                self.stats.connect_failures += 1
                 log.error("user_ws_connect_failed", error=f"{type(exc).__name__}: {exc}", retry_in_s=self._backoff)
+                await self._disconnect()
                 await asyncio.sleep(self._backoff)
                 self._backoff = min(self._backoff * 2, BACKOFF_MAX_S)
         self._resync_reason = "ws_connected"  # orders may have moved while we were not listening
@@ -586,7 +637,10 @@ class CoinbaseUserStream:
     async def _consume(self) -> None:
         assert self._queue is not None
         while True:
-            _, raw = await self._queue.get()
+            generation, raw = await self._queue.get()
+            if generation != self._generation:  # a transport we already replaced
+                self.stats.stale_dropped += 1
+                continue
             if raw is None:
                 await self._reconnect("connection closed")
                 continue
@@ -595,6 +649,6 @@ class CoinbaseUserStream:
 
     async def _supervise(self) -> None:
         while True:
-            await asyncio.sleep(1.0)
-            if self.check_silence(self._clock()):
+            await asyncio.sleep(SUPERVISE_S)
+            if not self._reconnecting and self.check_silence(self._clock()):
                 await self._reconnect("feed silent")

@@ -55,13 +55,16 @@ from modules.config import (
     DecisionConfig,
     EntryTimeout,
     FallbackFees,
+    FillMode,
     RiskConfig,
 )
 from modules.decision.engine import (
+    KEEP_BACKEND,
     BaselineBackend,
     DecisionEngine,
     DecisionSink,
     ExecutionReport,
+    ModelSwap,
     Processed,
     RemoteBackend,
     SentimentSource,
@@ -70,9 +73,10 @@ from modules.decision.engine import (
 from modules.decision.policy import PolicyConfig
 from modules.decision.protocol import REGIME_LEGEND, DecisionAnswers
 from modules.decision.questions import QuestionSet
-from modules.dryrun.fill_model import BarFillModel, FillModelParams
+from modules.dryrun.bracket_sim import BracketSimulator
+from modules.dryrun.fill_model import BarFillModel, FillModelParams, TickFillModel
 from modules.dryrun.restore import BookRestore
-from modules.dryrun.shadow_gateway import BarEvent, RestoreReport, ShadowExecutionGateway
+from modules.dryrun.shadow_gateway import BarEvent, RestoreReport, ShadowExecutionGateway, TickRig, TradeTape
 from modules.dryrun.virtual_account import VirtualAccount
 from modules.execution.balance import Clock, CoverageAlarm
 from modules.execution.balance_guard import BalanceGuard, FeeSource, KillSwitchView
@@ -81,7 +85,10 @@ from modules.execution.orders import ProductMeta
 from modules.execution.rounding import ceil_to
 from modules.execution.spot import SpotRegistry
 from modules.ledger.positions import LedgerModeMismatch, PositionLedger
+from modules.market.backfill import CandleSource
 from modules.market.bars import BarClosed
+from modules.market.orderbook import LocalOrderBook
+from modules.market.ws_feed import Trade
 from modules.risk.costs import FeeRates, coverage_fee_rate, max_base_for_quote
 from modules.risk.label_config import LoadedLabelConfig
 from modules.risk.risk_manager import EntryGate, MarketQuote, OrderIntent, RiskManager
@@ -93,6 +100,7 @@ __all__ = [
     "BookKillSwitch",
     "BookModel",
     "BookStats",
+    "BookSwap",
     "BuyAndHoldDriver",
     "BuyRateTracker",
     "QuoteSource",
@@ -100,11 +108,13 @@ __all__ = [
     "ShadowBook",
     "ShadowBookManager",
     "VirtualBookContext",
+    "apply_book_swaps",
     "build_books",
     "build_buy_and_hold_book",
     "build_model_book",
     "build_random_book",
     "build_twin_book",
+    "prepare_book_swap",
     "to_bar_event",
 ]
 
@@ -193,6 +203,12 @@ class BookDeps:
     wrap_gateway: Callable[[str, ExecutionGateway], ExecutionGateway] | None = None
     # state read from the dry ledger before the books are built (restart): the account of a book is rebuilt from it
     restore: Mapping[str, BookRestore] = field(default_factory=dict)
+    # ``fill_mode == "tick"``: the brackets of every book follow the trades and the order books of the market stream
+    # (``order_books``: the books of the stream, ``candles``: where a data gap is closed from), one tape for all books
+    fill_mode: FillMode = "bar"
+    order_books: Mapping[str, LocalOrderBook] = field(default_factory=dict)
+    candles: CandleSource | None = None
+    tape: TradeTape = field(default_factory=TradeTape)
 
 
 @dataclass
@@ -294,9 +310,17 @@ def _infrastructure(
         if deps.on_alarm is not None:
             deps.on_alarm(name, alarm)
 
+    rig: TickRig | None = None
+    if deps.fill_mode == "tick":
+        model = TickFillModel(deps.fill_params)
+        sim = BracketSimulator(
+            deps.registry, deps.fees, deps.clock, model=model, candles=deps.candles, books=deps.order_books,
+            settle_s=deps.bars.rest_delay_s,
+        )  # fmt: skip
+        rig = TickRig(sim, deps.tape, deps.order_books, model)
     gateway = ShadowExecutionGateway(
         name, account, BarFillModel(deps.fill_params), deps.ledger, deps.clock, guard, deps.registry, deps.fees,
-        on_alarm=on_alarm,
+        on_alarm=on_alarm, tick=rig,
     )  # fmt: skip
     return account, guard, gateway, stats
 
@@ -568,6 +592,7 @@ def _engine(
     remote: RemoteBackend | None,
 ) -> DecisionEngine:
     on_execution = deps.on_execution
+    positions = deps.ledger.book_view(name)
     return DecisionEngine(
         products=deps.products,
         label=model.label,
@@ -575,7 +600,7 @@ def _engine(
         questions=model.questions,
         risk=risk,
         gateway=gateway if deps.wrap_gateway is None else deps.wrap_gateway(name, gateway),
-        positions=deps.ledger.book_view(name),
+        positions=positions,
         context=VirtualBookContext(account, deps),
         decision=decision,
         bars=deps.bars,
@@ -588,7 +613,47 @@ def _engine(
         cooldown_s=deps.cooldown_s,
         btc_product=deps.btc_product,
         on_execution=None if on_execution is None else (lambda report: on_execution(name, report)),
+        model_version=model.version,
+        stamp_entry=positions.stamp_entry,
     )
+
+
+# ------------------------------------------------------------------------------------------- model swap
+
+
+@dataclass(frozen=True)
+class BookSwap:
+    """What replacing the model of ONE book needs, all of it built: nothing in it can fail when it is installed."""
+
+    book: ShadowBook
+    model: BookModel
+    risk: RiskManager
+    engine_swap: ModelSwap
+
+
+def prepare_book_swap(book: ShadowBook, deps: BookDeps, model: BookModel) -> BookSwap:
+    """The swap of ``book`` to ``model`` (a ``model`` book or a ``random_entry``, whose policy, label, questions and
+    RiskManager are the source book's). Raises if the new model cannot be installed (``DecisionEngine.build_swap``);
+    the book is left untouched."""
+    engine = book.engine
+    if not isinstance(engine, DecisionEngine) or book.kind not in ("model", "random_entry"):
+        raise BookConfigError(f"book {book.name!r} has no model to swap")
+    risk = _risk_manager(book.name, deps, model)
+    swap = engine.build_swap(
+        version=model.version, label=model.label, policy=model.policy, questions=model.questions, risk=risk,
+        baseline=model.baseline if book.kind == "model" else KEEP_BACKEND,
+        remote=model.remote if book.kind == "model" else KEEP_BACKEND,
+    )  # fmt: skip
+    return BookSwap(book, model, risk, swap)
+
+
+def apply_book_swaps(swaps: Sequence[BookSwap]) -> None:
+    """Install the prepared swaps. No ``await``: all the books change between two bars, none of them half way."""
+    for s in swaps:
+        engine = s.book.engine
+        assert isinstance(engine, DecisionEngine)
+        engine.apply_swap(s.engine_swap)
+        s.book.model, s.book.risk, s.book.spread = s.model, s.risk, s.model.label.spread_for
 
 
 def _registry_alias(decider: str) -> str | None:
@@ -644,6 +709,7 @@ class ShadowBookManager:
         on_closed: Callable[[str, str, ExitResult], None] | None = None,
         on_error: Callable[[str, str, Exception], None] | None = None,
         restore: Mapping[str, BookRestore] | None = None,
+        tape: TradeTape | None = None,
     ) -> None:
         names = [b.name for b in books]
         if len(set(names)) != len(names):
@@ -654,6 +720,9 @@ class ShadowBookManager:
         self._on_closed = on_closed
         self._on_error = on_error
         self._restore: Mapping[str, BookRestore] = restore or {}
+        self._tape = tape or TradeTape()  # the one the gateways were built with (``BookDeps.tape``)
+        self._tick_books = [b for b in books if b.gateway.tick_mode]
+        self._tick_wake = asyncio.Event()
 
     @classmethod
     def from_config(
@@ -668,7 +737,7 @@ class ShadowBookManager:
         on_error: Callable[[str, str, Exception], None] | None = None,
     ) -> ShadowBookManager:
         books = [*build_books(configs, deps, resolve_model, spread), *extra]
-        return cls(books, on_closed=on_closed, on_error=on_error, restore=deps.restore)
+        return cls(books, on_closed=on_closed, on_error=on_error, restore=deps.restore, tape=deps.tape)
 
     @property
     def books(self) -> Mapping[str, ShadowBook]:
@@ -725,10 +794,68 @@ class ShadowBookManager:
             closed_n[name] = 0
             for product, since in sorted(report.catch_up_from.items()):
                 for bar in bars(product, since):
-                    for result in await book.gateway.on_bar(bar):
+                    for result in await book.gateway.on_bar(bar, gap=True):  # no trade was seen: the bars decide
                         closed_n[name] += 1
                         self._notify_closed(book, product, result)
         return closed_n
+
+    # ------------------------------------------------------------------------- tick fill mode
+
+    @property
+    def tick_mode(self) -> bool:
+        """At least one book resolves its brackets from the market trades (``dry_run.fill_model.mode: tick``)."""
+        return bool(self._tick_books)
+
+    def on_trades(self, trades: Sequence[Trade]) -> None:
+        """One event of the trade feed (``CoinbaseMarketStream.on_trades``). Synchronous: the simulators only produce
+        fills, ``settle_ticks`` / ``run_ticks`` book them. A book that fails is counted and does not reach the feed."""
+        if not self._tick_books:
+            return
+        self._tape.add(trades)
+        for book in self._tick_books:
+            try:
+                book.gateway.on_trades(trades)
+            except Exception as exc:
+                self._fail(book, "tick", exc)
+        self._tick_wake.set()
+
+    def on_damage(self, start: datetime, end: datetime | None) -> None:
+        """Trades in ``[start, end]`` may be missing (``CoinbaseMarketStream.on_damage``)."""
+        for book in self._tick_books:
+            try:
+                book.gateway.on_damage(start, end)
+            except Exception as exc:
+                self._fail(book, "tick", exc)
+
+    async def settle_ticks(self) -> None:
+        """Book the fills the simulators produced (every bar and every exit does it too)."""
+        for book in self._tick_books:
+            try:
+                results = await book.gateway.settle_closed()
+            except Exception as exc:
+                self._fail(book, "tick", exc)
+                continue
+            for product, result in results:
+                self._notify_closed(book, product, result)
+
+    async def pump_ticks(self) -> None:
+        """Periodic work of the tick mode: the stops that wait for liquidity retry on the current books, the data gaps
+        whose candles are final are closed, and the fills they cause are booked."""
+        for book in self._tick_books:
+            try:
+                book.gateway.on_books()
+                await book.gateway.resolve_gaps()
+            except Exception as exc:
+                self._fail(book, "tick", exc)
+        await self.settle_ticks()
+
+    async def run_ticks(self) -> None:
+        """Book the fills of the tick mode as soon as the feed produces them (a task of the process; runs until
+        cancelled)."""
+        while True:
+            await self._tick_wake.wait()
+            self._tick_wake.clear()
+            await self.settle_ticks()
 
     async def drain(self, timeout: float | None = None) -> None:
         """Wait for the entry/exit calls the engines still run (shutdown). Never raises for one book."""
@@ -751,6 +878,8 @@ class ShadowBookManager:
                 "consecutive_errors": b.stats.consecutive_errors,
                 "last_error": b.stats.last_error,
                 "coverage_alarms": b.stats.coverage_alarms,
+                "fill_mode": "tick" if b.gateway.tick_mode else "bar",
+                "tick": b.gateway.tick_stats,
                 "fees_paid": str(b.account.fees_paid),
                 "net_realized_pnl": str(b.account.net_realized_pnl),
             }
@@ -798,7 +927,7 @@ class ShadowBookManager:
 
     def _fail(self, book: ShadowBook, stage: str, exc: Exception) -> None:
         stats = book.stats
-        if stage == "gateway":
+        if stage in ("gateway", "tick"):
             stats.gateway_errors += 1
         else:
             stats.engine_errors += 1

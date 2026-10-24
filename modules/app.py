@@ -121,7 +121,9 @@ from modules.dryrun.books import (
     BookModel,
     ShadowBook,
     ShadowBookManager,
+    apply_book_swaps,
     build_books,
+    prepare_book_swap,
 )
 from modules.dryrun.fill_model import FillModelParams
 from modules.dryrun.recorder import WsRecorder
@@ -136,6 +138,13 @@ from modules.dryrun.registry import (
     artifacts_from_dir,
 )
 from modules.dryrun.restore import BookRestore, load_book_restore
+from modules.dryrun.schedule import (
+    DEFAULT_LEARNER_TIMEOUT_S,
+    DailyJob,
+    LearnerLauncher,
+    LearnerRunner,
+    run_learner_process,
+)
 from modules.dryrun.shadow_gateway import BarEvent, RestoreReport, ShadowExecutionGateway
 from modules.dryrun.virtual_account import VirtualAccount
 from modules.execution.balance import Clock, CoverageAlarm, utc_now
@@ -148,7 +157,7 @@ from modules.execution.exchange import (
 from modules.execution.gateway import CancelOutcome, EntryResult, ExecutionGateway, ExitResult
 from modules.execution.spot import SPOT_EXIT_CODE, SpotRegistry, SpotViolation, assert_live_key_permissions
 from modules.execution.watchdog import Watchdog
-from modules.ledger.positions import ClosedTrade, PositionLedger
+from modules.ledger.positions import ClosedTrade, EntryStamp, PositionLedger
 from modules.market.backfill import (
     Backfiller,
     BarStore,
@@ -161,7 +170,7 @@ from modules.market.backfill import (
 from modules.market.bars import BarClosed, BarFinalizer, BarService, BarStoreWriter
 from modules.market.indicators import IndicatorEngine
 from modules.market.orderbook import LocalOrderBook
-from modules.market.ws_feed import CoinbaseMarketStream, Quote
+from modules.market.ws_feed import CoinbaseMarketStream, Quote, Trade
 from modules.risk.costs import FeeProvider, FeeRates
 from modules.risk.kill_switch import AccountGuards, ExitReason, KillSwitch, SystemGuards
 from modules.risk.label_config import LoadedLabelConfig, load_label_config
@@ -212,6 +221,7 @@ FEE_POLL_S: Final = 60.0
 FAILURES_KEPT: Final = 20
 MINUTE: Final = timedelta(minutes=1)
 MODEL_BOOK_KINDS: Final = ("model", "random_entry")  # the books that decide with a model (and have a watchdog)
+SCHEDULE_POLL_S: Final = 15.0  # how often the daily clock looks at the time (00:15 learner, 00:30 reload)
 
 Sleep = Callable[[float], Awaitable[None]]
 EventHook = Callable[[str, str, Mapping[str, Any]], None]
@@ -511,8 +521,9 @@ def default_stream(
     products: Sequence[str],
     raw_tap: Callable[[float, str], None] | None,
     on_damage: Callable[[datetime, datetime | None], None],
+    on_trades: Callable[[Sequence[Trade]], None] | None = None,
 ) -> MarketFeed:
-    return CoinbaseMarketStream(products, raw_tap=raw_tap, on_damage=on_damage)
+    return CoinbaseMarketStream(products, raw_tap=raw_tap, on_damage=on_damage, on_trades=on_trades)
 
 
 def default_bar_service(
@@ -544,6 +555,7 @@ class Deps:
     stream: Callable[..., MarketFeed] = default_stream
     bar_service: Callable[..., BarRunner] = default_bar_service
     sentiment: Callable[[AppConfig, Mapping[str, str], AsyncExitStack], Awaitable[SentimentRunner]] = default_sentiment
+    run_learner: LearnerRunner = run_learner_process  # the nightly learner as a low-priority child process (00:15)
 
 
 # ------------------------------------------------------------------------------------------- key / safety
@@ -849,6 +861,24 @@ def _plan_books(
     return sorted(started, key=lambda b: order[b.name]), models
 
 
+class _TickRelay:
+    """The market stream is built before the books, so its callbacks go through here: the damage intervals are kept
+    (status, ops) and, once the manager exists, handed to it together with the trades (tick fill mode)."""
+
+    def __init__(self, damage: list[tuple[datetime, datetime | None]]) -> None:
+        self.manager: ShadowBookManager | None = None
+        self._damage = damage
+
+    def on_trades(self, trades: Sequence[Trade]) -> None:
+        if self.manager is not None:
+            self.manager.on_trades(trades)
+
+    def on_damage(self, start: datetime, end: datetime | None) -> None:
+        self._damage.append((start, end))
+        if self.manager is not None:
+            self.manager.on_damage(start, end)
+
+
 class _Late:
     """Callbacks the books need before the ``Runtime`` exists (``BookDeps`` is built first). Until ``runtime`` is set
     they do the part that needs nothing else; afterwards they forward."""
@@ -891,6 +921,29 @@ def _tail_since(history: pd.DataFrame, since: datetime | None) -> pd.DataFrame:
     if index.tz is None:
         stamp = stamp.tz_convert("UTC").tz_localize(None)
     return history[index >= stamp]
+
+
+def _err(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def _stamp_of(version: str, label: LoadedLabelConfig) -> EntryStamp:
+    """What a position records of the model that opened it."""
+    return EntryStamp(version, label.sha256, label.cfg.horizon_min)
+
+
+def _book_aliases(configs: Sequence[BookConfig]) -> dict[str, str]:
+    """book -> registry alias of its model: ``registry:<alias>`` books, and the random books that match one of them
+    (their policy, label and questions are the source book's)."""
+    alias: dict[str, str] = {}
+    for b in configs:
+        prefix, sep, name = b.decider.partition(":")
+        if sep and prefix == "registry" and name:
+            alias[b.name] = name
+    for b in configs:
+        if b.decider == "random" and b.match_frequency_of in alias:
+            alias[b.name] = alias[b.match_frequency_of]
+    return alias
 
 
 def _fill_model_version(params: FillModelParams) -> str:
@@ -939,7 +992,18 @@ class Runtime:
     on_event: EventHook | None = None
     decider_ratio_1h: float | None = None
     started_at: datetime = field(default_factory=utc_now)
+    book_deps: BookDeps | None = None  # what the books were built with (a reload builds the new RiskManagers from it)
+    book_alias: dict[str, str] = field(default_factory=dict)  # book -> the registry alias whose model it runs
+    fill_version: str | None = None  # ``fill@<hash>`` of the fill model the books run
+    forced_test_books: frozenset[str] = frozenset()  # random books with a forced BUY rate: not gated by the model
+    config_path: str | None = None  # the YAML the process was started with: the learner child reads the same one
+    learner_timeout_s: float = DEFAULT_LEARNER_TIMEOUT_S
+    jobs: list[DailyJob] = field(default_factory=list)
+    learner: LearnerLauncher | None = None
+    reload_log: list[dict[str, Any]] = field(default_factory=list)  # what the reloads did (status, tests)
     _window: RatioWindow = field(default_factory=RatioWindow, init=False)
+    _turn: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)  # bars and reload swaps never interleave
+    _restart_notified: set[str] = field(default_factory=set, init=False)
 
     # ------------------------------------------------------------------------------------------ start
 
@@ -1078,7 +1142,11 @@ class Runtime:
             recorder = WsRecorder(Path(rec.dir), retention_days=rec.retention_days)
             recorder.start()
             stack.push_async_callback(partial(asyncio.to_thread, recorder.stop))
-        feed = deps.stream(products, None if recorder is None else recorder.record, lambda a, b: damage.append((a, b)))
+        # the trade callback is handed to the stream only in the tick fill mode (a stream factory that does not know it
+        # keeps working in the bar mode)
+        relay = _TickRelay(damage)
+        tick_kwargs: dict[str, Any] = {"on_trades": relay.on_trades} if fill_cfg.mode == "tick" else {}
+        feed = deps.stream(products, None if recorder is None else recorder.record, relay.on_damage, **tick_kwargs)
 
         gates = _EntryGates(life, kill_switch)
         decision_log = DecisionLog.under(cfg.paths.data_dir)
@@ -1111,6 +1179,7 @@ class Runtime:
             entry_timeout=cfg.execution.entry_timeout_s, fill_params=params, decision=cfg.decision,
             bars=cfg.market.bars, products=tuple(products), sentiment=sentiment, remote=remote,
             on_execution=late.execution, on_alarm=late.alarm, wrap_gateway=wrap, restore=restores,
+            fill_mode=fill_cfg.mode, order_books=feed.books, candles=source,
         )  # fmt: skip
         try:
             shadow_books = build_books(configs, book_deps, lambda alias: models[alias].book_model())
@@ -1120,13 +1189,26 @@ class Runtime:
             raise StartupError(f"a book cannot be restored from the dry ledger: {exc}") from exc
         base_of = {p: spot.meta(p).base_currency for p in products}
         untunable = {m.version: m.no_entry_reason for m in models.values() if m.no_entry_reason is not None}
+        # a random book with a forced BUY rate is a TEST aid (``BookConfig.forced_buy_rate``): it does not benchmark the
+        # model, so the model's untunable verdict is not its own. Every other gate still applies to it.
+        forced_test_books = {c.name for c in configs if c.forced_buy_rate is not None}
         fill_version = _fill_model_version(params)
         books: list[Book] = []
         for sb in shadow_books:
             sb.spread = _spread_source(feed, sb.model.label if sb.model is not None else champion.label)
-            if sb.model is not None and sb.model.version in untunable:
+            if sb.model is not None and sb.model.version in untunable and sb.name not in forced_test_books:
                 gates.no_entry[sb.name] = str(untunable[sb.model.version])
-            ledger.set_trade_info(sb.name, model_version=sb.model_version, fill_model_version=fill_version)
+            stamp = None if sb.model is None else _stamp_of(sb.model.version, sb.model.label)
+            ledger.set_trade_info(
+                sb.name, model_version=sb.model_version, fill_model_version=fill_version,
+                label_sha256=None if stamp is None else stamp.label_sha256,
+                horizon_min=None if stamp is None else stamp.horizon_min,
+            )  # fmt: skip
+            if stamp is not None:  # open positions of a build that did not record their model take the book's
+                stamped = await ledger.stamp_open_positions(sb.name, stamp)
+                if stamped:
+                    log.warning("positions_stamped_with_the_book_model", book=sb.name, products=stamped,
+                                model=stamp.model_version, hint="opened before the model was recorded")  # fmt: skip
             engine = sb.engine
             watchdog: Watchdog | None = None
             if isinstance(engine, DecisionEngine):
@@ -1138,7 +1220,8 @@ class Runtime:
                         horizon_min=sb.model.label.cfg.horizon_min, atr_1h=partial(_atr_1h, engine), clock=clock,
                     )  # fmt: skip
             books.append(Book(sb, guards[sb.name], observed.get(sb.name), watchdog, base_of))
-        manager = ShadowBookManager(shadow_books, on_error=late.error, restore=restores)
+        manager = ShadowBookManager(shadow_books, on_error=late.error, restore=restores, tape=book_deps.tape)
+        relay.manager = manager
 
         finalizer = BarFinalizer(products, cfg.market.bars.rest_delay_s, cfg.market.bars.rest_max_delay_s)
         complete: dict[str, datetime] = {}
@@ -1159,8 +1242,15 @@ class Runtime:
             ledger=ledger, system=system, kill_switch=kill_switch, gates=gates, life=life, manager=manager,
             books=books, feed=feed, bar_service=bar_service, writer=writer, bar_queue=bar_queue,
             sentiment=sentiment, stack=stack, marks=marks, last_bar_t=last_bar_t, damage=damage, restores=restores,
-            events=events, ops=ops, telemetry_errors=errors, started_at=clock(),
+            events=events, ops=ops, telemetry_errors=errors, started_at=clock(), book_deps=book_deps,
+            book_alias=_book_aliases(configs), forced_test_books=frozenset(forced_test_books),
+            fill_version=fill_version,
         )  # fmt: skip
+        learner_cfg = cfg.dry_run.learner
+        runtime.jobs = [
+            DailyJob("learner", learner_cfg.run_at_utc, clock()),
+            DailyJob("reload", learner_cfg.reload_at_utc, clock()),
+        ]
         late.runtime = runtime
         life.fatal_hooks.append(runtime.on_fatal)
         await runtime._restore_books({p: tail for p, _e, _t, _c, tail in warmed})
@@ -1276,7 +1366,10 @@ class Runtime:
             TaskSpec("health", self._health_loop),
             TaskSpec("heartbeat", self._heartbeat_loop),
             TaskSpec("fees", self._fee_loop, critical=False),
+            TaskSpec("schedule", self._schedule_loop, critical=False),  # 00:15 learner child, 00:30 model reload
         ]
+        if self.manager.tick_mode:
+            specs.append(TaskSpec("tick_fills", self.manager.run_ticks))
         for book in self.books:
             if book.watchdog is not None:
                 specs.append(TaskSpec(f"watchdog:{book.name}", book.watchdog.run))
@@ -1332,6 +1425,160 @@ class Runtime:
             await self._shutdown()
         return self.life.exit_code
 
+    # ---------------------------------------------------------------------------------------------- schedule
+
+    def _learner_argv(self) -> list[str]:
+        return [] if self.config_path is None else ["--config", self.config_path]
+
+    async def _schedule_loop(self) -> None:
+        """The daily clock: poll the (injected) clock and run what is due. Nothing here can end the process."""
+        while True:
+            await self.run_scheduled(self.deps.clock())
+            await self.deps.sleep(SCHEDULE_POLL_S)
+
+    async def run_scheduled(self, now: datetime) -> list[str]:
+        """Run the daily jobs that are due at ``now`` (each fires once per UTC day). The learner is launched as a child
+        process and NOT awaited; the reload re-resolves the registry aliases. A job that raises is an event."""
+        ran: list[str] = []
+        for job in self.jobs:
+            if not job.due(now):
+                continue
+            job.mark(now)
+            ran.append(job.name)
+            try:
+                if job.name == "learner":
+                    self._launch_learner(now)
+                elif job.name == "reload":
+                    await self.reload_models()
+            except Exception as exc:  # the schedule never reaches the trading path
+                self.emit(f"{job.name}_job_failed", "error", error=_err(exc))
+        return ran
+
+    def _launch_learner(self, now: datetime) -> bool:
+        if self.learner is None:
+            self.learner = LearnerLauncher(
+                runner=self.deps.run_learner, emit=self.emit, argv=self._learner_argv(),
+                timeout_s=self.learner_timeout_s,
+            )
+        return self.learner.launch(now)
+
+    # ------------------------------------------------------------------------------------- model reload
+
+    def _swap_problem(self, target: Champion) -> str | None:
+        """Why ``target`` cannot be served by the books that run now, or ``None``. (Files, sha256, label_config,
+        questions and flat columns were already checked when the model was loaded.)"""
+        if target.sentiment_available != self.champion.sentiment_available:
+            return "the model and the running champion differ on the sentiment (the feed is wired for one of them)"
+        try:
+            for product in self.cfg.market.products:
+                target.label.spread_for(product, self.deps.clock())
+        except ValueError as exc:
+            return str(exc)
+        return None
+
+    async def reload_models(self) -> list[dict[str, str]]:
+        """00:30 UTC: re-resolve the registry alias of every book. A book whose alias now points at another version
+        switches to it at once, between two bars (``_turn``): decider, policy, label, questions and RiskManager are
+        replaced together for all the books of the alias. Positions already open keep their own bracket, horizon and
+        label_config; the SELL of a model with another label_config does not apply to them (engine).
+
+        FAIL CLOSED: a version that cannot be loaded or served (missing file, sha256 that does not match, an
+        incompatible label_config or questions, another sentiment) leaves the books on the version they run, as an
+        event. A book never ends up without a model. Returns the changes made."""
+        if self.book_deps is None:
+            return []
+        models_dir = Path(self.cfg.paths.models_dir)
+        changes: list[dict[str, str]] = []
+        for alias in sorted(set(self.book_alias.values())):
+            current = self.models.get(alias)
+            if current is None:
+                continue
+            if alias == CHAMPION_ALIAS and not self.cfg.decision.model.startswith("registry:"):
+                continue  # the champion book runs a model named in the config: the registry does not move it
+            try:
+                target = await asyncio.to_thread(self.deps.model_alias, models_dir, alias)
+            except Exception as exc:  # StartupError (damaged registry or version), OSError...
+                self.emit("model_reload_failed", "error", alias=alias, kept=current.version, error=_err(exc))
+                continue
+            if target is None or target.version == current.version:
+                continue
+            problem = self._swap_problem(target)
+            books = [b for b in self.books if self.book_alias.get(b.name) == alias and b.engine is not None]
+            swaps = []
+            if problem is None:
+                try:
+                    swaps = [prepare_book_swap(b.book, self.book_deps, target.book_model()) for b in books]
+                except Exception as exc:
+                    problem = _err(exc)
+            if problem is not None:
+                self.emit(
+                    "model_reload_failed", "error", alias=alias, kept=current.version, version=target.version,
+                    error=problem,
+                )  # fmt: skip
+                continue
+            op, reason = self._alias_record(models_dir, alias)
+            async with self._turn:  # not while a batch of bars is being decided
+                apply_book_swaps(swaps)
+                self.models[alias] = target
+                if alias == CHAMPION_ALIAS:
+                    self.champion = target
+                for b in books:
+                    self._after_swap(b, target)
+            for b in books:
+                change = {"book": b.name, "alias": alias, "from": current.version, "to": target.version}
+                changes.append(change)
+                self.reload_log.append({**change, "op": op, "reason": reason, "at": _iso(self.deps.clock())})
+                self.emit(
+                    "model_version_changed", "info", book=b.name,
+                    **{"alias": alias, "from": current.version, "to": target.version, "op": op, "reason": reason},
+                )  # fmt: skip
+        await self._warn_books_that_need_a_restart(models_dir)
+        return changes
+
+    def _after_swap(self, book: Book, target: Champion) -> None:
+        """What lives outside the engine and follows the model of a book (called under ``_turn``)."""
+        stamp = _stamp_of(target.version, target.label)
+        book.book.spread = _spread_source(self.feed, target.label)
+        self.ledger.set_trade_info(
+            book.name, model_version=stamp.model_version, fill_model_version=self.fill_version,
+            label_sha256=stamp.label_sha256, horizon_min=stamp.horizon_min,
+        )  # fmt: skip
+        if book.watchdog is not None:
+            book.watchdog.set_horizon_min(stamp.horizon_min)
+        if target.no_entry_reason is not None and book.name not in self.forced_test_books:
+            self.gates.no_entry[book.name] = str(target.no_entry_reason)
+        else:
+            self.gates.no_entry.pop(book.name, None)
+
+    @staticmethod
+    def _alias_record(models_dir: Path, alias: str) -> tuple[str | None, str | None]:
+        """The last operation recorded for the alias (``promote`` / ``rollback`` and its reason), if readable."""
+        try:
+            state = registry_of(models_dir).state(alias)
+        except RegistryError:
+            return None, None
+        return state.op, state.reason or None
+
+    async def _warn_books_that_need_a_restart(self, models_dir: Path) -> None:
+        """A configured ``registry:<alias>`` book that did not start (its alias was unset) cannot start without a
+        restart: say so once per version, the learner has just proposed it."""
+        running = {b.name for b in self.books}
+        for b in self.cfg.dry_run.books:
+            prefix, sep, alias = b.decider.partition(":")
+            if b.name in running or not (sep and prefix == "registry"):
+                continue
+            try:
+                found = await asyncio.to_thread(self.deps.model_alias, models_dir, alias)
+            except Exception:  # a damaged alias is reported by the reload itself, not here
+                continue
+            if found is None:
+                continue
+            version = found.version
+            key = f"{b.name}:{version}"
+            if key not in self._restart_notified:
+                self._restart_notified.add(key)
+                self.emit("book_needs_restart", "warning", book=b.name, alias=alias, version=version)
+
     # -------------------------------------------------------------------------------------------- pump
 
     async def _bar_pump(self) -> None:
@@ -1354,7 +1601,8 @@ class Runtime:
             if self.ops is not None:
                 self.ops.observe_bar(event)
                 self.ops.observe_spread(product, self.feed.spread_bps(product))
-        results = await self.manager.on_bars(events)
+        async with self._turn:  # a model swap happens between two bars, never inside one
+            results = await self.manager.on_bars(events)
         for book in self.books:
             self._observe_account(book)
         self._outcome_events(results)
@@ -1406,6 +1654,7 @@ class Runtime:
                     await book.watchdog.on_quote(quote)
                 except Exception as exc:  # one failed evaluation: log it, the next ticker retries
                     log.error("watchdog_ticker_failed", product=product, error=f"{type(exc).__name__}: {exc}")
+        await self.manager.pump_ticks()  # tick fill mode: stops waiting for liquidity, closed data gaps, queued fills
 
     async def _ticker_loop(self) -> None:
         seen: dict[str, Quote] = {}
@@ -1692,11 +1941,17 @@ class Runtime:
             self.ops.stop()
             await self.ops.flush()
 
+    async def _stop_learner(self) -> None:
+        """A learner child must not outlive the app (it resumes the date it started on its next run)."""
+        if self.learner is not None:
+            await self.learner.cancel()
+
     async def _shutdown(self) -> None:
         """Ordered, and every step is attempted whatever happened to the previous one. Brackets are not touched."""
         self.life.request_stop("shutdown")
         self._emit("agent_stopping", exit_code=self.life.exit_code, faults=dict(self.life.faults))
         steps: list[tuple[str, Callable[[], Awaitable[object]]]] = [
+            ("stop_learner", self._stop_learner),
             ("cancel_entries", self._cancel_entries),
             ("drain_in_flight", self._drain),
             ("flush_bars", self._flush_bars),
@@ -1759,7 +2014,9 @@ def install_signal_handlers(loop: asyncio.AbstractEventLoop, callback: Callable[
     return installed
 
 
-async def amain(cfg: AppConfig, env: Mapping[str, str], deps: Deps | None = None) -> int:
+async def amain(
+    cfg: AppConfig, env: Mapping[str, str], deps: Deps | None = None, config_path: str | None = None
+) -> int:
     """Start, run, stop; return the exit code. Nothing but a clean code leaves this function."""
     holder: list[Runtime] = []
     task = asyncio.current_task()
@@ -1788,6 +2045,7 @@ async def amain(cfg: AppConfig, env: Mapping[str, str], deps: Deps | None = None
     except Exception:
         log.exception("startup_failed")
         return EXIT_FAILURE
+    runtime.config_path = config_path
     holder.append(runtime)
     return await runtime.run()
 
@@ -1806,9 +2064,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--config", default=None, help="YAML config (default: config/config.yml if present)")
     args = ap.parse_args(argv)
     cfg = resolve_cli_config(args.config)
+    config_path = args.config or (DEFAULT_CONFIG_PATH if Path(DEFAULT_CONFIG_PATH).is_file() else None)
     configure_logging(collect_secrets(cfg, os.environ))
     try:
-        return asyncio.run(amain(cfg, os.environ))
+        return asyncio.run(amain(cfg, os.environ, config_path=config_path))
     except KeyboardInterrupt:
         return EXIT_OK
 

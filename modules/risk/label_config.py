@@ -6,6 +6,7 @@ runtime must use exactly the barriers ``p_edge`` was calibrated on, and must not
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 from collections.abc import Mapping
@@ -19,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from modules.risk.costs import CostParams, FeeRates
 
-__all__ = ["LabelConfig", "LoadedLabelConfig", "load_label_config"]
+__all__ = ["LabelConfig", "LoadedLabelConfig", "extend_label_config", "load_label_config"]
 
 
 class LabelConfig(BaseModel):
@@ -104,3 +105,30 @@ def load_label_config(path: Path) -> LoadedLabelConfig:
     if cfg.sha256(fees, costs, spreads) != expected:
         raise ValueError(f"{path}: sha256 does not match its content (edited by hand or another version)")
     return LoadedLabelConfig(cfg, fees, costs, spreads, holdout_start, raw)
+
+
+def extend_label_config(
+    label: LoadedLabelConfig, spreads: Mapping[str, float], *, probe: Mapping[str, float] | None = None
+) -> dict[str, Any]:
+    """Content of a ``label_config.json`` for the SAME barriers, fees, costs and holdout with more products.
+
+    The spread per product is part of the hash, so the new file has a new ``sha256``; ``extended_from_sha256`` and
+    ``extended_products`` say where it comes from and that the study behind the barriers (feasibility) did not
+    include the new products. Existing products can never change (that would be a different label).
+    """
+    clash = sorted(p for p in spreads if p in label.spread_bps)
+    if clash:
+        raise ValueError(f"products already in the label_config: {clash}")
+    if not spreads or any(not (v > 0) for v in spreads.values()):
+        raise ValueError("every new product needs a positive label spread (bps)")
+    merged = {**label.spread_bps, **{str(k): float(v) for k, v in spreads.items()}}
+    raw = copy.deepcopy(label.raw)
+    raw["spread_bps"] = {k: merged[k] for k in sorted(merged)}
+    source = dict(raw.get("spread_source", {}))
+    for product, value in spreads.items():
+        source[str(product)] = {"floor": float(value), "probe": None if probe is None else probe.get(product)}
+    raw["spread_source"] = source
+    raw["sha256"] = label.cfg.sha256(label.fees, label.costs, merged)
+    raw["extended_from_sha256"] = label.sha256
+    raw["extended_products"] = sorted(set(raw.get("extended_products", [])) | set(spreads))
+    return raw

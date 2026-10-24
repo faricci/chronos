@@ -69,3 +69,24 @@ Rules:
 - Mai riscrivere un file con `open(p, 'w')` di Python su Windows senza `newline=""`: converte tutti i fine riga in CRLF (il working tree e' CRLF, ma `tasks/*.md` no); per i documenti usare gli strumenti Edit/Write o `cat >>`.
 - Un test di riavvio deve confrontare lo stato dopo uno spegnimento PULITO (le entrate in attesa vengono annullate e rilasciate) con quello ricostruito; confrontarlo con lo stato a processo ancora vivo fa fallire per le riserve dell'entrata in corso, che e' corretto.
 - I test non devono scrivere nel repo: `make_cfg` ora mette anche `telemetry.dir` sotto `tmp`; una cartella `telemetry/` creata nella radice dal primo giro dei test e' stata rimossa a mano.
+
+## Un finto che non imita l'SDK non prova la riconnessione (canale `user`, 2026-10-20)
+
+- I test di `user_stream.py` erano verdi (1.8 mila) e il flusso si congelava al primo guasto sul feed vero: il finto non chiamava `on_close` dentro `close()` come fa l'SDK, non sollevava su un socket morto e non lasciava mai il thread dell'SDK vivo. Regola: un finto di trasporto riproduce i callback e le eccezioni REALI dell'SDK (letti nel sorgente installato); la prova di riconnessione si fa con guasti INIETTATI sul feed vero (`script/user_channel_soak.py --inject`), non solo con test.
+- Ogni attesa su un thread dell'SDK (`open`, `subscribe`, `close`) ha un timeout: una `close()` che non torna ha bloccato `_consume` per sempre. Un processo con thread non-daemon abbandonati non esce: lo script di soak termina con `os._exit` dopo aver scritto i rapporti.
+- Un flag "gia' segnalato" (`_silent`) che solo un messaggio puo' azzerare disattiva la sorveglianza proprio quando i messaggi non arrivano: il flag va azzerato anche alla nuova connessione.
+- Lo stesso schema e' in `modules/market/ws_feed.py` (non toccato): da provare con un soak con `abort`/`silence` sul feed pubblico.
+
+## Dataset esterni di news (studio a eventi, 2026-10-20)
+
+- Il timestamp di un dataset esterno va sempre confrontato con eventi noti prima di usarlo: il campo `published_on` del dataset CoinDesk e' in ora iraniana (Asia/Tehran), 3,5-4,5 ore avanti rispetto all'UTC; senza la correzione ogni risultato sarebbe stato sfasato. Verifica incrociata su titoli presenti in due dataset diversi e su eventi con orario noto (FTX, tweet SEC falso del 9-gen-2024).
+- Una regola di decisione (tag, finestre, controllo, famiglie di test) si scrive PRIMA di vedere i risultati e si congela con un hash (`TAGGER_VERSION`); si riportano tutti i test con la correzione per confronti multipli, non solo quelli che escono.
+- I titoli che raccontano un movimento arrivano dopo il prezzo: una notizia che 'spiega' un movimento non e' un segnale anticipatore.
+
+
+## Misurare l'impatto di una correzione di dati: stesso percorso del sistema, non una scorciatoia (revisioni REST, 2026-10-23)
+
+- Gli script di ricerca sostituivano una cella della griglia GIA' riempita; ricostruire la griglia con la stessa `fill_flat_bars` dalle righe reali rivisto (K15) ha cambiato i numeri: spostamento massimo SOL da 0 a 0,0153, stati ETH sopra 0,01 da 1 a 7. Regola: una misura di impatto passa dallo stesso codice di costruzione dei dati del sistema (righe reali -> griglia -> indicatori -> matrice -> modello), e la certificazione si fa sul codice ufficiale, non sullo script di ricerca.
+- Un criterio "quota per giorno" su un giorno PARZIALE ha un denominatore piccolo (343 stati: 1 stato = 0,29%): puo' fallire per due stati senza che il modello si comporti diversamente. Prima di scrivere una soglia per periodo, dire cosa succede ai periodi incompleti.
+- `vol_z_1d` e' lo z-score del volume dei giorni UTC COMPLETI: una revisione del giorno D lo sposta dal giorno D+1. Leggere la definizione prima di scrivere il test che dice "stesso giorno".
+- pandas recente da' `datetime64[us]` agli indici costruiti con `date_range`: le fixture che simulano lo store devono forzare `datetime64[ns, UTC]` (il dtype di `candles_to_frame`) o i confronti fra frame con etichette uguali sollevano.

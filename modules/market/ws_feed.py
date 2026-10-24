@@ -42,6 +42,8 @@ CHANNELS: Final = ("market_trades", "ticker", "level2", "heartbeats")
 SILENCE_S: Final = 5.0  # heartbeats arrive every second
 BACKOFF_MIN_S: Final = 1.0
 BACKOFF_MAX_S: Final = 30.0
+WATCHDOG_TICK_S: Final = 1.0
+NO_MESSAGE_AFTER_RECONNECT_S: Final = 45.0  # connected but nothing arrives: tear it down and try again
 
 SEEN_TRADES_MAX: Final = 20_000
 
@@ -265,11 +267,13 @@ class CoinbaseMarketStream:
         self._silence_s = silence_s
         self._seq = SequenceMonitor()
         self._transport: MarketTransport | None = None
-        self._queue: asyncio.Queue[tuple[float, str | None]] | None = None
+        self._queue: asyncio.Queue[tuple[float, str | None, int]] | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._resubscribe: set[str] = set()
         self._silent = False
         self._backoff = BACKOFF_MIN_S
+        self._reconnected_at = time.monotonic()
+        self._generation = 0  # one per transport: whatever a REPLACED transport still reports is ignored
 
     # ----------------------------------------------------------------------------- reads
 
@@ -388,21 +392,26 @@ class CoinbaseMarketStream:
 
     # ------------------------------------------------------------------------------ asyncio
 
-    def _on_message_thread(self, raw: str) -> None:
+    def _on_message_thread(self, raw: str, generation: int) -> None:
         """Called by the SDK thread: hand the message to the event loop together with its arrival time."""
         if self._loop is not None and self._queue is not None:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, (time.time(), raw))
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, (time.time(), raw, generation))
 
-    def _on_close_thread(self) -> None:
+    def _on_close_thread(self, generation: int) -> None:
         if self._loop is not None and self._queue is not None:
-            self._loop.call_soon_threadsafe(self._queue.put_nowait, (time.time(), None))
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, (time.time(), None, generation))
 
     async def _connect(self) -> None:
-        self._transport = self._factory(self._on_message_thread, self._on_close_thread)
+        self._generation += 1
+        generation = self._generation
+        self._transport = self._factory(
+            lambda raw: self._on_message_thread(raw, generation), lambda: self._on_close_thread(generation)
+        )
         await asyncio.to_thread(self._transport.open)
         await asyncio.to_thread(self._transport.subscribe, self.products, CHANNELS)
 
     async def _disconnect(self) -> None:
+        self._generation += 1  # the SDK reports our own close() as a drop: that report must not start a new reconnect
         transport, self._transport = self._transport, None
         if transport is not None:
             try:
@@ -414,13 +423,17 @@ class CoinbaseMarketStream:
         self.stats.reconnects += 1
         log.warning("ws_reconnecting", reason=reason, backoff_s=self._backoff)
         self._enter_trouble(reason)
-        await self._disconnect()
-        await asyncio.sleep(self._backoff)
-        self._backoff = min(self._backoff * 2, BACKOFF_MAX_S)
-        try:
-            await self._connect()
-        except Exception as exc:
-            log.error("ws_connect_failed", error=f"{type(exc).__name__}: {exc}")
+        while True:  # a failed attempt must never end the recovery: nothing else would wake the feed up again
+            await self._disconnect()
+            await asyncio.sleep(self._backoff)
+            self._backoff = min(self._backoff * 2, BACKOFF_MAX_S)
+            try:
+                await self._connect()
+            except Exception as exc:
+                log.error("ws_connect_failed", error=f"{type(exc).__name__}: {exc}", retry_in_s=self._backoff)
+                continue
+            self._reconnected_at = time.monotonic()
+            return
 
     async def _flush_resubscribes(self) -> None:
         if not self._resubscribe or self._transport is None:
@@ -456,7 +469,9 @@ class CoinbaseMarketStream:
     async def _consume(self) -> None:
         assert self._queue is not None
         while True:
-            recv_ts, raw = await self._queue.get()
+            recv_ts, raw, generation = await self._queue.get()
+            if generation != self._generation:
+                continue  # a transport that has been replaced or closed by us
             if raw is None:
                 await self._reconnect("connection closed")
                 continue
@@ -466,6 +481,8 @@ class CoinbaseMarketStream:
 
     async def _watchdog(self) -> None:
         while True:
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(WATCHDOG_TICK_S)
             if self.check_silence(self._clock()):
                 await self._reconnect("feed silent")
+            elif self._silent and time.monotonic() - self._reconnected_at > NO_MESSAGE_AFTER_RECONNECT_S:
+                await self._reconnect("no message after reconnect")  # connected, subscribed, and still dead

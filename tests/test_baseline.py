@@ -360,6 +360,21 @@ def test_model_files_and_card(trained: tuple[Path, Path, Path]) -> None:
     assert set(card["folds"]) == {"fold_0", "fold_1", "final"} and card["folds"]["final"]["metrics_test"] == {}
 
 
+def test_model_card_has_final_train_end(trained: tuple[Path, Path, Path]) -> None:
+    """Rule L5, V1: the card says where the data of the final model ends, and it is before the frozen holdout minus
+    the embargo (so a backtest window inside the holdout is out of sample for it)."""
+    root, run, _ = trained
+    card = json.loads((root / "model_card.json").read_text())
+    samples = pd.read_parquet(run / "samples.parquet")
+    used = samples.loc[samples["final_split"].isin(["train", "val"]), "label_window_end"]
+    expected = pd.Timestamp(used.max()).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert card["data"]["final_train_end"] == expected == bl.final_train_end(samples)
+    end = pd.Timestamp(card["data"]["final_train_end"])
+    embargo = pd.Timedelta(days=TrainConfig(**CFG_KW).embargo_days)
+    assert end <= pd.Timestamp(LABEL.holdout_start).tz_convert("UTC") - embargo
+    assert bl.final_train_end(samples.iloc[0:0]) is None
+
+
 def test_a_second_training_gets_the_next_version_number(trained: tuple[Path, Path, Path], tmp_path: Path) -> None:
     root, _, _ = trained
     assert bl._version(root.parent, datetime(2026, 10, 18, tzinfo=UTC)) == "baseline-lgbm@2026-10-18.2"

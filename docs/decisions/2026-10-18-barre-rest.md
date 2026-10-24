@@ -1,5 +1,6 @@
 <!-- Risoluzione di architetto-opus del 2026-10-18 (fonte canonica delle barre 1m: candele REST a T+S). Le sezioni 7.x sono gia' nella spec; 5 (firme) e 6 (test) sono il riferimento per bars.py, backfill.py, ws_feed.py, e per DecisionEngine, KillSwitch, learner L0 e report ancora da scrivere. -->
 > Valori numerici di market.bars e stale_bar_s superati dalla taratura del 2026-10-18 (S = 120 s): vedi sez. 2.3 A.2 della spec.
+> Q3.2 (criterio 0.005 come gate) superato dalla decisione 2026-10-20 (`docs/decisions/2026-10-20-revisioni-rest-e-promozione.md`): il valore 0.005 resta come allarme diagnostico; il gate misura l'impatto delle revisioni (R1-R4).
 
 # RISOLUZIONE ARCHITETTONICA - Fonte canonica delle barre a 1 minuto
 

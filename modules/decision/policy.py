@@ -38,6 +38,8 @@ __all__ = [
     "PolicyConfig",
     "PolicyMismatchError",
     "load_policy",
+    "masked_buy_prob",
+    "masked_sell_prob",
     "regime_from_pctile",
     "regimes_from_pctile",
 ]
@@ -164,8 +166,8 @@ class DecisionPolicy:
         cfg = self.config
         p = np.asarray(p_action, dtype=np.float64)
         total = p[:, 0] + p[:, 2]  # BUY, HOLD
+        masked_buy = masked_buy_prob(p)
         with np.errstate(divide="ignore", invalid="ignore"):
-            masked_buy = np.where(total > 0, p[:, 0] / total, 0.0)
             h = -np.where(p > 0, p * np.log(np.where(p > 0, p, 1.0)), 0.0).sum(axis=1)
         confidence = np.clip(1.0 - h / math.log(p.shape[1]), 0.0, 1.0)
         allowed = np.isin(regimes_from_pctile(vol_pctile), np.array(ENTRY_REGIMES))
@@ -175,6 +177,20 @@ class DecisionPolicy:
         """``resolve(...) == SELL`` for many LONG states: masked P(SELL) over SELL+HOLD against ``tau_sell``."""
         p = np.asarray(p_action, dtype=np.float64)
         total = p[:, 1] + p[:, 2]  # SELL, HOLD
-        with np.errstate(divide="ignore", invalid="ignore"):
-            masked_sell = np.where(total > 0, p[:, 1] / total, 0.0)
-        return np.asarray((total > 0) & (masked_sell >= self.config.tau_sell))
+        return np.asarray((total > 0) & (masked_sell_prob(p) >= self.config.tau_sell))
+
+
+def masked_buy_prob(p_action: np.ndarray) -> np.ndarray:
+    """P(BUY) over BUY+HOLD for many FLAT states (0 where both are 0): the masked probability ``resolve`` compares."""
+    p = np.asarray(p_action, dtype=np.float64)
+    total = p[:, 0] + p[:, 2]  # BUY, HOLD
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.asarray(np.where(total > 0, p[:, 0] / total, 0.0))
+
+
+def masked_sell_prob(p_action: np.ndarray) -> np.ndarray:
+    """P(SELL) over SELL+HOLD for many LONG states (0 where both are 0)."""
+    p = np.asarray(p_action, dtype=np.float64)
+    total = p[:, 1] + p[:, 2]  # SELL, HOLD
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return np.asarray(np.where(total > 0, p[:, 1] / total, 0.0))

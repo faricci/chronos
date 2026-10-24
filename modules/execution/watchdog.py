@@ -146,6 +146,12 @@ class Watchdog:
         self.exits_started = 0
         self.exits_failed = 0
 
+    def set_horizon_min(self, horizon_min: int) -> None:
+        """The horizon of positions that record none (the book's model changed): the new model's ``H``."""
+        if horizon_min < 1:
+            raise ValueError("horizon_min must be at least 1")
+        self._horizon_min = horizon_min
+
     # ----------------------------------------------------------------------------------- tickers
 
     async def on_quote(self, quote: Quote) -> Verdict:
@@ -221,7 +227,8 @@ class Watchdog:
         if pos.opened_at is None:
             log.error("watchdog_position_without_opened_at", product_id=pos.product_id)
             return None
-        due = horizon_deadline(pos.opened_at, self._horizon_min)
+        # the horizon the position was OPENED under (a model swap can change the book's), else the book's current one
+        due = horizon_deadline(pos.opened_at, pos.horizon_min or self._horizon_min)
         if now < due:
             return None
         return Verdict("exit_due", pos.product_id, "HORIZON", f"horizon reached at {due.isoformat()}")

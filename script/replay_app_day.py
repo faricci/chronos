@@ -19,6 +19,19 @@ ones, so that trades open and close within hours. It is a test of the MECHANICS 
 report), not a strategy: its ``model_card.json`` says ``"demo": true``. ``random_entry`` draws BUY at
 ``--random-rate`` (its documented test setting) in both variants; with a real untunable champion the gate still
 blocks it.
+
+``--second-model label|policy`` (with a window that crosses 00:15 and 00:30 UTC, ``--end-day`` the next day) proves the
+model life cycle of the app on real data: a SECOND version of the demo model waits in ``<work>/models/staged``; at 00:15
+(simulated) the scheduler of the app launches its "learner", which in the replay is a stand-in that registers the
+second version and promotes it as champion in the SCRATCH registry (what the nightly learner plus the local
+``registry promote`` do in life); at 00:30 the app reloads and swaps the models of the books between two bars.
+``label``: the second version has another label_config (barriers, horizon), so the SELL of the new model must NOT
+touch the positions the first one opened; ``policy``: same label_config, a policy that sells at once, so it must.
+
+``--fill-mode tick`` runs the brackets of every book from the recorded TRADES and ORDER BOOKS (``BracketSimulator``)
+instead of the 1m bars (``dry_run.fill_model.mode``); a data gap of the recording is closed with the candles of the
+scratch store. Run it twice (``bar`` and ``tick``, two ``--work`` directories) and compare the two ledgers with
+``script.tick_vs_bar_compare``.
 """
 
 from __future__ import annotations
@@ -40,9 +53,11 @@ from modules.app import Champion, Deps, Runtime, load_champion
 from modules.config import AppConfig, CoinbaseConfig, load_config
 from modules.decision.questions import build_questions
 from modules.dryrun.books import BuyAndHoldDriver
+from modules.dryrun.registry import FilesystemModelRegistry, artifacts_from_dir
 from modules.dryrun.replay import ReplayMarketStream, ReplayResult, ReplayRunner, SimClock
+from modules.dryrun.schedule import LearnerResult, LearnerRunner, run_learner_process
 from modules.execution.balance import Clock
-from modules.market.backfill import CandleSource, load_bars
+from modules.market.backfill import CandleSource, StoreCandleSource, load_bars
 from modules.market.bars import BarService
 from modules.risk.costs import CostParams, FeeRates
 from modules.risk.label_config import LabelConfig
@@ -50,6 +65,8 @@ from modules.telemetry.status import EquityWriter, StatusWriter
 
 MINUTE = timedelta(minutes=1)
 DEMO_VERSION = "baseline-lgbm@2026-10-19.1"
+SECOND_VERSION = "baseline-lgbm@2026-10-20.1"
+STAGED = "staged"  # <work>/models/staged/<version>: a version that exists but is not registered yet
 
 
 # ------------------------------------------------------------------------------------------------ scratch copy
@@ -71,11 +88,17 @@ def copy_inputs(src: Path, work: Path, days: Sequence[date]) -> None:
     print(f"inputs copied into {work} in {time.time() - t0:.0f} s", flush=True)
 
 
-def make_demo_model(work: Path, *, atr_tf: str, k_tp: float, k_sl: float, horizon_min: int) -> None:
-    """A copy of the newest real model with a short label and a permissive policy (see the module docstring)."""
+def make_demo_model(
+    work: Path, *, atr_tf: str, k_tp: float, k_sl: float, horizon_min: int, version: str = DEMO_VERSION,
+    staged: bool = False, tau_sell: float = 1.0,
+) -> Path:  # fmt: skip
+    """A copy of the newest real model with a short label and a permissive policy (see the module docstring).
+    ``staged``: written under ``models/staged`` (not a candidate of the bootstrap); ``tau_sell``: where it sells."""
     root = work / "models" / "baseline"
-    newest = sorted(p for p in root.glob("*@*") if (p / "model_card.json").is_file() and p.name != DEMO_VERSION)[-1]
-    demo = root / DEMO_VERSION
+    own = (DEMO_VERSION, SECOND_VERSION)
+    newest = sorted(p for p in root.glob("*@*") if (p / "model_card.json").is_file() and p.name not in own)[-1]
+    demo = (work / "models" / STAGED if staged else root) / version
+    demo.parent.mkdir(parents=True, exist_ok=True)
     if demo.exists():
         shutil.rmtree(demo)
     shutil.copytree(newest, demo)
@@ -91,17 +114,18 @@ def make_demo_model(work: Path, *, atr_tf: str, k_tp: float, k_sl: float, horizo
     raw["sha256"] = sha
     (demo / "label_config.json").write_text(json.dumps(raw, indent=2, sort_keys=True), encoding="utf-8")
     card = json.loads((demo / "model_card.json").read_text(encoding="utf-8"))
-    card["model"] = DEMO_VERSION
+    card["model"] = version
     card["label_config"]["sha256"] = sha
     card["questions_version"] = build_questions(horizon_min, k_tp, k_sl, atr_tf).version_tag  # type: ignore[arg-type]
     card["demo"] = True
     card["demo_note"] = "label and policy replaced to exercise the mechanics; NOT a strategy"
     (demo / "model_card.json").write_text(json.dumps(card, indent=2, sort_keys=True), encoding="utf-8")
     policy = {
-        "model": DEMO_VERSION, "tau_buy": 0.01, "tau_sell": 1.0, "c_min": 0.0, "p_be_buffer": 0.0,
+        "model": version, "tau_buy": 0.01, "tau_sell": tau_sell, "c_min": 0.0, "p_be_buffer": 0.0,
         "regime_rule": "ATR1D_PCTILE365:5/35/65/95", "label_config_sha256": sha,
     }  # fmt: skip
     (demo / "final" / "policy.json").write_text(json.dumps(policy, indent=2), encoding="utf-8")
+    return demo
 
 
 def write_config(work: Path, args: argparse.Namespace) -> Path:
@@ -123,7 +147,7 @@ def write_config(work: Path, args: argparse.Namespace) -> Path:
         "risk": risk,
         "dry_run": {
             "db_path": str(work / "state" / "chronos_dry.db"), "books": books,
-            "fill_model": {"path": str(work / "models" / "registry" / "fill_model.json")},
+            "fill_model": {"path": str(work / "models" / "registry" / "fill_model.json"), "mode": args.fill_mode},
             "recording": {"enabled": False, "dir": str(work / "data" / "ws_recordings")},
         },
         "telemetry": {"dir": str(work / "telemetry"), "ops_interval_s": 60},
@@ -145,11 +169,6 @@ def assert_scratch(cfg: AppConfig, work: Path) -> None:
 
 
 # ------------------------------------------------------------------------------------------------ the replay
-
-
-class NoCandles:
-    def fetch(self, product_id: str, start_s: int, end_s: int) -> list[dict[str, Any]]:
-        return []
 
 
 class _SilentBars:
@@ -189,6 +208,11 @@ class AppReplayRunner(ReplayRunner):
             result.decisions += processed
         await self._quiesce()
         await self._rt.pump_tickers(self._seen_quotes)  # the last prices: stale-data guard and the watchdogs' stop
+        ran = await self._rt.run_scheduled(self._rt.deps.clock())  # 00:15 learner, 00:30 reload, in simulated time
+        if ran:
+            print(f"[schedule] {self._rt.deps.clock().isoformat()} ran {ran}", flush=True)
+            if self._rt.learner is not None:
+                await self._rt.learner.wait()
         for book in self._rt.books:
             if book.watchdog is not None:
                 await book.watchdog.check_horizons()
@@ -238,23 +262,43 @@ class AppReplayRunner(ReplayRunner):
                     await book.shadow.cancel(product)
                     result.cancelled_at_end.append(f"{book.name}:{product}")
         await self._quiesce()
+        await self._rt.manager.pump_ticks()  # tick mode: the fills of the last messages are booked
         await self._rt.manager.drain(timeout=0)
 
 
-def build_deps(clock: SimClock, work: Path, holder: dict[str, Any], start: datetime) -> Deps:
+def stand_in_learner(work: Path, staged: Path | None, version: str) -> LearnerRunner:
+    """The "learner" of the replay: instead of a training run, register the staged second version in the SCRATCH
+    registry and promote it as champion (nightly learner + local ``registry promote`` of the real life)."""
+
+    async def run(argv: Sequence[str], timeout_s: float) -> LearnerResult:
+        if staged is None:
+            return LearnerResult(0, False, 0.0, "replay: nothing to register")
+        registry = FilesystemModelRegistry(work / "models" / "registry")
+        registry.register(artifacts_from_dir(staged), {"version": version, "kind": "baseline-lgbm", "origin": "replay"})
+        registry.promote(version, "champion", reason="replay: stand-in for the nightly learner and the local promotion")
+        return LearnerResult(0, False, 0.0, f"replay: {version} registered and promoted")
+
+    return run
+
+
+def build_deps(
+    clock: SimClock, work: Path, holder: dict[str, Any], start: datetime, run_learner: LearnerRunner | None = None
+) -> Deps:
     def history(root: Path, product: str) -> Any:
         return load_bars(root, product, end=start - MINUTE, store_complete_until_end=True)
 
-    def stream(products: Sequence[str], tap: Any, on_damage: Any) -> ReplayMarketStream:
-        holder["stream"] = ReplayMarketStream(products, clock, on_damage=on_damage)
+    def stream(products: Sequence[str], tap: Any, on_damage: Any, on_trades: Any = None) -> ReplayMarketStream:
+        holder["stream"] = ReplayMarketStream(products, clock, on_trades=on_trades, on_damage=on_damage)
         return holder["stream"]  # type: ignore[no-any-return]
 
     async def no_backfill(cfg: AppConfig, source: CandleSource, clk: Clock) -> None:
         return None
 
+    candles = StoreCandleSource(work / "data" / "bars" / "1m")  # a tick-mode data gap is closed from the scratch store
     return Deps(
-        clock=clock, candle_source=NoCandles, backfill=no_backfill, history=history, stream=stream,
+        clock=clock, candle_source=lambda: candles, backfill=no_backfill, history=history, stream=stream,
         bar_service=lambda *a, **k: _SilentBars(), champion=_champion_loader(),
+        run_learner=run_learner or run_learner_process,
     )  # fmt: skip
 
 
@@ -266,12 +310,13 @@ def _champion_loader() -> Any:
 
 
 async def run_phase(
-    cfg: AppConfig, work: Path, start: datetime, end: datetime, *, label: str, preroll: timedelta
-) -> tuple[Runtime, ReplayResult, float]:
+    cfg: AppConfig, work: Path, start: datetime, end: datetime, *, label: str, preroll: timedelta,
+    run_learner: LearnerRunner | None = None,
+) -> tuple[Runtime, ReplayResult, float]:  # fmt: skip
     clock = SimClock(start)
     holder: dict[str, Any] = {}
     t0 = time.time()
-    runtime = await Runtime.start(cfg, {}, build_deps(clock, work, holder, start))
+    runtime = await Runtime.start(cfg, {}, build_deps(clock, work, holder, start, run_learner))
     print(f"[{label}] runtime built in {time.time() - t0:.0f} s; books: {[b.name for b in runtime.books]}", flush=True)
     for name, report in runtime.restore_reports.items():
         print(f"[{label}] restored {name}: brackets {list(report.restored)}, new {list(report.placed)}, "
@@ -287,6 +332,7 @@ async def run_phase(
     print(f"[{label}] replayed {result.bars} bars, {result.messages} messages in {time.time() - t1:.0f} s; "
           f"decisions {len(result.decisions)}, watchdog exits "
           f"{sum(b.watchdog.exits_started for b in runtime.books if b.watchdog is not None)}", flush=True)  # fmt: skip
+    await print_trades(runtime, label)
     runtime.request_stop("end of the window")
     await runtime._shutdown()  # noqa: SLF001  (the clean stop of the app: cancel entries, flush, ops, close)
     return runtime, result, time.time() - t0
@@ -296,8 +342,14 @@ def summarize(rt: Runtime, label: str) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for b in rt.books:
         out[b.name] = {
-            "open_positions": [p.product_id for p in rt.ledger.long_positions(b.name)],
+            "model": b.book.model_version,
+            "open_positions": {
+                p.product_id: {"model": p.model_version, "horizon_min": p.horizon_min,
+                               "label": None if p.label_sha256 is None else p.label_sha256[:8]}
+                for p in rt.ledger.long_positions(b.name)
+            },
             "cash": str(b.account.balances.total("EUR")), "fees_paid": str(b.account.fees_paid),
+            "tick": b.shadow.tick_stats,
             "realized_gross": str(b.account.realized_pnl), "engine": None if b.engine is None else dict(
                 decisions=b.engine.stats.decisions, intents=b.engine.stats.intents, errors=b.engine.stats.errors,
                 skips=dict(b.engine.stats.skips), actions=dict(b.engine.stats.actions),
@@ -307,6 +359,24 @@ def summarize(rt: Runtime, label: str) -> dict[str, Any]:
     return out
 
 
+async def print_trades(rt: Runtime, label: str) -> None:
+    """The closed trades with the model version that OPENED them (read before the ledger is closed)."""
+    for t in await rt.ledger.closed_trades():
+        print(f"[{label}] trade {t.book} {t.product_id} {t.exit_reason} opened_by={t.model_version} "
+              f"entry={t.entry_at.isoformat()} exit={t.exit_at.isoformat()} net={t.net_quote}", flush=True)  # fmt: skip
+
+
+def report_life_cycle(rt: Runtime, *, label: str) -> None:
+    """What the model life cycle did: the reloads and the events of the clock (read after the shutdown flushed them)."""
+    print(f"[{label}] reloads: {json.dumps(rt.reload_log, default=str)}", flush=True)
+    events = Path(rt.cfg.telemetry.events_dir or Path(rt.cfg.paths.data_dir) / "events")
+    for path in sorted(events.glob("*.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            rec = json.loads(line)
+            if str(rec.get("type", "")).startswith(("model_", "learner_", "book_needs")):
+                print(f"[{label}] event {path.stem} {json.dumps(rec, default=str)}", flush=True)
+
+
 async def amain(args: argparse.Namespace) -> int:
     src, work = Path(args.src).resolve(), Path(args.work).resolve()
     day = date.fromisoformat(args.day)
@@ -314,14 +384,29 @@ async def amain(args: argparse.Namespace) -> int:
     start = datetime(day.year, day.month, day.day, hh, mm, tzinfo=UTC)
     hh, mm = (int(x) for x in args.to.split(":"))
     end = datetime(day.year, day.month, day.day, hh, mm, tzinfo=UTC)
+    if args.end_day:
+        last = date.fromisoformat(args.end_day)
+        end = end.replace(year=last.year, month=last.month, day=last.day)
     restart = None
     if args.restart_at:
         hh, mm = (int(x) for x in args.restart_at.split(":"))
         restart = datetime(day.year, day.month, day.day, hh, mm, tzinfo=UTC)
     work.mkdir(parents=True, exist_ok=True)
-    copy_inputs(src, work, [day])
+    copy_inputs(src, work, [day + timedelta(days=i) for i in range((end.date() - day).days + 1)])
+    staged: Path | None = None
     if args.variant == "demo":
         make_demo_model(work, atr_tf=args.atr_tf, k_tp=args.k_tp, k_sl=args.k_sl, horizon_min=args.horizon_min)
+        if args.second_model == "label":
+            staged = make_demo_model(
+                work, atr_tf=args.atr_tf, k_tp=1.5, k_sl=1.0, horizon_min=max(args.horizon_min // 2, 10),
+                version=SECOND_VERSION, staged=True, tau_sell=0.0,
+            )  # fmt: skip
+        elif args.second_model == "policy":
+            staged = make_demo_model(
+                work, atr_tf=args.atr_tf, k_tp=args.k_tp, k_sl=args.k_sl, horizon_min=args.horizon_min,
+                version=SECOND_VERSION, staged=True, tau_sell=0.0,
+            )  # fmt: skip
+    learner = stand_in_learner(work, staged, SECOND_VERSION)
     config_path = write_config(work, args)
     cfg = load_config(config_path)
     cfg = cfg.model_copy(update={"coinbase": CoinbaseConfig()})
@@ -330,8 +415,11 @@ async def amain(args: argparse.Namespace) -> int:
     phases = [(start, end)] if restart is None else [(start, restart), (restart, end)]
     for i, (a, b) in enumerate(phases):
         # every phase feeds the recording from the same instant: the order books need the snapshot of the connection
-        rt, res, took = await run_phase(cfg, work, a, b, label=f"phase {i + 1}", preroll=preroll + (a - start))
+        rt, res, took = await run_phase(
+            cfg, work, a, b, label=f"phase {i + 1}", preroll=preroll + (a - start), run_learner=learner
+        )
         summarize(rt, f"phase {i + 1} end")
+        report_life_cycle(rt, label=f"phase {i + 1}")
         print(f"[phase {i + 1}] took {took:.0f} s", flush=True)
     print(f"done. config: {config_path}", flush=True)
     return 0
@@ -345,7 +433,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--from", dest="from_", required=True, help="HH:MM UTC")
     ap.add_argument("--to", required=True, help="HH:MM UTC")
     ap.add_argument("--restart-at", default=None, help="HH:MM UTC: stop the app there and start it again")
+    ap.add_argument("--end-day", default=None, help="YYYY-MM-DD of --to (default: --day): a window past midnight")
+    ap.add_argument("--second-model", choices=("none", "label", "policy"), default="none",
+                    help="stage a second version, promoted at 00:15 and reloaded at 00:30 (see the module docstring)")
     ap.add_argument("--variant", choices=("real", "demo"), default="demo")
+    ap.add_argument("--fill-mode", choices=("bar", "tick"), default="bar", help="dry_run.fill_model.mode")
     ap.add_argument("--random-rate", type=float, default=0.01, help="forced BUY probability (test setting)")
     ap.add_argument("--products", nargs="+", default=["BTC-EUR", "ETH-EUR", "SOL-EUR"])
     ap.add_argument("--atr-tf", default="1h")

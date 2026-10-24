@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS positions (
   base_qty TEXT NOT NULL, avg_entry TEXT, opened_at TEXT, entry_decision_id TEXT,
   bracket_order_id TEXT, tp TEXT, sl TEXT, k_tp REAL, k_sl REAL, atr_at_entry TEXT,
   dust_qty TEXT NOT NULL DEFAULT '0', dust_cost TEXT NOT NULL DEFAULT '0',
+  model_version TEXT, label_config_sha256 TEXT, horizon_min INTEGER,
   PRIMARY KEY (book, product_id)
 );
 CREATE TABLE IF NOT EXISTS orders (
@@ -88,6 +89,11 @@ CLOSED_TRADES_COLUMNS: Final = {
     "gap_resolved": "INTEGER NOT NULL DEFAULT 0", "model_version": "TEXT", "fill_model_version": "TEXT",
 }  # fmt: skip
 
+# columns a ``positions`` table must have (spec 5.1.6: the model, label_config and horizon the position was OPENED
+# under); an older table gets them added, nullable, and no existing row is touched
+POSITIONS_COLUMNS: Final = {"model_version": "TEXT", "label_config_sha256": "TEXT", "horizon_min": "INTEGER"}
+ENTRY_STAMPS_MAX: Final = 512  # stamps of entries that never filled are dropped oldest first
+
 TERMINAL_STATUSES: Final = frozenset({"FILLED", "CANCELLED", "EXPIRED", "REJECTED", "FAILED"})
 EXIT_REASONS: Final = frozenset({"TP", "SL", "SELL", "HORIZON", "WATCHDOG", "MANUAL"})
 
@@ -120,6 +126,12 @@ class PositionView:
     atr_at_entry: Decimal | None = None
     dust_qty: Decimal = ZERO
     dust_cost: Decimal = ZERO
+    # what the position was opened under: the model that decided the entry, the sha256 of its label_config and its
+    # horizon H. The SELL of a model with another label_config does not apply to it (spec 5.1.6) and the watchdog
+    # closes it at ITS horizon, whatever the book runs now. ``None``: opened before they were recorded.
+    model_version: str | None = None
+    label_sha256: str | None = None
+    horizon_min: int | None = None
 
     @property
     def is_long(self) -> bool:
@@ -140,6 +152,16 @@ class EntryPlan:
     k_tp: float
     k_sl: float
     atr: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class EntryStamp:
+    """The model an entry was decided by, announced BEFORE the order (``stamp_entry``): the position it opens takes it,
+    even when the version of the book changes while the entry waits to fill."""
+
+    model_version: str
+    label_sha256: str
+    horizon_min: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -260,6 +282,9 @@ class BookPositions:
     def view(self, product_id: str) -> PositionView:
         return self._ledger.view(self._book, product_id)
 
+    def stamp_entry(self, decision_id: str, stamp: EntryStamp) -> None:
+        self._ledger.stamp_entry(self._book, decision_id, stamp)
+
 
 def _dec(value: str | None) -> Decimal | None:
     return None if value is None else Decimal(value)
@@ -286,6 +311,9 @@ def _row_to_view(r: aiosqlite.Row) -> PositionView:
         atr_at_entry=_dec(r["atr_at_entry"]),
         dust_qty=Decimal(r["dust_qty"]),
         dust_cost=Decimal(r["dust_cost"]),
+        model_version=r["model_version"],
+        label_sha256=r["label_config_sha256"],
+        horizon_min=r["horizon_min"],
     )
 
 
@@ -320,6 +348,11 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     for column, ddl in CLOSED_TRADES_COLUMNS.items():
         if column not in have:
             await db.execute(f"ALTER TABLE closed_trades ADD COLUMN {column} {ddl}")
+    async with db.execute("PRAGMA table_info(positions)") as cur:
+        have = {r["name"] for r in await cur.fetchall()}
+    for column, ddl in POSITIONS_COLUMNS.items():  # additive and nullable: the rows already there are not touched
+        if column not in have:
+            await db.execute(f"ALTER TABLE positions ADD COLUMN {column} {ddl}")
     await db.execute(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?)"
         " ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -353,6 +386,8 @@ class PositionLedger:
         self._lock = asyncio.Lock()
         self._exit_hints: dict[tuple[str, str], str] = {}
         self._trade_info: dict[str, tuple[str | None, str | None]] = {}
+        self._book_stamp: dict[str, EntryStamp] = {}  # the model a book runs now: the fallback of an unannounced entry
+        self._entry_stamps: dict[tuple[str, str], EntryStamp] = {}  # (book, decision_id) -> the model that decided
         self._listeners: list[CloseListener] = []
         self.gap_resolution = False  # True while the bars of a downtime are replayed: the trades they close say so
 
@@ -426,6 +461,10 @@ class PositionLedger:
                 str(v.dust_qty), str(v.dust_cost),
             ),
         )  # fmt: skip
+        await self._db.execute(
+            "UPDATE positions SET model_version=?, label_config_sha256=?, horizon_min=? WHERE book=? AND product_id=?",
+            (v.model_version, v.label_sha256, v.horizon_min, v.book, v.product_id),
+        )
 
     async def _mutate_position(
         self, book: str, product_id: str, change: object, fill: FillRecord | None = None
@@ -471,9 +510,43 @@ class PositionLedger:
     def clear_exit(self, book: str, product_id: str) -> None:
         self._exit_hints.pop((book, product_id), None)
 
-    def set_trade_info(self, book: str, *, model_version: str | None, fill_model_version: str | None) -> None:
-        """Versions written on every trade the book closes from now on (the ledger does not know them)."""
+    def set_trade_info(
+        self, book: str, *, model_version: str | None, fill_model_version: str | None,
+        label_sha256: str | None = None, horizon_min: int | None = None,
+    ) -> None:  # fmt: skip
+        """What the book runs NOW. ``fill_model_version`` is written on every trade the book closes from now on.
+        ``model_version`` is the fallback for a trade whose position carries none (it was opened before the stamps
+        existed); a position takes the model that DECIDED its entry (``stamp_entry``), or, when nobody announced one,
+        the model the book runs at the first fill (``label_sha256`` and ``horizon_min`` complete it)."""
         self._trade_info[book] = (model_version, fill_model_version)
+        if model_version is not None and label_sha256 is not None and horizon_min is not None:
+            self._book_stamp[book] = EntryStamp(model_version, label_sha256, horizon_min)
+        else:
+            self._book_stamp.pop(book, None)
+
+    def stamp_entry(self, book: str, decision_id: str, stamp: EntryStamp) -> None:
+        """The model that decided the entry ``decision_id``: the position it opens records it at its first fill."""
+        self._entry_stamps[(book, decision_id)] = stamp
+        while len(self._entry_stamps) > ENTRY_STAMPS_MAX:
+            self._entry_stamps.pop(next(iter(self._entry_stamps)))
+
+    async def stamp_open_positions(self, book: str, stamp: EntryStamp) -> list[str]:
+        """Migration at start: the open positions of ``book`` that carry no model (opened by a build that did not
+        record it) take ``stamp``, the model the book starts with. Positions that already carry one are NOT touched.
+        Returns the products stamped."""
+        done: list[str] = []
+        for pos in self.long_positions(book):
+            if pos.model_version is not None:
+                continue
+            await self._mutate_position(
+                book, pos.product_id,
+                lambda old: replace(
+                    old, model_version=stamp.model_version, label_sha256=stamp.label_sha256,
+                    horizon_min=stamp.horizon_min,
+                ),
+            )  # fmt: skip
+            done.append(pos.product_id)
+        return done
 
     def add_close_listener(self, listener: CloseListener) -> None:
         """``listener(trade)`` after each closed trade is committed (loss streak, events). It runs synchronously, must
@@ -520,7 +593,8 @@ class PositionLedger:
         net = gross - fees
         entry_avg, exit_avg = buy_notional / buy_size, sell_notional / sell_size
         risk = None if old.sl is None else (entry_avg - old.sl) * buy_size
-        model_version, fill_model_version = self._trade_info.get(old.book, (None, None))
+        info_model, fill_model_version = self._trade_info.get(old.book, (None, None))
+        model_version = old.model_version or info_model  # the model that opened it, not the one the book runs now
         trade = ClosedTrade(
             trade_id=fill.trade_id, book=old.book, product_id=old.product_id, entry_decision_id=old.entry_decision_id,
             entry_avg_price=entry_avg, entry_size=buy_size, entry_fees=buy_fees, entry_at=old.opened_at,
@@ -639,6 +713,7 @@ class PositionLedger:
         if qty <= 0 or price <= 0:
             raise ValueError("an entry fill needs a positive quantity and price")
         merged = False
+        stamp = self._entry_stamps.get((book, decision_id)) or self._book_stamp.get(book)
 
         def change(old: PositionView) -> PositionView:
             nonlocal merged
@@ -655,9 +730,14 @@ class PositionLedger:
                 tp=None if plan is None else plan.tp, sl=None if plan is None else plan.sl,
                 k_tp=None if plan is None else plan.k_tp, k_sl=None if plan is None else plan.k_sl,
                 atr_at_entry=None if plan is None else plan.atr,
+                model_version=None if stamp is None else stamp.model_version,
+                label_sha256=None if stamp is None else stamp.label_sha256,
+                horizon_min=None if stamp is None else stamp.horizon_min,
             )  # fmt: skip
 
         position, applied = await self._mutate_position(book, product_id, change, fill)
+        if applied:
+            self._entry_stamps.pop((book, decision_id), None)
         return EntryResult(position, merged and applied), applied
 
     async def set_bracket(

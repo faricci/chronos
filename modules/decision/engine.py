@@ -39,7 +39,7 @@ import secrets
 import time
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import groupby
@@ -57,7 +57,7 @@ from modules.decision.questions import QuestionSet
 from modules.execution.orders import ProductMeta
 from modules.features.serializer import serialize_state, state_sha256
 from modules.features.state_builder import PositionInput, StateBuilder
-from modules.ledger.positions import PositionView
+from modules.ledger.positions import EntryStamp, PositionView
 from modules.market.bars import BarClosed
 from modules.market.indicators import IndicatorEngine, IndicatorSnapshot
 from modules.risk.costs import FeeRates
@@ -76,6 +76,8 @@ __all__ = [
     "DecisionSink",
     "EngineStats",
     "ExecutionReport",
+    "KEEP_BACKEND",
+    "ModelSwap",
     "PositionSource",
     "Processed",
     "RemoteBackend",
@@ -271,6 +273,26 @@ def _dec(x: float) -> Decimal:
     return Decimal(repr(float(x)))
 
 
+LABEL_CONFIG_MISMATCH: Final = "label_config_mismatch"
+KEEP_BACKEND: Final = object()  # "leave the backend as it is" in ``DecisionEngine.build_swap``
+
+
+@dataclass(frozen=True)
+class ModelSwap:
+    """The model parts of an engine, ready to be installed (``DecisionEngine.build_swap`` makes them, ``apply_swap``
+    installs them). Everything that can fail is done when it is built; installing it only assigns references."""
+
+    version: str
+    label: LoadedLabelConfig
+    policy_cfg: PolicyConfig
+    policy: DecisionPolicy
+    questions: QuestionSet
+    risk: RiskManager
+    builder: StateBuilder
+    baseline: BaselineBackend | None
+    remote: RemoteBackend | None
+
+
 # -------------------------------------------------------------------------------------------------- engine
 
 
@@ -299,6 +321,8 @@ class DecisionEngine:
         cooldown_s: float = 0.0,
         btc_product: str = "BTC-EUR",
         on_execution: Callable[[ExecutionReport], None] | None = None,
+        model_version: str | None = None,
+        stamp_entry: Callable[[str, EntryStamp], None] | None = None,
     ) -> None:
         if not products:
             raise ValueError("the engine needs at least one product")
@@ -330,6 +354,8 @@ class DecisionEngine:
         self._btc = btc_product
         self._on_execution = on_execution
         self._builder = StateBuilder(label)
+        self._model_version = model_version or policy.model
+        self._stamp_entry = stamp_entry  # tells the ledger which model decided an entry (before the order)
         self._slots = asyncio.Semaphore(DECIDER_SLOTS)
         self.indicators: dict[str, IndicatorEngine] = {p: IndicatorEngine(p) for p in self._products}
         self._last_ts: dict[str, datetime] = {}
@@ -359,6 +385,46 @@ class DecisionEngine:
         self._last_ts[product_id] = last_bar_ts
         self._last_close[product_id] = last_close
         self._broken.pop(product_id, None)
+
+    @property
+    def model_version(self) -> str:
+        return self._model_version
+
+    @property
+    def label(self) -> LoadedLabelConfig:
+        return self._label
+
+    def build_swap(
+        self, *, version: str, label: LoadedLabelConfig, policy: PolicyConfig, questions: QuestionSet,
+        risk: RiskManager, baseline: BaselineBackend | None | object = KEEP_BACKEND,
+        remote: RemoteBackend | None | object = KEEP_BACKEND,
+    ) -> ModelSwap:  # fmt: skip
+        """The parts of another model version for this engine. Nothing is installed: every check that can fail
+        (the policy was tuned for another label_config, the state builder cannot be made) fails HERE, so an
+        installation never fails half way. ``baseline`` / ``remote`` left out keep the current ones (a random book
+        keeps its decider)."""
+        if policy.label_config_sha256 != label.sha256:
+            raise ValueError("policy.json was tuned for another label_config than the model's")
+        return ModelSwap(
+            version, label, policy, DecisionPolicy(policy), questions, risk, StateBuilder(label),
+            self._baseline if baseline is KEEP_BACKEND else baseline,  # type: ignore[arg-type]
+            self._remote if remote is KEEP_BACKEND else remote,  # type: ignore[arg-type]
+        )  # fmt: skip
+
+    def apply_swap(self, swap: ModelSwap) -> None:
+        """Install ``swap``. Synchronous and without an ``await``: it cannot interleave with a decision. The caller
+        runs it BETWEEN two ``on_bars`` calls (the runtime holds its bar lock), so a decision is made entirely with
+        one model; a gateway call already running keeps the intent it was started with."""
+        self._label = swap.label
+        self._atr_attr = swap.label.cfg.atr_column
+        self._policy_cfg = swap.policy_cfg
+        self._policy = swap.policy
+        self._questions = swap.questions
+        self._risk = swap.risk
+        self._builder = swap.builder
+        self._baseline = swap.baseline
+        self._remote = swap.remote
+        self._model_version = swap.version
 
     def pending(self, product_id: str) -> Kind | None:
         """``entry`` / ``exit`` while a gateway call of the product is running."""
@@ -524,6 +590,10 @@ class DecisionEngine:
             decision = Decision.unavailable()
         else:
             decision = self._policy.resolve(ans.answers, w.side, vol_pctile=w.vol_pctile)
+            if decision.action == "SELL" and self._foreign_label(w.view):
+                # the SELL head of this model was trained on other barriers than the ones the position was opened
+                # under: it does not apply. Bracket, the position's own horizon and the watchdog still govern it.
+                decision = replace(decision, action="HOLD", reason=LABEL_CONFIG_MISMATCH)
 
         intent: OrderIntent | ExitIntent | None = None
         skip: tuple[str, str] | None = None
@@ -540,12 +610,28 @@ class DecisionEngine:
             record["order_intent_id"] = None
         if intent is not None:
             self.stats.intents += 1
+            if isinstance(intent, OrderIntent) and self._stamp_entry is not None:
+                try:  # the position this entry opens records the model that decided it, whenever it fills
+                    self._stamp_entry(
+                        w.decision_id,
+                        EntryStamp(self._model_version, self._label.sha256, self._label.cfg.horizon_min),
+                    )
+                except Exception:
+                    log.exception("engine_entry_stamp_failed", product=p, decision_id=w.decision_id)
             self._launch(p, intent, w.decision_id)
             await asyncio.sleep(0)  # let the gateway reserve the balance before the next product plans its size
         self._count(decision, ans, skip)
         return Processed(
             w.decision_id, p, w.event.t, decision, intent, None if skip is None else skip[0],
             "" if skip is None else skip[1], record,
+        )  # fmt: skip
+
+    def _foreign_label(self, view: PositionView | None) -> bool:
+        """The LONG position was opened under another ``label_config`` (sha256) than the one this engine runs. A
+        position that records none (opened before it was recorded; the app stamps those at start) is not foreign."""
+        return (
+            view is not None and view.is_long and view.label_sha256 is not None
+            and view.label_sha256 != self._label.sha256
         )  # fmt: skip
 
     def _plan_entry(self, w: _Work, decision: Decision) -> tuple[OrderIntent | None, tuple[str, str] | None]:

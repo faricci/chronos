@@ -360,17 +360,24 @@ def soak_verdict(
     parse_errors: int,
     parity: dict[str, dict[str, Any]],
     revisions: dict[str, dict[str, Any]],
-    max_revision_ratio: float,
     seconds_behind: dict[str, float],
     products: Sequence[str] | None = None,
     catch_up_s: float = 600.0,
 ) -> dict[str, bool]:
     """One boolean per P0 exit criterion, from measured numbers. A criterion with nothing measured is False, and
-    when ``products`` is given every product must have been measured."""
+    when ``products`` is given every product must have been measured.
+
+    "Barre REST" (spec 0.5, 5.1.7, since 2.11): ``rest_bars_complete`` is R4, no minute appeared or disappeared in the
+    re-read. The ratio of revised minutes is NOT a criterion any more (it stays in ``checks['rest_revisions']`` with
+    an alarm in ``checks['rest_revision_alarm']``). R1 and R2 are not computed here: the soak loads no model. They are
+    computed for a soak, finished or future, by ``python -m modules.dryrun.revision_impact certify``."""
     wanted = set(products) if products is not None else None
 
     def covered(measured: dict[str, Any]) -> bool:
         return bool(measured) and (wanted is None or wanted <= set(measured))
+
+    def complete(r: dict[str, Any]) -> bool:
+        return r.get("appeared") == 0 and r.get("disappeared") == 0  # a missing count is not a zero
 
     return {
         "hours_reached": elapsed_hours >= target_hours * 0.99,
@@ -378,8 +385,7 @@ def soak_verdict(
         "no_parse_errors": parse_errors == 0,
         "engine_matches_batch_on_stored_bars": covered(parity)
         and all(c["nan_mismatch_cells"] == 0 and c["max_relative_error"] <= PARITY_RTOL for c in parity.values()),
-        "rest_revision_ratio_within_limit": covered(revisions)
-        and all(r["ratio"] <= max_revision_ratio for r in revisions.values()),
+        "rest_bars_complete": covered(revisions) and all(complete(r) for r in revisions.values()),
         "bars_caught_up": bool(seconds_behind) and all(v < catch_up_s for v in seconds_behind.values()),
     }
 
@@ -506,7 +512,7 @@ async def run_soak(
         await writer.flush()
         recorder.stop()
 
-    checks: dict[str, Any] = {"parity": {}, "rest_revisions": {}}
+    checks: dict[str, Any] = {"parity": {}, "rest_revisions": {}, "rest_revision_alarm": {}}
     for pid in products:
         if not rows[pid]:
             continue
@@ -531,7 +537,10 @@ async def run_soak(
             cursor = upper
         fresh = candles_to_frame(fresh_raw, int(lo.timestamp()), int(hi.timestamp()))
         stored_frame = pd.concat([store.read_month(pid, *m) for m in store.months(pid)])
-        checks["rest_revisions"][pid] = asdict(rest_revisions(pid, stored_frame, fresh, lo, hi))
+        stats = rest_revisions(pid, stored_frame, fresh, lo, hi)
+        checks["rest_revisions"][pid] = asdict(stats)
+        # diagnostic with an alarm, not a criterion (spec 2.11): the raw share of revised minutes
+        checks["rest_revision_alarm"][pid] = stats.ratio > cfg.dry_run.gate_ops.max_rest_revision_ratio
 
     final = snapshot(True, checks)
     final.verdict = soak_verdict(
@@ -542,7 +551,6 @@ async def run_soak(
         parse_errors=stream.stats.parse_errors,
         parity=checks["parity"],
         revisions=checks["rest_revisions"],
-        max_revision_ratio=cfg.dry_run.gate_ops.max_rest_revision_ratio,
         seconds_behind={p: (utc_now() - finalizer.next_minute(p)).total_seconds() for p in products},
         products=list(products),
     )

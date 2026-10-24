@@ -406,6 +406,107 @@ async def test_a_stale_book_triggers_unsubscribe_and_subscribe_of_level2(fast_ba
         await task
 
 
+class EchoingTransport(FakeTransport):
+    """Like the real SDK client: closing it reports a drop through ``on_close``."""
+
+    def close(self) -> None:
+        super().close()
+        self.on_close()
+
+
+async def test_our_own_close_is_not_taken_for_a_new_drop(fast_backoff: None) -> None:
+    """Dry run 2026-10-20: 'feed silent' -> reconnect -> 'connection closed' (our close) -> a second reconnect."""
+    clock = Clock()
+    stream = CoinbaseMarketStream([P], EchoingTransport, clock=clock)
+    task = asyncio.create_task(stream.run())
+    await settle(lambda: len(FakeTransport.instances) == 1)
+    first = FakeTransport.instances[0]
+    first.on_message(heartbeat(0))
+    await settle(lambda: stream.stats.heartbeats == 1)
+    first.on_close()  # a real drop
+    await settle(lambda: len(FakeTransport.instances) == 2)
+    await asyncio.sleep(0.3)  # the echo of our own close() has had plenty of time to start a second reconnect
+    assert stream.stats.reconnects == 1 and len(FakeTransport.instances) == 2
+    FakeTransport.instances[1].on_message(heartbeat(0))  # the new connection delivers: the feed is healthy again
+    await settle(lambda: stream.stats.heartbeats == 2)
+    clock.advance(60)  # now the watchdog's silence path, closing the second transport (which echoes too)
+    await settle(lambda: len(FakeTransport.instances) == 3)
+    await asyncio.sleep(0.3)
+    assert stream.stats.reconnects == 2 and len(FakeTransport.instances) == 3
+    FakeTransport.instances[2].on_message(heartbeat(0))
+    await settle(lambda: stream.stats.heartbeats == 3)  # and the live transport still delivers
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_messages_of_a_replaced_transport_are_dropped(fast_backoff: None) -> None:
+    stream = CoinbaseMarketStream([P], FakeTransport, clock=Clock())
+    task = asyncio.create_task(stream.run())
+    await settle(lambda: len(FakeTransport.instances) == 1)
+    old = FakeTransport.instances[0]
+    old.on_close()
+    await settle(lambda: len(FakeTransport.instances) == 2)
+    old.on_message(heartbeat(0))  # a late message from the dead connection
+    await asyncio.sleep(0.1)
+    assert stream.stats.heartbeats == 0
+    FakeTransport.instances[1].on_message(heartbeat(0))
+    await settle(lambda: stream.stats.heartbeats == 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_a_failed_reconnection_is_retried_until_it_works(fast_backoff: None) -> None:
+    """The soak-free dry run of 2026-10-20: one failed reconnection left the feed dead for 63 hours."""
+    opens = {"n": 0}
+
+    class FlakyAfterFirst(FakeTransport):
+        def open(self) -> None:
+            opens["n"] += 1
+            if 2 <= opens["n"] <= 4:  # the first connection works, the next three attempts fail
+                raise ConnectionError("Failed to establish WebSocket connection")
+            super().open()
+
+    stream = CoinbaseMarketStream([P], FlakyAfterFirst, clock=Clock())
+    task = asyncio.create_task(stream.run())
+    await settle(lambda: len(FakeTransport.instances) == 1)
+    first = FakeTransport.instances[0]
+    first.on_message(heartbeat(0))
+    await settle(lambda: stream.stats.heartbeats == 1)
+    first.on_close()  # the connection drops
+    await settle(lambda: opens["n"] >= 5, timeout=5.0)  # three failed attempts, then a good one: no outside help needed
+    second = FakeTransport.instances[-1]
+    assert second.calls[:2] == [("open", None), ("subscribe", ((P,), CHANNELS))]
+    second.on_message(heartbeat(0))
+    await settle(lambda: stream.stats.heartbeats == 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_a_connection_that_stays_silent_after_a_reconnect_is_torn_down_and_retried(
+    fast_backoff: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(ws_feed, "WATCHDOG_TICK_S", 0.01)
+    monkeypatch.setattr(ws_feed, "NO_MESSAGE_AFTER_RECONNECT_S", 0.05)
+    clock = Clock()
+    stream = CoinbaseMarketStream([P], FakeTransport, clock=clock)
+    task = asyncio.create_task(stream.run())
+    await settle(lambda: len(FakeTransport.instances) == 1)
+    first = FakeTransport.instances[0]
+    first.on_message(heartbeat(0))
+    await settle(lambda: stream.stats.heartbeats == 1)
+    clock.advance(60)  # silence: the first reconnection
+    await settle(lambda: len(FakeTransport.instances) == 2)
+    # the new connection opens and subscribes but never delivers anything: it must be replaced again, and again
+    await settle(lambda: len(FakeTransport.instances) >= 4, timeout=5.0)
+    assert stream.stats.reconnects >= 3 and ("close", None) in FakeTransport.instances[1].calls
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
 async def test_first_connection_failures_are_retried(fast_backoff: None) -> None:
     attempts = {"n": 0}
 

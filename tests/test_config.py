@@ -222,3 +222,37 @@ def test_a_larger_publication_lag_needs_a_larger_stale_bar_threshold() -> None:
     from modules.config import AppConfig as App
 
     assert App.model_validate(ok).market.bars.rest_max_delay_s == 360
+
+
+def test_gate_ops_revision_defaults() -> None:
+    """Spec 5.1.7 "Barre REST": R1 shift 0.01 / share 0.005, R2 max 0.02, R3 flips 0.001; the old ratio is the alarm."""
+    g = AppConfig().dry_run.gate_ops
+    assert (g.revision_shift_threshold, g.max_revision_shift_share) == (0.01, 0.005)
+    assert (g.max_revision_shift, g.max_revision_flip_share) == (0.02, 0.001)
+    assert g.max_rest_revision_ratio == 0.005  # same name and value: now the threshold of an alarm
+
+
+def test_gate_ops_old_yaml_still_valid(tmp_path: Path) -> None:
+    """A config written before the R1-R4 keys (only ``max_rest_revision_ratio``) loads with the new defaults."""
+    cfg = load_config(_write(tmp_path, {"dry_run": {"gate_ops": {"max_rest_revision_ratio": 0.004, "min_days": 7}}}))
+    g = cfg.dry_run.gate_ops
+    assert g.max_rest_revision_ratio == 0.004 and g.max_revision_shift == 0.02 and g.max_revision_flip_share == 0.001
+
+
+def test_gate_ops_shift_threshold_not_above_max(tmp_path: Path) -> None:
+    bad = {"dry_run": {"gate_ops": {"revision_shift_threshold": 0.05, "max_revision_shift": 0.02}}}
+    with pytest.raises(ConfigError, match="revision_shift_threshold"):
+        load_config(_write(tmp_path, bad))
+    equal = {"dry_run": {"gate_ops": {"revision_shift_threshold": 0.02, "max_revision_shift": 0.02}}}
+    assert load_config(_write(tmp_path, equal)).dry_run.gate_ops.revision_shift_threshold == 0.02
+
+
+def test_gate_ops_has_no_block_states_key(tmp_path: Path) -> None:
+    """The block of R1/R3 (1440 states) is the definition of the production test, not a threshold: there is no YAML key
+    for it (a knob the gate forbids turning after seeing a result). Changing it takes a CONFLITTO."""
+    with pytest.raises(ConfigError, match="revision_block_states"):
+        load_config(_write(tmp_path, {"dry_run": {"gate_ops": {"revision_block_states": 720}}}))
+    assert "block_states" not in AppConfig().dry_run.gate_ops.model_dump()
+    from modules.dryrun.revision_impact import STATES_PER_DAY, ImpactThresholds
+
+    assert ImpactThresholds.from_config(AppConfig().dry_run.gate_ops).block_states == STATES_PER_DAY == 1440

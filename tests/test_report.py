@@ -241,12 +241,22 @@ def test_other_books_do_not_count() -> None:
 # -------------------------------------------------------------------------------------------- G-DRY-OPS
 
 
+def impact(**kw: Any) -> dict[str, Any]:
+    """The worst ``ImpactDay`` of a book on a product and day, as ``bars.<p>.revision_impact.<book>`` carries it."""
+    base = {"version": "m@1", "states": 1440, "share": 0.0, "max_shift": 0.004, "flip_share": 0.0, "r3": "measured"}
+    return {**base, **kw}
+
+
 def good_day(day: str = "2026-10-17") -> dict[str, Any]:
     return {
         "date": day,
         "ops": {"uptime": 0.999, "dry_run_violations": 0, "crashes": 0, "kill_switch_bug_trips": 0},
         "parity": {"compared": 1000, "matched": 995, "max_feature_psi": 0.04},
-        "bars": {"SOL-EUR": {"rest_revision_ratio": 0.001, "out_of_order": 0, "duplicates": 0}},
+        "bars": {"SOL-EUR": {
+            "rest_revision_ratio": 0.001, "out_of_order": 0, "duplicates": 0,
+            "rest_revisions_appeared": 0, "rest_revisions_disappeared": 0,
+            "revision_impact": {"champion": impact()},
+        }},
         "costs": {"maker_fill_rate": 0.67, "spread_ratio_vs_labels": {"SOL-EUR": 1.1}},
         "decisions_by_book": {"champion": {"BUY": 2, "skip_reasons": {"fee_floor": 0}}},
     }  # fmt: skip
@@ -266,7 +276,7 @@ def ops_gate(days: list[dict[str, Any]], expected: float | None = 2.0) -> dict[s
 def test_ops_gate_passes_on_seven_good_days() -> None:
     g = ops_gate(seven_days())
     assert g["status"] == "PASS", [c for c in g["criteria"] if c["status"] != "pass"]
-    assert {c["name"] for c in g["criteria"]} >= {"uptime", "decision_parity", "feature_psi", "rest_revision_ratio"}
+    assert {c["name"] for c in g["criteria"]} >= {"uptime", "decision_parity", "feature_psi", "revision_shift_share"}
 
 
 def test_ops_gate_is_in_progress_before_seven_days() -> None:
@@ -320,15 +330,160 @@ def test_decision_parity_is_pooled_over_minutes_and_inclusive() -> None:
     assert crit(ops_gate(seven_days(below)), "decision_parity")["status"] == "fail"
 
 
-def test_rest_revision_ratio_limit_is_inclusive_per_product_and_day() -> None:
-    def edge(ds: list[dict[str, Any]]) -> None:
-        ds[2]["bars"]["SOL-EUR"]["rest_revision_ratio"] = 0.005
+def test_gate_ops_ratio_is_diagnostic_not_criterion() -> None:
+    """A ratio of 1.1% (the ETH of the P0 soak) with R1-R4 in order does not fail the gate: it is a diagnostic."""
+    g = ops_gate(seven_days(lambda ds: ds[2]["bars"]["SOL-EUR"].update(rest_revision_ratio=0.011)))
+    assert g["status"] == "PASS" and "rest_revision_ratio" not in {c["name"] for c in g["criteria"]}
+    diag = next(d for d in g["diagnostics"] if d["name"] == "rest_revision_ratio")
+    assert diag["value"] == 0.011
+    assert diag["alarm_threshold"] == 0.005 and diag["alarm"] is True
+    quiet = ops_gate(seven_days())["diagnostics"][0]
+    assert quiet["alarm"] is False and quiet["value"] == 0.001
+    edge = ops_gate(seven_days(lambda ds: ds[0]["bars"]["SOL-EUR"].update(rest_revision_ratio=0.005)))
+    assert edge["diagnostics"][0]["alarm"] is False  # the alarm is strictly above the limit, as the old gate was
 
-    def over(ds: list[dict[str, Any]]) -> None:
-        ds[2]["bars"]["SOL-EUR"]["rest_revision_ratio"] = 0.0051
 
-    assert crit(ops_gate(seven_days(edge)), "rest_revision_ratio")["status"] == "pass"
-    assert crit(ops_gate(seven_days(over)), "rest_revision_ratio")["status"] == "fail"
+def set_impact(**kw: Any) -> Any:
+    def mutate(ds: list[dict[str, Any]]) -> None:
+        ds[2]["bars"]["SOL-EUR"]["revision_impact"]["champion"].update(kw)
+
+    return mutate
+
+
+def test_gate_ops_r1_r2_r3_r4_criteria() -> None:
+    names = ("revision_shift_share", "revision_shift_max", "revision_decision_flips", "rest_completeness")
+    ok = ops_gate(seven_days())
+    assert [crit(ok, n)["status"] for n in names] == ["pass"] * 4
+    # R1: the share 0.005 passes, above it fails
+    assert crit(ops_gate(seven_days(set_impact(share=0.005))), names[0])["status"] == "pass"
+    over = ops_gate(seven_days(set_impact(share=0.0051)))
+    assert crit(over, names[0])["status"] == "fail" and over["status"] == "FAIL"
+    # R2: 0.02 passes, above fails
+    assert crit(ops_gate(seven_days(set_impact(max_shift=0.02))), names[1])["status"] == "pass"
+    assert crit(ops_gate(seven_days(set_impact(max_shift=0.0201))), names[1])["status"] == "fail"
+    # R3: 0.001 passes, above fails
+    assert crit(ops_gate(seven_days(set_impact(flip_share=0.001))), names[2])["status"] == "pass"
+    assert crit(ops_gate(seven_days(set_impact(flip_share=0.0011))), names[2])["status"] == "fail"
+
+    # the criteria are those of the BOOK under evaluation: another book's evidence does not count
+    def with_challenger(ds: list[dict[str, Any]]) -> None:
+        for d in ds:
+            d["bars"]["SOL-EUR"]["revision_impact"]["challenger"] = impact(share=0.5)
+
+    other = seven_days(with_challenger)
+    assert crit(ops_gate(other), names[0])["status"] == "pass"
+    gate = evaluate_gate_ops(other, OPS, "challenger", expected_buy_rate=2.0)
+    assert crit(gate, names[0])["status"] == "fail"
+    no_data = evaluate_gate_ops(seven_days(), OPS, "random_entry", expected_buy_rate=2.0)
+    assert crit(no_data, names[0])["status"] == "unmeasured" and crit(no_data, names[3])["status"] == "pass"
+
+
+def test_gate_ops_r1_reads_block_share() -> None:
+    """R1 reads the share of the BLOCK of 1440 states, not the share of the calendar day."""
+    block_ok = ops_gate(seven_days(set_impact(share=0.004, day_share=0.012, block_kind="extended_back")))
+    assert crit(block_ok, "revision_shift_share")["status"] == "pass" and block_ok["status"] == "PASS"
+    block_bad = ops_gate(seven_days(set_impact(share=0.006, day_share=0.001, block_kind="extended_back")))
+    assert crit(block_bad, "revision_shift_share")["status"] == "fail" and block_bad["status"] == "FAIL"
+    assert "1440" in crit(block_bad, "revision_shift_share")["note"]
+
+
+def old_learner_l0(states: int, share: float) -> dict[str, Any]:
+    """A learner document written before the blocks existed: ``books`` only, no ``blocks`` key."""
+    entry = impact_day_doc("m@1", states=states, share=share, day="2026-10-17", max_shift=0.004)
+    return {"revision_impact": {"products": {"SOL-EUR": {"books": {"champion": [entry]}}}}}
+
+
+def test_gate_ops_old_learner_doc_full_day_same_share(tmp_path: Path) -> None:
+    doc = report_with_l0(tmp_path, old_learner_l0(1440, 0.003))
+    imp = doc["bars"]["SOL-EUR"]["revision_impact"]["champion"]
+    assert imp["share"] == 0.003 and imp["block_kind"] == "day" and imp["block_states"] == 1440  # a full day IS a block
+    assert imp["day_share"] == 0.003
+
+
+def test_gate_ops_old_learner_doc_partial_day_r1_unmeasured(tmp_path: Path) -> None:
+    """A partial day of an old document is never judged with the old per-day rule: R1 is unmeasured, R2 is not."""
+    doc = report_with_l0(tmp_path, old_learner_l0(343, 0.0058))
+    imp = doc["bars"]["SOL-EUR"]["revision_impact"]["champion"]
+    assert imp["share"] is None and imp["day_share"] == 0.0058 and imp["max_shift"] == 0.004
+    def partial(ds: list[dict[str, Any]]) -> None:
+        for d in ds:
+            d["bars"]["SOL-EUR"]["revision_impact"] = {"champion": imp}
+
+    g = ops_gate(seven_days(partial))
+    assert crit(g, "revision_shift_share")["status"] == "unmeasured" and g["status"] == "INCOMPLETE"
+    assert crit(g, "revision_shift_max")["status"] == "pass"
+    r3 = crit(g, "revision_decision_flips")
+    assert r3["status"] == "unmeasured" and "block_unavailable" in r3["note"]
+    # one unmeasured day among measured ones is enough: R1 is unmeasured, never the maximum of the others
+    def mixed(ds: list[dict[str, Any]]) -> None:
+        ds[3]["bars"]["SOL-EUR"]["revision_impact"] = {"champion": imp}
+
+    one = ops_gate(seven_days(mixed))
+    r1 = crit(one, "revision_shift_share")
+    assert r1["status"] == "unmeasured" and r1["value"] == 0.0
+    # a document WITH blocks but none for this version/day (series shorter than a block): the same
+    new = old_learner_l0(343, 0.0058)
+    new["revision_impact"]["products"]["SOL-EUR"]["blocks"] = {"champion": []}
+    assert report_with_l0(tmp_path / "new", new)["bars"]["SOL-EUR"]["revision_impact"]["champion"]["share"] is None
+
+
+def test_gate_ops_new_diagnostics_not_criteria() -> None:
+    def contiguous(ds: list[dict[str, Any]]) -> None:
+        start = datetime(2026, 10, 11, tzinfo=UTC)
+        for i, d in enumerate(ds):
+            first = start + timedelta(days=i)
+            imp = d["bars"]["SOL-EUR"]["revision_impact"]["champion"]
+            z = "%Y-%m-%dT%H:%M:%SZ"
+            imp.update(first_at=first.strftime(z), last_at=(first + timedelta(minutes=1439)).strftime(z),
+                       revisions=1 + i % 2, r2_utilization=0.1 * (i + 1), shifted_at=[])  # fmt: skip
+        # three shifted states close to midnight of day 3 / day 4: one window of 1440 states holds them all
+        day3 = ds[3]["bars"]["SOL-EUR"]["revision_impact"]["champion"]
+        day3["shifted_at"] = ["2026-10-14T23:50:00Z", "2026-10-14T23:51:00Z"]
+        ds[4]["bars"]["SOL-EUR"]["revision_impact"]["champion"]["shifted_at"] = ["2026-10-15T00:05:00Z"]
+
+    g = ops_gate(seven_days(contiguous))
+    names = {c["name"] for c in g["criteria"]}
+    by_name = {d["name"]: d for d in g["diagnostics"]}
+    assert {"revision_shift_rolling_max", "revision_independent_revisions", "revision_r2_utilization"} <= set(by_name)
+    assert not names & set(by_name)  # diagnostics are not criteria
+    assert by_name["revision_shift_rolling_max"]["value"] == pytest.approx(3 / 1440)
+    assert by_name["revision_independent_revisions"]["value"] == 2
+    assert by_name["revision_r2_utilization"]["value"] == pytest.approx(0.7)
+    assert all("senza soglia" in by_name[n]["note"] for n in list(by_name)[1:])
+    assert g["status"] == "PASS"  # whatever they say, they do not move the status
+    bare = ops_gate(seven_days())  # no instants in the days: the diagnostics exist and are empty, not an error
+    assert next(d for d in bare["diagnostics"] if d["name"] == "revision_shift_rolling_max")["value"] is None
+
+
+def test_anomalies_ignore_unmeasured_share(tmp_path: Path) -> None:
+    doc = report_with_l0(tmp_path, old_learner_l0(343, 0.5))  # share unmeasured (None): not an R1 anomaly
+    assert doc["anomalies"]["revision_by_version"] == {} and doc["anomalies"]["operational"] == 0
+    full = report_with_l0(tmp_path / "full", old_learner_l0(1440, 0.5))
+    assert full["anomalies"]["revision_by_version"] == {"m@1": ["R1:SOL-EUR"]}  # a measured one still is
+
+
+def test_gate_ops_r3_unmeasured_gives_incomplete() -> None:
+    """A champion with an untunable policy has no flips to count: the gate cannot be better than INCOMPLETE."""
+
+    def untunable(ds: list[dict[str, Any]]) -> None:
+        for d in ds:
+            d["bars"]["SOL-EUR"]["revision_impact"]["champion"].update(r3="policy_untunable", flip_share=None)
+
+    g = ops_gate(seven_days(untunable))
+    c = crit(g, "revision_decision_flips")
+    assert c["status"] == "unmeasured" and "policy_untunable" in c["note"] and g["status"] == "INCOMPLETE"
+    assert crit(g, "revision_shift_share")["status"] == "pass"  # R1 and R2 are measured all the same
+    gone = ops_gate(seven_days(lambda ds: ds[3]["bars"]["SOL-EUR"].pop("revision_impact")))  # a day without the audit
+    assert crit(gone, "revision_shift_share")["status"] == "unmeasured" and gone["status"] == "INCOMPLETE"
+
+
+def test_gate_ops_r4_appeared_fails() -> None:
+    appeared = ops_gate(seven_days(lambda ds: ds[5]["bars"]["SOL-EUR"].update(rest_revisions_appeared=1)))
+    assert crit(appeared, "rest_completeness")["status"] == "fail" and appeared["status"] == "FAIL"
+    gone = ops_gate(seven_days(lambda ds: ds[5]["bars"]["SOL-EUR"].update(rest_revisions_disappeared=2)))
+    assert crit(gone, "rest_completeness")["value"] == 2 and gone["status"] == "FAIL"
+    none = ops_gate(seven_days(lambda ds: ds[5]["bars"]["SOL-EUR"].update(rest_revisions_appeared=None)))
+    assert crit(none, "rest_completeness")["status"] == "unmeasured"
 
 
 def test_bars_out_of_order_or_duplicated_fail() -> None:
@@ -474,7 +629,7 @@ def test_the_rest_audit_and_the_costs_come_from_the_learner_of_the_next_night(tm
         }},
         "L4": {"details": {"maker_fill_rate": {"rate": 0.8, "entries": 5, "filled": 4}, "latency_ms_p75": 280.0}},
     }}  # fmt: skip
-    (tmp_path / "learner").mkdir()
+    (tmp_path / "learner").mkdir(parents=True)
     (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")  # the NEXT day
     (tmp_path / "learner" / "2026-10-17.json").write_text(json.dumps({"steps": {}}), encoding="utf-8")  # not this one
     doc = build(tmp_path).generate(DAY1, 1)["daily"][0]
@@ -529,7 +684,51 @@ def test_anomalies_are_the_breaches_of_the_ops_thresholds(tmp_path: Path) -> Non
         "uptime",
     }
     clean = build(tmp_path / "clean").generate(DAY1, 1)["daily"][0]["anomalies"]
-    assert clean == {"operational": 0, "parity": 0, "notes": []}  # nothing measured is not an anomaly
+    assert clean == {"operational": 0, "parity": 0, "notes": [], "revision_by_version": {}}  # nothing measured: none
+
+
+def impact_day_doc(version: str, **kw: Any) -> dict[str, Any]:
+    return {"version": version, "states": 1440, "share": 0.0, "max_shift": 0.004, "flip_share": 0.0, "r3": "measured",
+            **kw}  # fmt: skip
+
+
+def report_with_l0(tmp_path: Path, l0: dict[str, Any]) -> dict[str, Any]:
+    (tmp_path / "learner").mkdir(parents=True)
+    learner = {"steps": {"L0": {"details": l0}}}
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")
+    daily: dict[str, Any] = build(tmp_path).generate(DAY1, 1)["daily"][0]
+    return daily
+
+
+def test_anomalies_ratio_goes_to_alarms(tmp_path: Path) -> None:
+    """The raw ratio (ETH of the soak: 1.09%) rings an alarm and is NOT an anomaly any more; R4 is operational."""
+    l0 = {"rest_revisions": {"products": {
+        "ETH-EUR": {"revised": 26, "ratio": 0.0109, "max_close_diff_bps": 16.3, "value_revised": 26, "appeared": 0,
+                    "disappeared": 0},
+        "BTC-EUR": {"revised": 1, "ratio": 0.0004, "max_close_diff_bps": 1.0, "value_revised": 1, "appeared": 1,
+                    "disappeared": 0},
+    }}}  # fmt: skip
+    doc = report_with_l0(tmp_path, l0)
+    assert doc["alarms"] == ["rest_revision_ratio:ETH-EUR"]
+    assert doc["anomalies"]["operational"] == 1 and doc["anomalies"]["notes"] == ["rest_completeness:BTC-EUR"]
+    assert doc["bars"]["ETH-EUR"]["rest_revisions_value"] == 26
+    assert doc["bars"]["BTC-EUR"]["rest_revisions_appeared"] == 1
+    md = (tmp_path / "out" / "2026-10-17.md").read_text(encoding="utf-8")
+    assert "ALARM (diagnostic)" in md
+
+
+def test_revision_impact_is_read_per_book_and_per_version(tmp_path: Path) -> None:
+    champion = [impact_day_doc("m@1", share=0.001, max_shift=0.012), impact_day_doc("m@0", share=0.02, max_shift=0.03)]
+    challenger = [impact_day_doc("m@2", flip_share=0.01)]
+    l0 = {"revision_impact": {"products": {"SOL-EUR": {"books": {"champion": champion, "challenger": challenger}}}}}
+    doc = report_with_l0(tmp_path, l0)
+    b = doc["bars"]["SOL-EUR"]
+    assert b["revision_impact"]["champion"]["version"] == "m@0"  # two versions in the day: the worst one
+    assert b["revision_impact"]["challenger"]["flip_share"] == 0.01
+    assert set(b["revision_impact_by_version"]) == {"m@0", "m@1", "m@2"}
+    # R1-R3 are charged to the version that failed them, never to the others
+    assert doc["anomalies"]["revision_by_version"] == {"m@0": ["R1:SOL-EUR", "R2:SOL-EUR"], "m@2": ["R3:SOL-EUR"]}
+    assert doc["anomalies"]["operational"] == 0
 
 
 def test_the_window_gate_and_the_calibration_use_the_champion_labels_only(tmp_path: Path) -> None:

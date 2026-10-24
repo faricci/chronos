@@ -102,6 +102,7 @@ dry_run:
     - {name: random_entry, decider: random, match_frequency_of: champion, seed: 42, starting_quote: "100.00"}
     - {name: buy_and_hold, decider: buy_and_hold, starting_quote: "100.00"}
   fill_model:
+    mode: bar                                        # bar | tick: tick drives the brackets from WS trades and book
     path: "models/registry/fill_model.json"
     latency_ms: 300
     queue_haircut: 0.25
@@ -117,7 +118,8 @@ dry_run:
     refit_day_of_month: 1
     min_n_eff_calibration: 300
     live_weight: 2.0
-    promotion: {backtest_recent_days: 90, min_shadow_days: 14}
+    # Rule L5 (spec 5.1.6). Minimum trades and drawdown limit come from gate_econ (min_trades, max_drawdown_frac).
+    promotion: {backtest_recent_days: 90, min_shadow_days: 14, superiority_quantile: 0.05}
   gate_ops:
     min_days: 7
     min_uptime: 0.99
@@ -127,7 +129,11 @@ dry_run:
     min_maker_fill_rate: 0.50
     max_spread_ratio_vs_labels: 2.0
     max_fee_floor_skip_ratio: 0.80
-    max_rest_revision_ratio: 0.005
+    max_rest_revision_ratio: 0.005     # ALARM of a diagnostic (raw share of revised minutes), not a gate (spec 2.11)
+    revision_shift_threshold: 0.01     # R1: a state is "shifted" if the model answer moves by more than this
+    max_revision_shift_share: 0.005    # R1: max share of shifted states per product and UTC day
+    max_revision_shift: 0.02           # R2: max shift of any state
+    max_revision_flip_share: 0.001     # R3: max share of states whose actionability flips
   gate_econ:
     min_trades: 30
     min_profit_factor: 1.2

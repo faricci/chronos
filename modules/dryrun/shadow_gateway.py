@@ -29,11 +29,32 @@ Bar-level rules (a deliberately pessimistic reading of sez. 5.1.3; the same kern
 
 Limits of the bar face, to be lifted by the tick face: the virtual stop of a position with a partial entry and no
 bracket yet is checked only at the bar where the entry ends; the watchdog covers that window in live and dry.
+
+Tick fill mode (``tick=TickRig(...)``, ``dry_run.fill_model.mode: tick``). The entry, the model exit and the watchdog
+exit stay bar-driven (above). What changes is who resolves the bracket (take profit, stop) of a position:
+
+* the ``BracketSimulator`` follows it trade by trade (``on_trades``), retries a stop that waits for liquidity on every
+  book update (``on_books``) and closes a data gap with the candles (``on_damage``, ``resolve_gaps``). It only PRODUCES
+  ``BracketFill``: it books nothing;
+* the fills wait in a queue and ``settle`` books them, one at a time, through ``_book_fill`` (the very code of the bar
+  mode: ``LedgerBooking`` for the ledger, ``VirtualAccount.record_fill`` against the reservation the guard made when
+  the bracket was authorized). A take profit or a stop can fill in parts: the reservation shrinks with each part and is
+  released with the last; the ``closed_trades`` row and its exit reason (price against the take profit) are the
+  ledger's, as in the bar mode. ``on_bar`` and every exit settle the queue first, so a fill that the market produced
+  before the bar or the exit is booked before it;
+* a bracket is armed from the position: the trades of the minutes between the fill and the moment the bar was
+  published (``TradeTape``) are checked first. A print at or below the stop in that window closes the position at the
+  bar-level price of the stop (``sl_exit`` from the trigger print: the book of that moment is gone); the take profit
+  exists from the bar AFTER the fill bar, as in the bar mode. Then the simulator follows the live trades;
+* a bar acts on a bracket only in a gap catch-up (``on_bar(bar, gap=True)``: the bars of a downtime), when no trade was
+  seen. Everything else is the bar mode.
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections import deque
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
@@ -41,7 +62,8 @@ from typing import Final, Literal
 
 import structlog
 
-from modules.dryrun.fill_model import BarFillModel
+from modules.dryrun.bracket_sim import BracketFill, BracketSimulator
+from modules.dryrun.fill_model import BarFillModel, TickFillModel
 from modules.dryrun.restore import BookRestore
 from modules.dryrun.virtual_account import VirtualAccount
 from modules.execution.balance import Clock, CoverageAlarm
@@ -68,14 +90,18 @@ from modules.execution.rounding import ceil_to, floor_to
 from modules.execution.spot import SpotRegistry
 from modules.execution.user_stream import EntryContext
 from modules.ledger.positions import EntryPlan, LedgerModeMismatch, PositionLedger, PositionView
+from modules.market.orderbook import LocalOrderBook
+from modules.market.ws_feed import Trade
 from modules.risk.risk_manager import ExitIntent, OrderIntent
 
-__all__ = ["BarEvent", "RestoreReport", "ShadowExecutionGateway"]
+__all__ = ["BarEvent", "RestoreReport", "ShadowExecutionGateway", "TickRig", "TradeTape"]
 
 log = structlog.get_logger(__name__)
 
 ZERO: Final = Decimal(0)
 BPS: Final = Decimal(10_000)
+MINUTE: Final = timedelta(minutes=1)
+TAPE_KEEP: Final = timedelta(minutes=15)  # a bar is published about 3 minutes after its minute: a wide margin
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +128,40 @@ class RestoreReport:
     placed: tuple[str, ...] = ()  # products that got a NEW bracket (the old one was gone)
     unprotected: tuple[str, ...] = ()  # LONG positions left without a bracket (the watchdog covers them)
     catch_up_from: dict[str, datetime] = field(default_factory=dict)
+
+
+class TradeTape:
+    """The trades of the last minutes per product, shared by the books of a manager (tick fill mode).
+
+    A bar is published about three minutes after its minute, so a position filled "at" a bar is armed when its first
+    minutes are already history: the tape is where the bracket finds the trades it missed. Old trades are dropped
+    against the newest trade of the product, never against a clock."""
+
+    def __init__(self, keep: timedelta = TAPE_KEEP) -> None:
+        self._keep = keep
+        self._trades: dict[str, deque[Trade]] = {}
+
+    def add(self, trades: Iterable[Trade]) -> None:
+        for tr in trades:
+            tape = self._trades.setdefault(tr.product_id, deque())
+            tape.append(tr)
+            while tape[0].ts < tr.ts - self._keep:
+                tape.popleft()
+
+    def since(self, product_id: str, t: datetime) -> list[Trade]:
+        """The trades of ``product_id`` at or after ``t``, in the order they arrived."""
+        return [tr for tr in self._trades.get(product_id, ()) if tr.ts >= t]
+
+
+@dataclass(frozen=True, slots=True)
+class TickRig:
+    """What the tick fill mode needs: the simulator (one per gateway), the shared tape, the order books of the stream
+    and the tick face of the fill model (the stop rule the tape check shares with the simulator)."""
+
+    sim: BracketSimulator
+    tape: TradeTape
+    books: Mapping[str, LocalOrderBook]
+    model: TickFillModel
 
 
 @dataclass(slots=True)
@@ -155,6 +215,8 @@ class _Bracket:
     tp: Decimal
     sl: Decimal
     placed_bar_open: datetime  # the take profit does not exist in the bar where the bracket is placed
+    opened_at: datetime | None = None  # when the position was filled: the trades before it are not its own
+    fills: int = 0  # simulated fills booked so far (tick mode: a bracket can fill in parts); numbers the trade ids
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +244,7 @@ class ShadowExecutionGateway:
         fees: FeeSource,
         *,
         on_alarm: AlarmSink | None = None,
+        tick: TickRig | None = None,
     ) -> None:
         if not isinstance(guard, BalanceGuard):  # a look-alike or None is not the coverage circuit
             raise TypeError("ShadowExecutionGateway needs a BalanceGuard")
@@ -205,6 +268,12 @@ class ShadowExecutionGateway:
         self._last_bar: dict[str, BarEvent] = {}
         self._exit_locks: dict[str, asyncio.Lock] = {}
         self._contexts = EntryContexts()
+        self._tick = tick
+        self._queue: deque[BracketFill] = deque()  # fills the simulator produced and nobody booked yet
+        self._settle_lock = asyncio.Lock()
+        self._reported: list[tuple[str, ExitResult]] = []  # tick exits booked and not yet handed to the caller
+        self.tick_dropped = 0  # queued fills whose bracket was gone (an exit cancelled it first): nothing was sold
+        self.tick_errors = 0  # queued fills that could not be booked
 
     # ---------------------------------------------------------------------------- order plumbing
 
@@ -247,9 +316,11 @@ class ShadowExecutionGateway:
         *,
         decision_id: str,
         plan: EntryPlan | None,
+        fee: Decimal | None = None,
     ) -> Decimal:
-        """Apply one simulated fill (VirtualAccount balances, ledger via LedgerBooking). Returns the fee."""
-        fee = self._fee(price, size, liquidity)
+        """Apply one simulated fill (VirtualAccount balances, ledger via LedgerBooking). Returns the fee (``fee``
+        when the fill model already priced it, else the current fee rates)."""
+        fee = self._fee(price, size, liquidity) if fee is None else fee
 
         def apply(f: FillEvent) -> list[CoverageAlarm]:
             return self._account.record_fill(
@@ -418,9 +489,11 @@ class ShadowExecutionGateway:
         await self._ledger.set_bracket(
             self._book, meta.product_id, spec.client_order_id, intent.bracket.take_profit, intent.bracket.stop_loss
         )
-        self._brackets[meta.product_id] = _Bracket(
+        bracket = _Bracket(
             spec.client_order_id, meta, size, intent.bracket.take_profit, intent.bracket.stop_loss, bar.ts_open
         )
+        self._brackets[meta.product_id] = bracket
+        self._arm_ticks(bracket, position.opened_at or bar.ts_open, bar.ts_open + MINUTE, bar.spread_bps)
         return filled("placed", bracket_cid=spec.client_order_id)
 
     # -------------------------------------------------------------------------------------- cancel
@@ -461,10 +534,14 @@ class ShadowExecutionGateway:
             product, meta = pos.product_id, self._registry.meta(pos.product_id)
             alive = kept.get(product)
             if alive is not None and pos.tp is not None and pos.sl is not None:
-                spec = OrderSpec.model_validate_json(alive.payload or "{}")
-                self._brackets[product] = _Bracket(
-                    alive.client_order_id, meta, spec.base_size, pos.tp, pos.sl, pos.opened_at or self._clock()
-                )  # fmt: skip
+                # what is left of the bracket: the reservation the account was rebuilt with (a tick bracket may have
+                # sold a part); the next fill continues the numbering of the trade ids of this order
+                left = next(r.amount for r in state.reservations if r.client_order_id == alive.client_order_id)
+                opened = pos.opened_at or self._clock()
+                bracket = _Bracket(alive.client_order_id, meta, left, pos.tp, pos.sl, opened)
+                bracket.fills = len(await self._ledger.fills_for(alive.client_order_id))
+                self._brackets[product] = bracket
+                self._arm_ticks(bracket, opened, opened.replace(second=0, microsecond=0) + MINUTE, 0.0)
                 restored.append(product)
                 if pos.opened_at is not None:
                     catch_up[product] = pos.opened_at
@@ -496,7 +573,9 @@ class ShadowExecutionGateway:
             log.error("restart_bracket_not_placed", book=self._book, product=product, reason=sent.reason)
             return False
         await self._ledger.set_bracket(self._book, product, cid, pos.tp, pos.sl)
-        self._brackets[product] = _Bracket(cid, meta, size, pos.tp, pos.sl, now)
+        bracket = _Bracket(cid, meta, size, pos.tp, pos.sl, now)
+        self._brackets[product] = bracket
+        self._arm_ticks(bracket, pos.opened_at or now, now, 0.0)
         return True
 
     def has_pending_entry(self, product_id: str) -> bool:
@@ -542,6 +621,7 @@ class ShadowExecutionGateway:
 
     async def _exit_locked(self, product_id: str, decision_id: str, intent_id: str | None, reason: str) -> ExitResult:
         meta = self._registry.meta(product_id)
+        await self._book_queue()  # what the market already did to the bracket is booked before the position is sold
         pending = self._entries.get(product_id)
         if pending is not None:  # a half-filled entry is cancelled and gets no bracket
             pending.abort_bracket = True
@@ -550,7 +630,7 @@ class ShadowExecutionGateway:
         if not position.is_long:
             return ExitResult("nothing_to_do", reason)
         # X1-X3: cancel the bracket; in a simulation the confirmation is immediate, and only then is its base free
-        bracket = self._brackets.pop(product_id, None)
+        bracket = self._drop_bracket(product_id)
         active = bracket.cid if bracket is not None else position.bracket_order_id
         if active is not None:
             self._account.balances.release(active)
@@ -600,11 +680,12 @@ class ShadowExecutionGateway:
             reason, liquidity = "SL", "taker"
         else:
             price, reason, liquidity = b.tp, "TP", "maker"
+        b.fills += 1  # a bracket the tick mode already sold a part of continues the numbering of its trade ids
         fee = await self._book_fill(
             b.cid,
             meta,
             "SELL",
-            1,
+            b.fills,
             price,
             b.size,
             liquidity,
@@ -614,26 +695,178 @@ class ShadowExecutionGateway:
         )
         self._account.balances.release(b.cid)
         await self._booking.set_status(b.cid, "FILLED")
-        self._brackets.pop(meta.product_id, None)
+        self._drop_bracket(meta.product_id)
         left = self._ledger.view(self._book, meta.product_id)
         return ExitResult("partial" if left.is_long else "closed", reason, "", b.size, price, fee)
 
+    def _drop_bracket(self, product_id: str) -> _Bracket | None:
+        """Forget the simulated bracket of a product: here and in the tick simulator (a fill it has not produced yet
+        never will, one already queued finds no bracket and is dropped by ``settle``)."""
+        bracket = self._brackets.pop(product_id, None)
+        if bracket is not None and self._tick is not None:
+            self._tick.sim.untrack(self._tick.sim.key_of(self._book, product_id))
+        return bracket
+
+    # ------------------------------------------------------------------------------------ tick mode
+
+    @property
+    def tick_mode(self) -> bool:
+        return self._tick is not None
+
+    @property
+    def queued_fills(self) -> int:
+        return len(self._queue)
+
+    @property
+    def tick_stats(self) -> dict[str, int]:
+        """Counters of the tick fill mode (all zero in the bar mode)."""
+        sim = None if self._tick is None else self._tick.sim
+        return {
+            "tp_fills": 0 if sim is None else sim.stats.tp_fills, "sl_fills": 0 if sim is None else sim.stats.sl_fills,
+            "gaps_resolved": 0 if sim is None else sim.stats.gaps_resolved,
+            "gap_fetch_failures": 0 if sim is None else sim.stats.gap_fetch_failures,
+            "dropped": self.tick_dropped, "book_errors": self.tick_errors, "queued": len(self._queue),
+        }  # fmt: skip
+
+    def _rig(self) -> TickRig:
+        if self._tick is None:
+            raise RuntimeError(f"book {self._book!r} runs in the bar fill mode: it has no tick feed")
+        return self._tick
+
+    def on_trades(self, trades: Sequence[Trade]) -> None:
+        """One event of the trade feed (synchronous, in-memory); the fills it produces wait for ``settle``."""
+        fresh = [tr for tr in trades if not self._precedes_position(tr)]
+        self._queue.extend(self._rig().sim.on_trades(fresh))
+
+    def _precedes_position(self, tr: Trade) -> bool:
+        """A trade older than the position it would stop: the channel resends its recent trades as a snapshot at every
+        (re)connection, and a restored position must not be stopped by what happened before it was filled."""
+        b = self._brackets.get(tr.product_id)
+        return b is not None and b.opened_at is not None and tr.ts < b.opened_at
+
+    def on_books(self) -> None:
+        """A book update: the stops that wait for liquidity try again."""
+        rig = self._rig()
+        for book in rig.books.values():
+            self._queue.extend(rig.sim.on_book(book))
+
+    def on_damage(self, start: datetime, end: datetime | None) -> None:
+        """Trades in ``[start, end]`` may be missing (the callback of the market stream)."""
+        self._rig().sim.on_damage(start, end)
+
+    async def resolve_gaps(self) -> None:
+        """Close the data gaps whose candles are final; the stops they cause are queued."""
+        self._queue.extend(await self._rig().sim.resolve_gaps())
+
+    def _arm_ticks(self, b: _Bracket, opened_at: datetime, bracket_at: datetime, spread_bps: float) -> None:
+        """Hand a bracket that was just placed (or restored) to the simulator.
+
+        The trades since ``opened_at`` that the tape has are checked first for the stop: the position was filled at a
+        bar that is published minutes later, and the simulator would never see those trades. A print at or below the
+        stop closes the position at once at the bar-level stop price from that print (the book of that moment is
+        gone). The take profit counts from ``bracket_at`` (the bar after the fill bar, as in the bar mode), which the
+        simulator applies itself when the same trades are replayed to it."""
+        b.opened_at = opened_at
+        if self._tick is None:
+            return
+        rig, product = self._tick, b.meta.product_id
+        key = rig.sim.key_of(self._book, product)
+        tape = rig.tape.since(product, opened_at)
+        for tr in tape:
+            if rig.model.stop_triggered(Decimal(repr(tr.price)), b.sl):
+                inc = b.meta.quote_increment
+                price = floor_to(Decimal(repr(self._fill.sl_exit(float(b.sl), tr.price, spread_bps))), inc)
+                fee = self._fee(price, b.size, "taker")
+                self._queue.append(
+                    BracketFill(key, self._book, product, "SL", price, b.size, fee, "taker", tr.ts, ZERO)
+                )
+                return
+        rig.sim.track(
+            book=self._book, product_id=product, size=b.size, tp=b.tp, sl=b.sl, opened_at=opened_at,
+            bracket_at=bracket_at,
+        )  # fmt: skip
+        if tape:
+            self._queue.extend(rig.sim.on_trades(tape))
+
+    async def settle(self) -> list[ExitResult]:
+        """Book the fills the simulator produced, in order, and return the bracket exits they are (TP, SL)."""
+        return [result for _, result in await self.settle_closed()]
+
+    async def settle_closed(self) -> list[tuple[str, ExitResult]]:
+        """``settle`` with the product of every exit, including the ones a bar or an exit booked on the way and that
+        nobody has been told about yet (each exit is reported once)."""
+        await self._book_queue()
+        reported, self._reported = self._reported, []
+        return reported
+
+    async def _book_queue(self) -> None:
+        """Book everything queued; the bracket exits that result are kept in ``_reported``."""
+        if self._tick is None:
+            return
+        async with self._settle_lock:
+            while self._queue:
+                fill = self._queue.popleft()
+                try:
+                    result = await self._book_tick_fill(fill)
+                except Exception as exc:  # a ledger failure: counted and logged, the horizon watchdog still covers it
+                    self.tick_errors += 1
+                    log.error("tick_fill_not_booked", book=self._book, product=fill.product_id, reason=fill.reason,
+                              error=f"{type(exc).__name__}: {exc}")  # fmt: skip
+                    continue
+                if result is not None:
+                    self._reported.append((fill.product_id, result))
+
+    async def _book_tick_fill(self, fill: BracketFill) -> ExitResult | None:
+        """One ``BracketFill`` into the ledger and the account, through the path of the bar mode (``_book_fill``)."""
+        b = self._brackets.get(fill.product_id)
+        if b is None:  # an exit (or a bar of a gap catch-up) took the bracket away first: nothing is left to sell
+            self.tick_dropped += 1
+            log.warning("tick_fill_without_bracket", book=self._book, product=fill.product_id, reason=fill.reason)
+            return None
+        b.fills += 1
+        # the trade of a gap closed by candles says so in its row (the flag is the ledger's, as in a restart catch-up)
+        previous = self._ledger.gap_resolution
+        self._ledger.gap_resolution = previous or fill.gap_resolved
+        try:
+            await self._book_fill(
+                b.cid, b.meta, "SELL", b.fills, fill.price, fill.size, fill.liquidity, fill.at, decision_id="",
+                plan=None, fee=fill.fee,
+            )  # fmt: skip
+        finally:
+            self._ledger.gap_resolution = previous
+        b.size -= fill.size
+        if fill.closed or b.size <= 0:
+            self._account.balances.release(b.cid)
+            await self._booking.set_status(b.cid, "FILLED")
+            self._drop_bracket(fill.product_id)
+        left = self._ledger.view(self._book, fill.product_id)
+        return ExitResult("partial" if left.is_long else "closed", fill.reason, "", fill.size, fill.price, fill.fee)
+
     # ------------------------------------------------------------------------------------ market
 
-    async def on_bar(self, bar: BarEvent) -> list[ExitResult]:
+    async def on_bar(self, bar: BarEvent, *, gap: bool = False) -> list[ExitResult]:
         """Feed one closed bar. Entries, brackets and exits of the product act in that order; the bracket exits
         (TP, SL) are returned, the entry and the model exits resolve their pending ``submit_*`` call. Callers feed
-        bars one at a time (await each call)."""
+        bars one at a time (await each call).
+
+        In the tick fill mode the bracket is not looked at by bars, the market trades did it (their fills are booked
+        here first and again at the end, ``settle``) unless ``gap``: the bars of a downtime, when no trade was seen."""
         product = bar.product_id
         self._last_bar[product] = bar
+        await self._book_queue()
         closed: list[ExitResult] = []
         entry = self._entries.get(product)
         if entry is not None:
             await self._entry_step(entry, bar)
         bracket = self._brackets.get(product)
-        if bracket is not None and (done := await self._bracket_step(bracket, bar)) is not None:
-            closed.append(done)
+        if bracket is not None and (self._tick is None or gap):
+            done = await self._bracket_step(bracket, bar)
+            if done is not None:
+                closed.append(done)
         exit_ = self._exits.get(product)
         if exit_ is not None:
             await self._exit_step(exit_, bar)
-        return closed
+        await self._book_queue()
+        mine = [r for p, r in self._reported if p == product]  # the exits of the other products wait for their caller
+        self._reported = [(p, r) for p, r in self._reported if p != product]
+        return mine + closed

@@ -4,7 +4,7 @@ Layout (``models/registry/``)::
 
     <version>/manifest.json         the manifest given to ``register`` plus ``files`` (sha256 of every artifact)
     <version>/<artifact files>      copied, never modified afterwards
-    aliases.json                    {"champion": {"version", "previous": [...], "updated_at"}, "challenger": ...}
+    aliases.json                    {"champion": {"version", "previous": [...], "updated_at", "op", "reason"}, ...}
 
 Rules:
 
@@ -16,11 +16,16 @@ Rules:
   rollback runs under an exclusive file lock, so concurrent processes (the nightly learner and the CLI) cannot lose
   an update. A corrupt ``aliases.json`` is an error, never "no aliases".
 * ``previous`` is the stack of versions the alias pointed at before. ``rollback`` pops it: rolling back twice goes two
-  versions back; promoting again pushes the current version.
-* Promotion is a LOCAL act: this module imports no network, process or control code and reads no environment variable.
-  The rule L5 (``decide_promotion``) says WHEN a challenger may become champion; ``promote`` itself is the mechanism
-  that the rule and the local CLI (``python -m modules.dryrun.registry``) use. The remote control channel (sez. 6.4.2)
-  has no command for either: ``tests/test_registry.py`` pins that nothing in ``modules/control`` can reach this module.
+  versions back; promoting again pushes the current version. Every entry records the last operation (``op``:
+  ``promote`` | ``rollback``) and its ``reason``; a file written before they existed reads as ``promote`` / ``""``.
+* Promotion and rollback are LOCAL acts: this module imports no network, process or control code and reads no
+  environment variable. The rule L5 (``decide_promotion``, sez. 5.1.6) says WHEN a challenger may become champion;
+  ``promote`` itself is the mechanism that the rule and the local CLI (``python -m modules.dryrun.registry``) use. A
+  manual ``promote`` from the CLI overrides L5 (decision U2: it prints the last L5 verdict of the version, it does not
+  ask for it). The rollback exists only here and in that CLI (``--reason`` is mandatory); it moves a pointer and
+  nothing else: the engine takes it up at the next reload (``learner.reload_at_utc``) and no order is opened, closed or
+  modified by it. The remote control channel (sez. 6.4.2) has no command for either: ``tests/test_registry.py`` pins
+  that nothing in ``modules/control`` can reach this module.
 """
 
 from __future__ import annotations
@@ -43,14 +48,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, Literal, Protocol
 
-from modules.config import LearnerConfig
+from modules.config import GateEconConfig, LearnerConfig
 
 __all__ = [
+    "AliasState",
     "BacktestEvidence",
     "CorruptRegistry",
     "FilesystemModelRegistry",
+    "GateSummary",
     "ModelRegistry",
     "NothingToRollback",
+    "OosEvidence",
     "PromotionDecision",
     "PromotionEvidence",
     "PromotionRule",
@@ -62,6 +70,7 @@ __all__ = [
     "VersionExists",
     "artifacts_from_dir",
     "decide_promotion",
+    "last_l5_verdict",
     "promote_if_eligible",
 ]
 
@@ -74,6 +83,8 @@ CHALLENGER: Final = "challenger"
 _VERSION: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}$")
 _ALIAS: Final = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 _RESERVED_MANIFEST_KEYS: Final = ("files", "registered_at")
+OPS: Final = ("promote", "rollback")
+Op = Literal["promote", "rollback"]
 _CHUNK: Final = 1 << 20
 
 
@@ -129,9 +140,9 @@ class ModelRegistry(Protocol):
 
     def get(self, alias: str) -> RegisteredModel: ...
 
-    def promote(self, version: str, alias: str = CHAMPION) -> None: ...
+    def promote(self, version: str, alias: str = CHAMPION, *, reason: str = "") -> None: ...
 
-    def rollback(self, alias: str) -> str: ...
+    def rollback(self, alias: str, *, reason: str = "") -> str: ...
 
 
 @dataclass(frozen=True)
@@ -139,6 +150,19 @@ class _Entry:
     version: str
     previous: tuple[str, ...]
     updated_at: str
+    op: Op = "promote"
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class AliasState:
+    """What ``aliases.json`` says about one alias (read only view for the report and the CLI)."""
+
+    version: str
+    previous: tuple[str, ...]
+    updated_at: str
+    op: Op
+    reason: str
 
 
 def _valid_version(version: object) -> str:
@@ -151,6 +175,14 @@ def _valid_alias(alias: str) -> str:
     if not _ALIAS.fullmatch(alias):
         raise RegistryError(f"invalid alias {alias!r}: lowercase letters, digits and _, starting with a letter")
     return alias
+
+
+def _valid_op(op: object) -> Op:
+    if op == "promote":
+        return "promote"
+    if op == "rollback":
+        return "rollback"
+    raise RegistryError(f"invalid op {op!r}: one of {OPS}")
 
 
 def _valid_artifact_name(name: str) -> str:
@@ -288,6 +320,13 @@ class FilesystemModelRegistry:
     def aliases(self) -> dict[str, str]:
         return {name: e.version for name, e in sorted(self._read_aliases().items())}
 
+    def state(self, alias: str) -> AliasState:
+        """The entry of ``alias`` as written: version, previous versions, when, and the last op with its reason."""
+        entry = self._read_aliases().get(_valid_alias(alias))
+        if entry is None:
+            raise UnknownAlias(f"alias {alias!r} is not set")
+        return AliasState(entry.version, entry.previous, entry.updated_at, entry.op, entry.reason)
+
     def history(self, alias: str) -> list[str]:
         """Versions the alias pointed at, oldest first, the current one last."""
         entry = self._read_aliases().get(_valid_alias(alias))
@@ -347,8 +386,9 @@ class FilesystemModelRegistry:
 
     # --------------------------------------------------------------------- promote / rollback
 
-    def promote(self, version: str, alias: str = CHAMPION) -> None:
-        """Point ``alias`` at ``version`` (registered and intact). Promoting the current version changes nothing."""
+    def promote(self, version: str, alias: str = CHAMPION, *, reason: str = "") -> None:
+        """Point ``alias`` at ``version`` (registered and intact). Promoting the current version changes nothing.
+        ``reason`` is recorded with the entry (the CLI makes it mandatory)."""
         _valid_alias(alias)
         _valid_version(version)
         with self._locked():
@@ -358,11 +398,12 @@ class FilesystemModelRegistry:
             if current is not None and current.version == version:
                 return
             previous = () if current is None else (*current.previous, current.version)
-            data[alias] = _Entry(version, previous, _iso(self._clock()))
+            data[alias] = _Entry(version, previous, _iso(self._clock()), "promote", reason)
             self._write_aliases(data)
 
-    def rollback(self, alias: str) -> str:
-        """Point ``alias`` back at the version it pointed at before; returns that version."""
+    def rollback(self, alias: str, *, reason: str = "") -> str:
+        """Point ``alias`` back at the version it pointed at before; returns that version. Nothing else changes: no
+        order, no position (the engine takes the new pointer up at its next reload)."""
         _valid_alias(alias)
         with self._locked():
             data = self._read_aliases()
@@ -373,7 +414,7 @@ class FilesystemModelRegistry:
                 raise NothingToRollback(f"alias {alias!r} has no previous version (it points at {current.version})")
             target = current.previous[-1]
             self._load(target)  # never roll back onto a damaged version
-            data[alias] = _Entry(target, current.previous[:-1], _iso(self._clock()))
+            data[alias] = _Entry(target, current.previous[:-1], _iso(self._clock()), "rollback", reason)
             self._write_aliases(data)
             return target
 
@@ -423,6 +464,8 @@ class FilesystemModelRegistry:
                     _valid_version(e["version"]),
                     tuple(_valid_version(v) for v in e["previous"]),
                     str(e["updated_at"]),
+                    _valid_op(e.get("op", "promote")),
+                    str(e.get("reason", "")),
                 )
                 for name, e in doc["aliases"].items()
             }
@@ -433,7 +476,10 @@ class FilesystemModelRegistry:
         doc = {
             "schema": SCHEMA,
             "aliases": {
-                name: {"version": e.version, "previous": list(e.previous), "updated_at": e.updated_at}
+                name: {
+                    "version": e.version, "previous": list(e.previous), "updated_at": e.updated_at, "op": e.op,
+                    "reason": e.reason,
+                }
                 for name, e in sorted(data.items())
             },
         }
@@ -452,35 +498,84 @@ class FilesystemModelRegistry:
 # ----------------------------------------------------------------------------- promotion rule (L5)
 
 Verdict = Literal["promote", "reject", "insufficient"]
+GeStatus = Literal["GO", "INCONCLUSO", "NO-GO"]
+# The three values of ``training.evaluate.Status``: this module cannot import ``training`` (heavy, and ``modules``
+# does not depend on it); ``tests/test_registry.py`` pins that the literals are the same.
+GE_GO: Final = "GO"
+GE_INCONCLUSIVE: Final = "INCONCLUSO"
+GE_NO_GO: Final = "NO-GO"
+REQUIRED_GATES: Final = ("G0", "G1", "G2", "G4")  # G3 is required too when the version reports it (an LLM backend)
 
 
 @dataclass(frozen=True)
 class BacktestEvidence:
-    """Walk-forward backtest of one model over the most recent days (sez. 5.1.6, L5 (a))."""
+    """Walk-forward backtest of one model over the COMMON recent window (sez. 5.1.6, L5 P3). A model that does not
+    trade in the window has defined metrics: PnL 0, Sharpe 0.0, drawdown 0 (``n_trades == 0``)."""
 
+    window_start: datetime
+    window_end: datetime
     window_days: float
+    n_trades: int
     net_pnl: Decimal
-    sharpe: float | None  # None: not defined (too few observations)
+    sharpe: float | None  # 0.0 when n_trades == 0; None only with trades and not defined (too few observations)
     max_dd_frac: float
+
+
+@dataclass(frozen=True)
+class GateSummary:
+    """The gates of ``evaluation.json`` of a version: ``ge`` (None: the file is missing) and ``passed`` for G0, G1, G2,
+    G4 (and G3 when applicable); a value of None means "missing"."""
+
+    ge: GeStatus | None
+    passed: Mapping[str, bool | None]
+
+
+@dataclass(frozen=True)
+class OosEvidence:
+    """The common out-of-sample walk-forward of the two models (P2, S3). The champion fields are None when the
+    champion is not GE = GO (the paired part is not computed then)."""
+
+    common_days: float
+    n_trades_ch: int
+    max_dd_ch: float
+    n_trades_cp: int | None
+    d_pnl_quantile: float | None  # quantile ``superiority_quantile`` of D = PnL_ch - PnL_cp (EUR), paired bootstrap
+    sharpe_ch: float | None
+    sharpe_cp: float | None
+    max_dd_cp: float | None
 
 
 @dataclass(frozen=True)
 class PromotionEvidence:
     challenger: BacktestEvidence
     champion: BacktestEvidence
-    shadow_days: float  # days the challenger has run as a dry book (L5 (b))
+    challenger_gates: GateSummary
+    champion_gates: GateSummary
+    oos: OosEvidence | None  # None: the OOS artifacts of the challenger are missing
+    oos_provable: bool  # V1: both models trained on data that ends before the window starts (minus the embargo)
+    shadow_days: float  # days the challenger has run as a dry book (P4)
     operational_anomalies: int
-    parity_anomalies: int
+    parity_anomalies: int  # includes R1-R3 of the version (spec 5.1.7)
 
 
 @dataclass(frozen=True)
 class PromotionRule:
     backtest_recent_days: int = 90
     min_shadow_days: int = 14
+    min_recent_trades: int = 30
+    max_drawdown_frac: float = 0.05
+    superiority_quantile: float = 0.05
 
     @classmethod
-    def from_config(cls, cfg: LearnerConfig) -> PromotionRule:
-        return cls(cfg.promotion["backtest_recent_days"], cfg.promotion["min_shadow_days"])
+    def from_config(cls, learner: LearnerConfig, econ: GateEconConfig) -> PromotionRule:
+        """Windows and quantile from ``dry_run.learner.promotion``; the minimum of trades and the drawdown limit from
+        ``dry_run.gate_econ`` (one number for L5 and for G-DRY-ECON)."""
+        p = learner.promotion
+        return cls(
+            backtest_recent_days=p.backtest_recent_days, min_shadow_days=p.min_shadow_days,
+            min_recent_trades=econ.min_trades, max_drawdown_frac=econ.max_drawdown_frac,
+            superiority_quantile=p.superiority_quantile,
+        )  # fmt: skip
 
 
 @dataclass(frozen=True)
@@ -497,56 +592,132 @@ def _finite(x: float | None) -> bool:
     return x is not None and math.isfinite(x)
 
 
+def _sharpe(bt: BacktestEvidence) -> float | None:
+    """A model without trades has Sharpe 0.0 (a flat return series), whatever the backtest reported."""
+    return 0.0 if bt.n_trades == 0 and bt.sharpe is None else bt.sharpe
+
+
 def decide_promotion(evidence: PromotionEvidence, rule: PromotionRule | None = None) -> PromotionDecision:
-    """Rule L5: the challenger becomes champion only if
+    """Rule L5 (spec 5.1.6; resolution P1e, B.3). The default is to KEEP the champion: the challenger becomes champion
+    only if every condition holds, evaluated in this fixed order.
 
-    (a) it beats the champion in the walk-forward backtest over the last ``backtest_recent_days``: net PnL strictly
-        higher, Sharpe strictly higher, max drawdown not worse (<=), AND
-    (b) it has run as the ``challenger`` dry book for at least ``min_shadow_days`` with no operational and no parity
-        anomaly. The PnL of the dry books after 14 days is NOT a criterion (sez. 5.1.6: it is noise).
+    1. definitive failures (always evaluated): GE = NO-GO or a failed gate G0/G1/G2/G3/G4 of the challenger, any
+       operational anomaly, any parity anomaly (R1-R4 of the version included);
+    2. sufficiency (P0 V1-V3, P1, P4): an evaluation of the challenger with GE = GO and every gate present, a common
+       window of at least ``backtest_recent_days`` for both models, the same window, an out-of-sample proof (V1), at
+       least ``min_recent_trades`` trades of the challenger in the window, defined Sharpe ratios, at least
+       ``min_shadow_days`` of shadow, the OOS artifacts (paired ones too when the champion is GE = GO);
+    3. recency (P3), strict comparisons: challenger PnL > 0 and > champion PnL, Sharpe > champion Sharpe, drawdown <=
+       champion drawdown (only if the champion traded in the window);
+    4. drawdown <= ``max_drawdown_frac`` in the window and in the OOS (S3);
+    5. superiority (P2), only when the champion is GE = GO too: the ``superiority_quantile`` quantile of the paired
+       block bootstrap of the PnL difference > 0, OOS Sharpe higher, OOS drawdown not worse.
 
-    ``insufficient`` means the evidence is not enough to decide either way (a short window, an undefined Sharpe, too
-    few shadow days): nothing is promoted and the caller tries again later. ``reject`` means the evidence is there
-    and says no. Every failed condition is listed in ``reasons``.
+    ``reject``: the evidence is there and says no (every failed condition is listed). ``insufficient``: not enough
+    evidence to decide either way. A definitive failure wins over an insufficiency; both lists are reported.
+    The PnL of the dry books after 14 days is NOT a criterion (sez. 5.1.6: it is noise).
     """
     rule = rule or PromotionRule()
+    ch, cp, oos = evidence.challenger, evidence.champion, evidence.oos
+    gates = evidence.challenger_gates
+    reject: list[str] = []
     short: list[str] = []
-    for label, bt in (("challenger", evidence.challenger), ("champion", evidence.champion)):
+
+    # 1. definitive
+    ge = gates.ge
+    if ge == GE_NO_GO:
+        reject.append("challenger_ge_nogo")
+    reject += [f"challenger_{k}_failed" for k, v in sorted(gates.passed.items()) if v is False]
+    if evidence.operational_anomalies > 0:
+        reject.append("operational_anomalies")
+    if evidence.parity_anomalies > 0:
+        reject.append("parity_anomalies")
+
+    # 2. sufficiency
+    if ge is None:
+        short.append("challenger_evaluation_missing")
+    elif ge == GE_INCONCLUSIVE:
+        short.append("challenger_ge_inconclusive")
+    required = (*REQUIRED_GATES, *(("G3",) if "G3" in gates.passed else ()))
+    short += [f"challenger_{k}_missing" for k in required if gates.passed.get(k) is None]
+    for label, bt in (("challenger", ch), ("champion", cp)):
         if not math.isfinite(bt.window_days) or bt.window_days < rule.backtest_recent_days:
             short.append(f"{label}_backtest_window_short")
-        if not _finite(bt.sharpe):
+    if (ch.window_start, ch.window_end) != (cp.window_start, cp.window_end):
+        short.append("backtest_windows_differ")
+    if not evidence.oos_provable:
+        short.append("oos_not_provable")
+    if ch.n_trades < rule.min_recent_trades:
+        short.append("challenger_recent_trades_short")
+    for label, bt in (("challenger", ch), ("champion", cp)):
+        if bt.n_trades > 0 and not _finite(_sharpe(bt)):
             short.append(f"{label}_sharpe_undefined")
     if not math.isfinite(evidence.shadow_days) or evidence.shadow_days < rule.min_shadow_days:
         short.append("shadow_days_short")
+    champion_go = evidence.champion_gates.ge == GE_GO
+    if oos is None:
+        short.append("oos_unavailable")
+    elif champion_go and not all(_finite(x) for x in (oos.d_pnl_quantile, oos.sharpe_ch, oos.sharpe_cp, oos.max_dd_cp)):
+        short.append("paired_oos_unavailable")
+    if reject:
+        return PromotionDecision("reject", (*reject, *short))
     if short:
         return PromotionDecision("insufficient", tuple(short))
 
-    ch, cp = evidence.challenger, evidence.champion
-    assert ch.sharpe is not None and cp.sharpe is not None  # _finite() above
-    failed: list[str] = []
+    # 3. recency (P3): strict comparisons; a model without trades has PnL 0 / Sharpe 0 / drawdown 0
+    assert oos is not None  # "oos_unavailable" above
+    ch_sharpe, cp_sharpe = _sharpe(ch), _sharpe(cp)
+    assert ch_sharpe is not None and cp_sharpe is not None  # sufficiency above
+    if not ch.net_pnl > 0:
+        reject.append("recent_pnl_not_positive")
     if not ch.net_pnl > cp.net_pnl:
-        failed.append("net_pnl_not_better")
-    if not ch.sharpe > cp.sharpe:
-        failed.append("sharpe_not_better")
-    if not ch.max_dd_frac <= cp.max_dd_frac:
-        failed.append("max_dd_worse")
-    if evidence.operational_anomalies > 0:
-        failed.append("operational_anomalies")
-    if evidence.parity_anomalies > 0:
-        failed.append("parity_anomalies")
-    if failed:
-        return PromotionDecision("reject", tuple(failed))
-    return PromotionDecision("promote")
+        reject.append("recent_pnl_not_better")
+    if not ch_sharpe > cp_sharpe:
+        reject.append("recent_sharpe_not_better")
+    if cp.n_trades > 0 and not ch.max_dd_frac <= cp.max_dd_frac:
+        reject.append("recent_max_dd_worse")
+    # 4. absolute drawdown (S3)
+    if ch.max_dd_frac > rule.max_drawdown_frac:
+        reject.append("recent_max_dd_above_limit")
+    if oos.max_dd_ch > rule.max_drawdown_frac:
+        reject.append("oos_max_dd_above_limit")
+    # 5. superiority on the common OOS (P2), only against a champion that is GO itself
+    if champion_go:
+        assert oos.d_pnl_quantile is not None and oos.sharpe_ch is not None  # "paired_oos_unavailable" above
+        assert oos.sharpe_cp is not None and oos.max_dd_cp is not None
+        if not oos.d_pnl_quantile > 0:
+            reject.append("oos_pnl_difference_not_significant")
+        if not oos.sharpe_ch > oos.sharpe_cp:
+            reject.append("oos_sharpe_not_better")
+        if not oos.max_dd_ch <= oos.max_dd_cp:
+            reject.append("oos_max_dd_worse")
+    return PromotionDecision("reject", tuple(reject)) if reject else PromotionDecision("promote")
 
 
 def promote_if_eligible(
     registry: ModelRegistry, version: str, evidence: PromotionEvidence, rule: PromotionRule | None = None
 ) -> PromotionDecision:
-    """Apply L5 and, only if it approves, ``registry.promote(version, "champion")``."""
+    """Apply L5 and, only if it approves, ``registry.promote(version, "champion")``. The nightly learner never calls
+    this (it reports the verdict only); whoever does is a local, explicit act."""
     decision = decide_promotion(evidence, rule)
     if decision.approved:
-        registry.promote(version, CHAMPION)
+        registry.promote(version, CHAMPION, reason="L5 promote")
     return decision
+
+
+def last_l5_verdict(reports_dir: Path | str, version: str) -> dict[str, Any] | None:
+    """The most recent L5 verdict the nightly learner wrote about ``version`` as the evaluated challenger
+    (``data/reports/learner/DAY.json``, step L5), or None. Read only: the CLI prints it before a manual promotion."""
+    folder = Path(reports_dir)
+    for path in sorted(folder.glob("*.json"), reverse=True) if folder.is_dir() else []:
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            details = doc["steps"]["L5"]["details"]
+            if details["challenger"] == version and "verdict" in details:
+                return {"date": doc["date"], "verdict": details["verdict"], "reasons": details.get("reasons", [])}
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return None
 
 
 # ------------------------------------------------------------------------------------------------ CLI
@@ -556,12 +727,30 @@ def _json(obj: object) -> str:
     return json.dumps(obj, indent=2, sort_keys=True, default=str)
 
 
+def _effective_note() -> str:
+    return (
+        f"effective at the next reload ({LearnerConfig().reload_at_utc} UTC), not intra-day; "
+        "no order is opened, closed or modified by this command"
+    )
+
+
+def _reason(parser: argparse.ArgumentParser, text: str) -> str:
+    if not text.strip():
+        parser.error("--reason must not be empty")
+    return text.strip()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Local command line: ``python -m modules.dryrun.registry [--root DIR] list|show|promote|rollback``."""
+    """Local command line: ``python -m modules.dryrun.registry [--root DIR] list|show|promote|rollback``.
+
+    ``promote`` and ``rollback`` need ``--reason`` (it is recorded in ``aliases.json``). A manual ``promote`` overrides
+    rule L5 (decision U2): it prints the last L5 verdict of the version and goes on. ``rollback`` defaults to the
+    ``champion`` alias and takes effect at the next reload, never intra-day."""
     parser = argparse.ArgumentParser(
         prog="python -m modules.dryrun.registry", description="Local model registry (promotion is a human decision)."
     )
     parser.add_argument("--root", default="models/registry")
+    parser.add_argument("--learner-reports", default="data/reports/learner", help="where the nightly L5 verdicts are")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="versions and aliases")
     show = sub.add_parser("show", help="the version an alias points at, with its history")
@@ -569,9 +758,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     promote = sub.add_parser("promote", help="point an alias at a registered version (a human decision: bypasses L5)")
     promote.add_argument("version")
     promote.add_argument("--alias", default=CHAMPION)
+    promote.add_argument("--reason", required=True, help="why (recorded in aliases.json)")
     rollback = sub.add_parser("rollback", help="point an alias back at its previous version")
-    rollback.add_argument("alias")
+    rollback.add_argument("alias", nargs="?", default=CHAMPION)
+    rollback.add_argument("--reason", required=True, help="why (recorded in aliases.json)")
     args = parser.parse_args(argv)
+    reason = _reason(parser, args.reason) if args.command in ("promote", "rollback") else ""
 
     registry = FilesystemModelRegistry(args.root)
     try:
@@ -579,12 +771,23 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(_json({"versions": registry.versions(), "aliases": registry.aliases()}))
         elif args.command == "show":
             model = registry.get(args.alias)
-            print(_json({"alias": args.alias, "version": model.version, "history": registry.history(args.alias)}))
+            st = registry.state(args.alias)
+            print(_json({
+                "alias": args.alias, "version": model.version, "history": registry.history(args.alias),
+                "updated_at": st.updated_at, "op": st.op, "reason": st.reason,
+            }))  # fmt: skip
         elif args.command == "promote":
-            registry.promote(args.version, args.alias)
-            print(_json({"alias": args.alias, "version": args.version}))
+            verdict = last_l5_verdict(args.learner_reports, args.version)
+            registry.promote(args.version, args.alias, reason=reason)
+            print(_json({
+                "alias": args.alias, "version": args.version, "op": "promote", "reason": reason,
+                "last_l5_verdict": verdict, "note": _effective_note(),
+            }))  # fmt: skip
         else:
-            print(_json({"alias": args.alias, "version": registry.rollback(args.alias)}))
+            target = registry.rollback(args.alias, reason=reason)
+            print(_json({
+                "alias": args.alias, "version": target, "op": "rollback", "reason": reason, "note": _effective_note(),
+            }))  # fmt: skip
     except RegistryError as exc:
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -593,4 +796,3 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

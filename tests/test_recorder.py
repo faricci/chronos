@@ -294,7 +294,7 @@ def _good(**changes: object) -> dict:  # type: ignore[type-arg]
     base = dict(
         elapsed_hours=48.0, target_hours=48.0, recorder_errors=0, recorder_dropped=0, parse_errors=0,
         parity={"BTC-EUR": {"nan_mismatch_cells": 0, "max_relative_error": 1e-13}},
-        revisions={"BTC-EUR": {"ratio": 0.001}}, max_revision_ratio=0.005, seconds_behind={"BTC-EUR": 40.0},
+        revisions={"BTC-EUR": {"ratio": 0.001, "appeared": 0, "disappeared": 0}}, seconds_behind={"BTC-EUR": 40.0},
     )  # fmt: skip
     return {**base, **changes}
 
@@ -315,7 +315,8 @@ def test_a_clean_soak_passes_every_criterion() -> None:
         ({"parse_errors": 2}, "no_parse_errors"),
         ({"parity": {"BTC-EUR": {"nan_mismatch_cells": 1, "max_relative_error": 0.0}}}, "engine_matches"),
         ({"parity": {"BTC-EUR": {"nan_mismatch_cells": 0, "max_relative_error": 1e-6}}}, "engine_matches"),
-        ({"revisions": {"BTC-EUR": {"ratio": 0.02}}}, "rest_revision_ratio_within_limit"),
+        ({"revisions": {"BTC-EUR": {"ratio": 0.0, "appeared": 1, "disappeared": 0}}}, "rest_bars_complete"),
+        ({"revisions": {"BTC-EUR": {"ratio": 0.0, "appeared": 0, "disappeared": 2}}}, "rest_bars_complete"),
         ({"seconds_behind": {"BTC-EUR": 4000.0}}, "bars_caught_up"),
     ],
 )  # fmt: skip
@@ -332,8 +333,38 @@ def test_a_criterion_with_nothing_measured_is_not_passed() -> None:
 
     v = soak_verdict(**_good(parity={}, revisions={}, seconds_behind={}))
     assert not v["engine_matches_batch_on_stored_bars"]
-    assert not v["rest_revision_ratio_within_limit"]
+    assert not v["rest_bars_complete"]
     assert not v["bars_caught_up"]
+
+
+def test_soak_verdict_rest_bars_complete() -> None:
+    """R4: nothing appeared or disappeared in the re-read; a revision of VALUE does not fail the P0 verdict any more."""
+    from modules.dryrun.recorder import soak_verdict
+
+    value_only = {"BTC-EUR": {"ratio": 0.02, "revised": 20, "appeared": 0, "disappeared": 0}}
+    assert soak_verdict(**_good(revisions=value_only))["rest_bars_complete"] is True
+    legacy = {"BTC-EUR": {"ratio": 0.001}}  # a report from before 2.11 has no counts: not a zero
+    assert soak_verdict(**_good(revisions=legacy))["rest_bars_complete"] is False
+
+
+def test_soak_verdict_has_no_ratio_key() -> None:
+    from modules.dryrun.recorder import soak_verdict
+
+    v = soak_verdict(**_good())
+    assert "rest_revision_ratio_within_limit" not in v and "rest_bars_complete" in v
+    assert "max_revision_ratio" not in soak_verdict.__code__.co_varnames[: soak_verdict.__code__.co_argcount]
+
+
+def test_soak_ratio_alarm_in_checks() -> None:
+    """``run_soak`` keeps the ratio in ``checks['rest_revisions']`` and adds the alarm next to it (source check: the
+    soak itself needs the network)."""
+    import inspect
+
+    from modules.dryrun import recorder
+
+    source = inspect.getsource(recorder.run_soak)
+    assert '"rest_revision_alarm"' in source and "max_rest_revision_ratio" in source
+    assert 'checks["rest_revisions"][pid] = asdict(stats)' in source
 
 
 def test_compare_rows_reports_nan_mismatches_and_the_worst_relative_error() -> None:
@@ -356,10 +387,10 @@ def test_every_product_must_be_measured_not_just_some() -> None:
 
     both = ["BTC-EUR", "ETH-EUR"]
     v = soak_verdict(**_good(products=both))  # only BTC has parity and revisions
-    assert not v["engine_matches_batch_on_stored_bars"] and not v["rest_revision_ratio_within_limit"]
+    assert not v["engine_matches_batch_on_stored_bars"] and not v["rest_bars_complete"]
     full = _good(
         products=both,
         parity={p: {"nan_mismatch_cells": 0, "max_relative_error": 0.0} for p in both},
-        revisions={p: {"ratio": 0.0} for p in both},
+        revisions={p: {"ratio": 0.0, "appeared": 0, "disappeared": 0} for p in both},
     )
     assert all(soak_verdict(**full).values())
