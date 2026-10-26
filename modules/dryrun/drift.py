@@ -24,7 +24,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -43,26 +43,39 @@ __all__ = [
     "CALIBRATION_SCHEMA",
     "Calibration",
     "CalibrationError",
+    "D1H_END_LAG_DAYS",
+    "D1H_LEVEL",
+    "D1H_STEP_DAYS",
     "FeatureRef",
     "FeatureResult",
     "PREREG_FILE",
     "PREREG_SCHEMA",
     "RULE",
+    "RULES",
+    "RULE_V3",
     "S6_FILE",
     "S6_SCHEMA",
+    "VOLSTD_BASE",
+    "VOLSTD_FEATURES",
     "WindowResult",
     "applicable",
     "bin_counts",
     "candidate_features",
     "empirical_p",
     "feature_ref",
+    "feature_values",
     "hourly_states",
     "inner_edges",
     "integrated_tau",
+    "k_h",
     "load_calibration",
     "minp_threshold",
     "psi_v2",
     "ref_shares",
+    "rule_json",
+    "run_dir_of",
+    "scope_note",
+    "window_diagnostics",
     "window_stat",
     "x_threshold",
 ]
@@ -110,6 +123,42 @@ S6_SCHEMA: Final = "chronos.sim_p1f.s6.v1"
 
 _COL: Final = {name: j for j, name in enumerate(FLAT_COLUMNS)}
 
+# ---------------------------------------------------------------------------------------- PSI-v3 (P1f-bis)
+# The LAST rule for ``feature_drift`` (docs/decisions/2026-10-26-p1f-bis-psi-v3.md, pre-registered before any z was
+# computed on real data). PSI-v2 above is closed (``rejected``, 2026-10-25) and stays readable. v3 differs in: the 14
+# fast features are standardised by the volatility of the same state (``z_f = f / rv_1d_bps``), the min-p family is
+# the z with ``n_eff_7d >= 50`` (J), one window of 7 days, an extra check on days the calibration never used (D1h).
+VOLSTD_PREFIX: Final = "z_"
+VOLSTD_DENOMINATOR: Final = "rv_1d_bps"
+VOLSTD_BASE: Final = (
+    "ret_15m_bps", "ret_1h_bps", *[c for c in FLAT_COLUMNS if c.startswith("seq_1h_bps_")],
+)  # fmt: skip
+if len(VOLSTD_BASE) != 14 or not all(c in FLAT_COLUMNS for c in (*VOLSTD_BASE, VOLSTD_DENOMINATOR)):
+    raise RuntimeError("VOLSTD_BASE is not the 14 fast features of the pre-registered rule: stop and open a conflict")
+VOLSTD_FEATURES: Final = tuple(VOLSTD_PREFIX + b for b in VOLSTD_BASE)
+D1H_LEVEL: Final = 0.05
+D1H_STEP_DAYS: Final = 7
+D1H_END_LAG_DAYS: Final = 7
+
+RULE_V3: Final[dict[str, Any]] = {
+    "id": "PSI_V3_VOLSTD",
+    "QUANTILES": [0.005, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.995],
+    "MIN_INNER_EDGES": 3, "JEFFREYS": 0.5, "REF_FLOOR": 0.5, "MIN_FINITE_FRAC": 0.9, "ALPHA": 0.01,
+    "WINDOW_DAYS": [7], "STEP_DAYS": 1, "TAU_MAX_LAG_H": 168, "TAU_STOP": 0.05, "NEFF_JUDGED": 50.0,
+    "D1_MAX_FWER": 0.02, "D1H_LEVEL": 0.05, "D1H_STEP_DAYS": 7, "D1H_END_LAG_DAYS": 7, "D2_MAX_X": 0.25,
+    "D3_MIN_POWER": 0.8, "DELTAS": [0.5, 1.0], "OOS_BLOCK_DAYS": 182, "OOS_GUARD_DAYS": 7,
+    "VOLSTD_BASE": [
+        "ret_15m_bps", "ret_1h_bps", "seq_1h_bps_00", "seq_1h_bps_01", "seq_1h_bps_02", "seq_1h_bps_03",
+        "seq_1h_bps_04", "seq_1h_bps_05", "seq_1h_bps_06", "seq_1h_bps_07", "seq_1h_bps_08", "seq_1h_bps_09",
+        "seq_1h_bps_10", "seq_1h_bps_11",
+    ],
+    "VOLSTD_DENOMINATOR": "rv_1d_bps", "VOLSTD_PREFIX": "z_", "R_T0": "all_candidate_features_finite",
+    "FAMILY": "volstd_neff_7d_ge_NEFF_JUDGED", "FINAL": True,
+}  # fmt: skip
+RULES: Final[dict[str, dict[str, Any]]] = {"PSI_V2": RULE, "PSI_V3_VOLSTD": RULE_V3}
+PREREG_SCHEMA_V3: Final = "chronos.sim_p1f.prereg.v2"
+CALIBRATION_SCHEMA_V3: Final = "chronos.sim_p1f.calibration.v2"
+
 
 class CalibrationError(Exception):
     """The calibration artefact is not trustworthy (tampered pre-registration, another rule, another schema)."""
@@ -124,6 +173,20 @@ def candidate_features(sentiment_available: bool) -> tuple[str, ...]:
     ``sent_*`` unless the model uses the sentiment. With ``sentiment_available`` false: 42 names."""
     skipped = ("clock_", "pos_", "cost_") + (() if sentiment_available else ("sent_",))
     return tuple(c for c in FLAT_COLUMNS if not c.startswith(skipped))
+
+
+def feature_values(x: np.ndarray, name: str) -> np.ndarray:
+    """The values of a feature of the gate over the rows of a FLAT matrix. A plain name is its column; ``z_<f>``
+    (PSI-v3) is ``f / rv_1d_bps`` of the SAME state, NaN where either is not finite or the volatility is not > 0."""
+    if not name.startswith(VOLSTD_PREFIX):
+        return x[:, _COL[name]]
+    num = x[:, _COL[name[len(VOLSTD_PREFIX) :]]]
+    den = x[:, _COL[VOLSTD_DENOMINATOR]]
+    ok = np.isfinite(num) & np.isfinite(den) & (den > 0)
+    out = np.full(num.shape, np.nan)
+    with np.errstate(all="ignore"):
+        out[ok] = num[ok] / den[ok]
+    return out
 
 
 def applicable(feature: str, product: str) -> bool:
@@ -209,6 +272,32 @@ def integrated_tau(series: np.ndarray, max_lag: int = TAU_MAX_LAG_H, stop: float
     return 1.0 + 2.0 * total
 
 
+def k_h(n: int, p0: float = ALPHA, level: float = D1H_LEVEL) -> int | None:
+    """The smallest ``k >= 0`` with ``P(Bin(n, p0) > k) <= level``: how many alarms the days that calibration never used
+    (D1h) may show. Exact sum, no scipy. ``None`` for ``n == 0`` (D1h cannot be checked: not passed)."""
+    if n <= 0:
+        return None
+    for k in range(n + 1):
+        tail = sum(math.comb(n, i) * p0**i * (1.0 - p0) ** (n - i) for i in range(k + 1, n + 1))
+        if tail <= level:
+            return k
+    return n
+
+
+def scope_note(n_untested: int) -> str:
+    """The sentence that goes with every ``feature_drift`` that is measured: what the test does NOT cover."""
+    return (
+        "feature_drift (PSI-v3): forma dei rendimenti veloci standardizzati per volatilita'. Livello di volatilita' e "
+        f"{n_untested} feature persistenti non testabili in 7 giorni (n_eff_7d < 50): solo diagnostica support."
+    )
+
+
+def run_dir_of(root: Path, rule: Mapping[str, Any], version: str) -> Path:
+    """Folder of the calibration of ``version``: ``<root>/<version>`` for PSI-v2 (existing layout),
+    ``<root>/<rule id>/<version>`` for the later rules."""
+    return Path(root) / version if rule["id"] == RULE["id"] else Path(root) / str(rule["id"]) / version
+
+
 # --------------------------------------------------------------------------------------- calibration object
 
 
@@ -240,6 +329,13 @@ class Calibration:
     preregistration_sha256: str
     sha256: str
     run_dir: Path
+    # PSI-v3 (all with defaults: the v2 constructions stay valid): the RAW features of R with their null (diagnostics
+    # only), the features the test does not cover, the reference of p_edge on the holdout, ``final`` rule
+    rule_id: str = "PSI_V2"
+    diagnostic: Mapping[str, FeatureRef] = field(default_factory=dict)
+    untested: tuple[tuple[str, float | None], ...] = ()
+    p_edge_ref: FeatureRef | None = None
+    final: bool = False
 
 
 @dataclass(frozen=True)
@@ -270,7 +366,7 @@ def window_stat(x_window: np.ndarray, cal: Calibration, product: str) -> WindowR
     for name, ref in cal.features.items():
         if not applicable(name, product):
             continue
-        col = x_window[:, _COL[name]]
+        col = feature_values(x_window, name)
         finite = col[np.isfinite(col)]
         psi = psi_v2(col, ref.inner, ref.p, n_expected)
         if psi is None:
@@ -282,6 +378,52 @@ def window_stat(x_window: np.ndarray, cal: Calibration, product: str) -> WindowR
     measured = [r.p for r in out.values() if r.p is not None]
     s = min(measured) if measured else None
     return WindowResult(out, s, s is not None and s < cal.c)
+
+
+def window_diagnostics(
+    x_window: np.ndarray, cal: Calibration, product: str, p_edge: np.ndarray | None
+) -> dict[str, Any]:
+    """Diagnostics of a window of 7 days, none of them a gate (PSI-v3): ``support`` (the share of states with a feature
+    outside the range seen in the training: the boosters extrapolate flat there), ``psi_percentile`` (for the features
+    the test does not cover, where this week's PSI falls among the weeks of the training: informative, no p-value) and
+    ``p_edge_psi`` (the PSI of the model's ``p_edge`` against its predictions on the HOLDOUT, never on the training)."""
+    n_expected = 24 * 7
+    n = int(x_window.shape[0])
+    outside = np.zeros(n, dtype=bool)
+    per_feature: dict[str, int] = {}
+    for name, ref in cal.diagnostic.items():
+        if not applicable(name, product):
+            continue
+        col = feature_values(x_window, name)
+        bad = np.isfinite(col) & ((col < ref.r_min) | (col > ref.r_max))
+        if bad.any():
+            per_feature[name] = int(bad.sum())
+        outside |= bad
+    support = {
+        "states": n, "states_outside": int(outside.sum()), "share": float(outside.sum()) / n if n else 0.0,
+        "features": per_feature,
+    }  # fmt: skip
+    percentile: dict[str, Any] = {}
+    for name, n_eff in cal.untested:
+        slow = cal.diagnostic.get(name)
+        if slow is None or not applicable(name, product):
+            continue
+        psi = psi_v2(feature_values(x_window, name), slow.inner, slow.p, n_expected)
+        pct = None
+        if psi is not None and slow.null_sorted.size:
+            pct = float(np.searchsorted(slow.null_sorted, psi, side="right")) / slow.null_sorted.size
+        percentile[name] = {"psi": psi, "percentile": pct, "n_eff_7d": n_eff}
+    if cal.p_edge_ref is None:
+        edge: dict[str, Any] = {"status": "unmeasured", "reason": "no_reference"}
+    elif p_edge is None:
+        edge = {"status": "unmeasured", "reason": "no_deciders"}
+    else:
+        value = psi_v2(p_edge, cal.p_edge_ref.inner, cal.p_edge_ref.p, n_expected)
+        edge = (
+            {"status": "unmeasured", "reason": "incomplete"} if value is None else
+            {"status": "measured", "psi": value, "n": int(np.isfinite(p_edge).sum()), "reference": "holdout"}
+        )  # fmt: skip
+    return {"support": support, "psi_percentile": percentile, "p_edge_psi": edge}
 
 
 def hourly_states(
@@ -306,9 +448,9 @@ def _sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def rule_json() -> dict[str, Any]:
-    """``RULE`` as it reads back from a JSON file."""
-    loaded: dict[str, Any] = json.loads(json.dumps(RULE))
+def rule_json(rule: Mapping[str, Any] = RULE) -> dict[str, Any]:
+    """A rule (default ``RULE``) as it reads back from a JSON file."""
+    loaded: dict[str, Any] = json.loads(json.dumps(rule))
     return loaded
 
 
@@ -323,11 +465,14 @@ def feature_ref(name: str, raw: Mapping[str, Any]) -> FeatureRef:
     )  # fmt: skip
 
 
-def load_calibration(run_dir: Path) -> Calibration | None:
-    """The calibration of a champion version: ``None`` if ``10_calibration.json`` does not exist (nothing was
-    calibrated); ``CalibrationError`` when the pre-registration was changed after the run (its sha256 is not the one
-    the calibration recorded), when the rule of the file is not the rule of the code, or when the schema is not ours.
-    A decision other than ``adopted`` loads with no features."""
+def load_calibration(run_dir: Path, rule: Mapping[str, Any] = RULE) -> Calibration | None:
+    """The calibration of a champion version under ``rule`` (default PSI-v2): ``None`` if ``10_calibration.json`` does
+    not exist (nothing was calibrated); ``CalibrationError`` when the pre-registration was changed after the run (its
+    sha256 is not the one the calibration recorded), when the rule of the file is not ``rule``, or when the schema
+    is not the one of the rule. A decision other than ``adopted`` loads with no ``features``. PSI-v3 files always load
+    their diagnostic part (``diagnostic_reference``, ``scope.untested``, ``p_edge_reference``), in any case."""
+    v3 = rule["id"] != RULE["id"]
+    schema = CALIBRATION_SCHEMA_V3 if v3 else CALIBRATION_SCHEMA
     path = Path(run_dir) / CALIBRATION_FILE
     if not path.is_file():
         return None
@@ -335,22 +480,37 @@ def load_calibration(run_dir: Path) -> Calibration | None:
         doc = json.loads(path.read_text(encoding="utf-8"))
     except ValueError as exc:
         raise CalibrationError(f"{path.name} is not valid JSON: {exc}") from exc
-    if not isinstance(doc, dict) or doc.get("schema") != CALIBRATION_SCHEMA:
-        raise CalibrationError(f"{path.name}: schema is not {CALIBRATION_SCHEMA!r}")
+    if not isinstance(doc, dict) or doc.get("schema") != schema:
+        raise CalibrationError(f"{path.name}: schema is not {schema!r}")
     prereg = Path(run_dir) / PREREG_FILE
     if not prereg.is_file():
         raise CalibrationError(f"{PREREG_FILE} is missing: the calibration cannot be verified")
     prereg_sha = _sha256_file(prereg)
     if prereg_sha != doc.get("preregistration_sha256"):
         raise CalibrationError(f"{PREREG_FILE} changed after the run (sha256 {prereg_sha[:12]} != the recorded one)")
-    if doc.get("rule") != rule_json():
-        raise CalibrationError("the rule of the calibration is not the rule of the code (RULE)")
+    if doc.get("rule") != rule_json(rule):
+        raise CalibrationError(f"the rule of the calibration is not the rule of the code (RULE, {rule['id']})")
     reference = doc.get("reference") if doc.get("decision") == "adopted" else None
     features = {} if reference is None else {n: feature_ref(n, r) for n, r in reference["features"].items()}
     c = doc.get("c")
+    extra: dict[str, Any] = {}
+    if v3:
+        edge = doc.get("p_edge_reference")
+        extra = {
+            "rule_id": str(rule["id"]), "final": bool(doc.get("final", False)),
+            "diagnostic": {n: feature_ref(n, r) for n, r in (doc.get("diagnostic_reference") or {}).items()},
+            "untested": tuple(
+                (str(u["feature"]), None if u.get("n_eff_7d") is None else float(u["n_eff_7d"]))
+                for u in (doc.get("scope") or {}).get("untested", [])
+            ),
+            "p_edge_ref": None if not edge else FeatureRef(
+                "p_edge", np.asarray(edge["inner"], dtype=np.float64), np.asarray(edge["p"], dtype=np.float64),
+                float(edge["r_min"]), float(edge["r_max"]), 0.0, np.array([]), math.inf, 0.0,
+            ),
+        }  # fmt: skip
     return Calibration(
         champion_version=str(doc["champion_version"]), label_config_sha256=str(doc["label_config_sha256"]),
         window_days=doc.get("window_days"), alpha=float(doc["alpha"]), c=None if c is None else float(c),
         features=features, decision=str(doc["decision"]), preregistration_sha256=prereg_sha,
-        sha256=_sha256_file(path), run_dir=Path(run_dir),
+        sha256=_sha256_file(path), run_dir=Path(run_dir), **extra,
     )  # fmt: skip

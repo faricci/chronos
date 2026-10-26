@@ -1,5 +1,9 @@
 """SIM-P1f: calibration of the PSI-v2 rule of the feature drift (conflict P1f, docs/decisions/2026-10-25-p1f-psi-v2.md).
 
+PSI-v2 is CLOSED (``rejected`` on 2026-10-25, docs/decisions/2026-10-25-p1f-psi-v2-esito.md): the ``run`` sub-command
+refuses (exit 2) and points to ``script/sim_p1f_v3.py``; ``run()``, ``Study`` and ``evaluate_window`` are the machinery
+PSI-v3 reuses, ``s6`` reads a calibration of either rule.
+
 ::
 
     python -m script.sim_p1f run --config config/config.yml [--train-config config/train.yml] \\
@@ -154,6 +158,10 @@ def hourly_of(pm: Any, label: LoadedLabelConfig) -> Hourly:
     return Hourly(np.asarray(pm.bars.ts_close)[rows], x, missing)
 
 
+def _finite(a: np.ndarray) -> np.ndarray:
+    return a[np.isfinite(a)]
+
+
 def _ceil_day(t: np.datetime64) -> np.datetime64:
     d = t.astype("datetime64[D]")
     ceiled: np.datetime64 = (d if d.astype("datetime64[ns]") == t else d + D).astype("datetime64[ns]")
@@ -204,12 +212,16 @@ class Study:
     looks at (the 42 of ``candidate_features`` in a real run)."""
 
     def __init__(
-        self, hourly: Mapping[str, Hourly], champion: Champion, served: Sequence[str], candidates: Sequence[str]
-    ) -> None:
+        self, hourly: Mapping[str, Hourly], champion: Champion, served: Sequence[str], candidates: Sequence[str],
+        t0_features: Sequence[str] | None = None,
+    ) -> None:  # fmt: skip
         self.hourly, self.champion, self.served = hourly, champion, tuple(served)
         self.training = tuple(p for p in champion.training_products if p in hourly)
         self.holdout = _naive(champion.holdout_start)
         self.candidates = tuple(candidates)
+        # the features whose first finite state starts R (default: the candidates themselves; PSI-v3 starts R with the
+        # RAW candidates, as PSI-v2 did, whatever the transformed features of the test are)
+        self.t0_features = tuple(candidates if t0_features is None else t0_features)
         self.t0: dict[str, np.datetime64] = {}
         for product in (*self.training, *(p for p in self.served if p not in self.training and p in hourly)):
             t0 = self._first_complete(product)
@@ -223,20 +235,20 @@ class Study:
         self.edges: dict[str, np.ndarray] = {}
         self.excluded: dict[str, str] = {}
         for name in self.candidates:
-            col = self.r_all[:, _COL[name]]
+            col = drift.feature_values(self.r_all, name)
             edges = drift.inner_edges(col)
             if edges is None:
                 self.excluded[name] = "fewer_than_3_distinct_edges"
             else:
                 self.edges[name] = edges
         self.features = tuple(n for n in self.candidates if n in self.edges)
-        self.shares = {n: drift.ref_shares(self.r_all[:, _COL[n]], self.edges[n]) for n in self.features}
+        self.shares = {n: drift.ref_shares(drift.feature_values(self.r_all, n), self.edges[n]) for n in self.features}
         self.tau: dict[str, dict[str, float]] = {n: {} for n in self.features}
         for product in self.training:
             r_p = self.hourly[product].x[self.r_rows[product]]
             for n in self.features:
                 if drift.applicable(n, product):
-                    self.tau[n][product] = drift.integrated_tau(r_p[:, _COL[n]])
+                    self.tau[n][product] = drift.integrated_tau(drift.feature_values(r_p, n))
         self.n_eff = {
             n: float(np.mean([drift.TAU_MAX_LAG_H / t for t in taus.values()])) if taus else float("nan")
             for n, taus in self.tau.items()
@@ -247,8 +259,8 @@ class Study:
 
     def _first_complete(self, product: str) -> np.datetime64 | None:
         h = self.hourly[product]
-        cols = [_COL[n] for n in self.candidates if drift.applicable(n, product)]
-        ok = np.isfinite(h.x[:, cols]).all(axis=1)
+        names = [n for n in self.t0_features if drift.applicable(n, product)]
+        ok = np.isfinite(np.column_stack([drift.feature_values(h.x, n) for n in names])).all(axis=1)
         return None if not ok.any() else h.ts[int(np.argmax(ok))]
 
     def _r_mask(self, product: str) -> np.ndarray:
@@ -292,7 +304,7 @@ class Study:
             for j, name in enumerate(self.features):
                 if not drift.applicable(name, w.product[i]):
                     continue
-                psi = drift.psi_v2(x[:, _COL[name]], self.edges[name], self.shares[name], n_expected)
+                psi = drift.psi_v2(drift.feature_values(x, name), self.edges[name], self.shares[name], n_expected)
                 if psi is not None:
                     out[i, j] = psi
         return out
@@ -317,7 +329,7 @@ class Study:
         """A ``Calibration`` object for the window (the real one when adopted, a provisional one for S3/S5)."""
         feats = {}
         for j, name in enumerate(self.features):
-            col = self.r_all[:, _COL[name]]
+            col = drift.feature_values(self.r_all, name)
             finite = col[np.isfinite(col)]
             feats[name] = FeatureRef(
                 name, self.edges[name], self.shares[name], float(finite.min()), float(finite.max()),
@@ -461,7 +473,7 @@ def evaluate_window(study: Study, days: int) -> dict[str, Any]:
     block_rows: list[dict[str, Any]] = []
     power_hits = {n: {delta: 0 for delta in drift.DELTAS} for n in study.features}
     power_n = {n: 0 for n in study.features}
-    sigma = {n: float(np.std(study.r_all[:, _COL[n]][np.isfinite(study.r_all[:, _COL[n]])])) for n in study.features}
+    sigma = {n: float(np.std(_finite(drift.feature_values(study.r_all, n)))) for n in study.features}
     for s, e in blocks:
         in_block = (day_of >= s) & (day_of < e)
         guard = drift.OOS_GUARD_DAYS
@@ -508,7 +520,7 @@ def evaluate_window(study: Study, days: int) -> dict[str, Any]:
                 name = study.features[j]
                 other = row[second] if (j == first and second is not None) else (np.inf if j == first else row[first])
                 power_n[name] += 1
-                col = x[:, _COL[name]]
+                col = drift.feature_values(x, name)
                 for delta in drift.DELTAS:
                     shifted = col + delta * sigma[name]
                     p_new = drift.psi_v2(shifted, study.edges[name], study.shares[name], n_exp)
@@ -561,7 +573,7 @@ def evaluate_window(study: Study, days: int) -> dict[str, Any]:
 def reference_doc(study: Study, days: int, ref: Mapping[str, Any]) -> dict[str, Any]:
     feats: dict[str, Any] = {}
     for j, name in enumerate(study.features):
-        col = study.r_all[:, _COL[name]]
+        col = drift.feature_values(study.r_all, name)
         finite = col[np.isfinite(col)]
         x_f = ref["x_f"][j]
         feats[name] = {
@@ -694,10 +706,11 @@ def run(
 def run_s6(
     run_dir: Path, served: Sequence[str], loader: MarketsLoader, label: LoadedLabelConfig, *,
     end: date | None = None, now: Callable[[], datetime] = lambda: datetime.now(UTC),
+    rule: Mapping[str, Any] = drift.RULE,
 ) -> int:  # fmt: skip
     """The rule on the last days of the dry run. Refused (2) without a calibration. Never enters the decision."""
     try:
-        cal = drift.load_calibration(run_dir)
+        cal = drift.load_calibration(run_dir, rule)
     except CalibrationError as exc:
         print(f"calibration not trustworthy: {exc}", file=sys.stderr)
         return EXIT_REFUSED
@@ -801,6 +814,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             p.add_argument("--run-dir", default=None, help="default: <out-root>/<champion version>")
             p.add_argument("--end", default=None, help="last UTC day of the window (default: yesterday)")
     args = ap.parse_args(argv)
+    if args.cmd == "run":  # PSI-v2 is closed (rejected 2026-10-25): a new champion is calibrated with PSI-v3
+        print("PSI_V2 closed (rejected 2026-10-25): use python -m script.sim_p1f_v3 run", file=sys.stderr)
+        return EXIT_REFUSED
     from modules.config import EXIT_CONFIG_ERROR, ConfigError
     from modules.dryrun.registry import RegistryError
 
@@ -810,8 +826,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (ConfigError, RegistryError, OSError, ValueError, KeyError) as exc:
         print(f"SIM-P1f configuration error: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
-    if args.cmd == "run":
-        return run(champion, served, loader, out_root)
     run_dir = Path(args.run_dir) if args.run_dir else out_root / champion.version
     return run_s6(run_dir, served, loader, champion.label, end=end)
 
