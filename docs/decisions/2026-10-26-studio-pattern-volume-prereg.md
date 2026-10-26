@@ -174,4 +174,8 @@ Test sintetici minimi:
 
 ## 15. Esito
 
-Da compilare dopo l'unica corsa per braccio: braccio, commit, verdetti per test e globale, numeri principali, nessun ritocco.
+Compilato il 2026-10-26 dopo l'unica corsa per braccio (codice al commit 81ac71da, nessun ritocco). Dettaglio, numeri e conseguenze: `docs/decisions/2026-10-26-studio-pattern-volume-esito.md`.
+
+- Braccio L (decide; `holdout_clean = true`): H1 7 / 14 / 30 g = INCONCLUSO / INCONCLUSO / INCONCLUSO (n_T = n_V = 3 unita', minimi 10 / 6); H2 INCONCLUSO x3 (n_T 7 / 7 / 5, n_V 2 / 2 / 1). Globale: INCONCLUSO.
+- Braccio E (`holdout_clean = false`): H1 INCONCLUSO x3 (n_T 4 / 4 / 3, n_V 5 / 5 / 3); H2 INCONCLUSO x3. Globale: INCONCLUSO (non modifica la decisione di L).
+- Conseguenza (sez. 11): nessun capitale, nessuna variante; un solo riesame pre-programmato (>= 6 nuove unita' a H = 7 per H1 con i dati EUR dal 2026-10-27, oppure 2028-10-26).
