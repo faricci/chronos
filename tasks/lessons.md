@@ -90,3 +90,15 @@ Rules:
 - Un criterio "quota per giorno" su un giorno PARZIALE ha un denominatore piccolo (343 stati: 1 stato = 0,29%): puo' fallire per due stati senza che il modello si comporti diversamente. Prima di scrivere una soglia per periodo, dire cosa succede ai periodi incompleti.
 - `vol_z_1d` e' lo z-score del volume dei giorni UTC COMPLETI: una revisione del giorno D lo sposta dal giorno D+1. Leggere la definizione prima di scrivere il test che dice "stesso giorno".
 - pandas recente da' `datetime64[us]` agli indici costruiti con `date_range`: le fixture che simulano lo store devono forzare `datetime64[ns, UTC]` (il dtype di `candles_to_frame`) o i confronti fra frame con etichette uguali sollevano.
+
+## Soglie pre-registrate su una statistica di cui non si e' vista la forma del nullo (P1f, 2026-10-25)
+
+- La regola PSI-v2 aveva soglie D1-D3 fissate su una stima [S] "quasi i.i.d." (`E[PSI | H0]` ~ 0,01-0,07); la corsa vera ha dato un nullo con 99-esimo percentile 1,06-1,27 per le feature veloci (la scala dei rendimenti segue il regime di volatilita', persistente per settimane) e un FWER fuori campione del 3-5%: `rejected`, con la pre-registrazione rispettata e nessun ritocco. Regola: prima di pre-registrare soglie numeriche su una statistica nuova, misurare la forma del nullo sul solo periodo di training (senza D1-D3 e senza guardare i dati di prova) e scrivere le soglie dopo; una stima i.i.d. di una serie finanziaria sbaglia di un ordine di grandezza.
+- Un engine che serve BTC e un'alt nello stesso oggetto vede ora come `stale` ogni minuto in cui l'alt arriva sola: i test che alimentavano un prodotto alla volta aspettavano un BUY che ora e' un HOLD `btc_context_stale`. Nei test, alimentare BTC e alt nello stesso `on_bars`.
+- Una pre-registrazione che include l'hash del codice (`code_sha256`) rende visibile qualunque modifica successiva alla corsa: dopo la corsa non toccare `script/sim_p1f.py` ne' `modules/dryrun/drift.py`.
+
+## Una soglia pre-registrata stretta puo' respingere una regola per un solo evento (P1f-bis, 2026-10-26)
+
+- PSI-v3 ha superato D2, D3 e D1h con ampio margine e ha fallito D1 per UN allarme su ETH-EUR (18 su ~883 finestre contro 17 ammessi: 2,04% contro 2%). La regola era scritta cosi' e la decisione e' definitiva: nessun arrotondamento, nessun cambio di alfa o di soglia dopo il risultato. Lezione per il disegno: una soglia a livello di singolo prodotto con ~900 finestre ha un errore standard di ~0,5 punti, pari a 1/4 della soglia; il criterio andava scritto con la sua incertezza (limite binomiale, come D1h) e non come numero secco.
+- Il congelamento in git (documento e tre file di codice tracciati e puliti, rifiuto della corsa se no) e l'hash del codice nel file di pre-registrazione hanno reso la corsa verificabile; farlo sempre per una calibrazione che non si puo' ripetere.
+- Un invariante come "nessun BUY con policy non tarabile" va contato sui book dove decide il MODELLO: un book benchmark con BUY forzati ha la stessa `policy_version` del champion e farebbe scattare un falso errore. La prova dipende dal nome del book finche' il record non dice con che cosa ha deciso (domanda E in P1g).

@@ -216,6 +216,8 @@ class KillSwitchConfig(_Section):
     stale_data_s: float = Field(default=90, gt=0)  # last ticker
     stale_bar_s: float = Field(default=270, gt=0)  # last 1m bar, published at t + S; = S + 150
     max_fallback_ratio_1h: float = Field(default=0.20, ge=0, le=1)
+    # Alert threshold of the DIAGNOSTIC daily PSI v1 in L0 (``psi_v1.alerts``). Linked to no guard: the ``drift``
+    # guard of ``SystemGuards`` has no writer (conflict P1f).
     psi_threshold: float = Field(default=0.25, gt=0)
 
 
@@ -358,7 +360,13 @@ class GateOpsConfig(_Section):
     min_days: int = Field(default=7, ge=1)
     min_uptime: float = Field(default=0.99, gt=0, le=1)
     min_decision_parity: float = Field(default=0.99, gt=0, le=1)
+    # ALARM threshold of the diagnostic ``feature_psi_daily_v1`` (conflict P1f): the old daily PSI against 90 days is no
+    # longer a criterion, an anomaly or an alarm of ``alarms``. The feature drift gate is ``feature_drift`` (PSI-v2).
     max_feature_psi: float = Field(default=0.10, gt=0)
+    # Alt states whose BTC context is not of the same instant (``btc_context_alignment``, conflict P1f): max share per
+    # product and day, and max shift m of the model answers between the served and the aligned state.
+    max_btc_stale_share: float = Field(default=0.005, ge=0, le=1)
+    max_btc_stale_shift: float = Field(default=0.01, gt=0, lt=1)
     buy_rate_tolerance: float = Field(default=0.50, gt=0)
     min_maker_fill_rate: float = Field(default=0.50, ge=0, le=1)
     max_spread_ratio_vs_labels: float = Field(default=2.0, gt=0)

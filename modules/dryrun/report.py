@@ -15,8 +15,9 @@ Inputs (all read only; a missing one makes the numbers that need it ``null``, ne
 * ``data/reports/ops/DAY.json``     ``OpsDay``: uptime, crashes, violations, kill switch trips, bars, costs.
   NOBODY WRITES THIS FILE YET (it is the contract the app/telemetry has to fill, sez. 6.3): until then uptime, bars
   lag, spread and the operational criteria are ``unmeasured`` and the gate cannot pass;
-* ``data/reports/learner/DAY+1.json`` the nightly learner (L0 REST revisions and PSI, L4 costs): the learner of the
-  night after the day, so the report of the day is complete after 00:15 UTC of the next one;
+* ``data/reports/learner/DAY+1.json`` the nightly learner (L0 REST revisions, state parity, BTC context, feature drift
+  and the diagnostic daily PSI v1; L4 costs): the learner of the night after the day, so the report of the day is
+  complete after 00:15 UTC of the next one;
 * ``--replay-dir/DAY.jsonl``        decisions of a replay of the day, for the decision parity;
 * ``data/live_labels/*.jsonl``      resolved labels (calibration ``edge`` and the date of the first label).
 
@@ -29,7 +30,16 @@ window is long enough, nothing fails, but something could not be measured.
 Manual closes (``exit.reason == 'MANUAL'``, sez. 6.4.4) are counted apart (``manual_exits``): they stay in the net PnL
 and in the drawdown, and are excluded from the trade count and from the profit factor of G-DRY-ECON. For the decision
 parity the minutes from a manual close to the end of its UTC day are excluded for that (book, product) and counted in
-``parity.excluded_manual`` (the command channel does not exist yet: the close is the proxy of the command).
+``parity.excluded_manual`` (the command channel does not exist yet: the close is the proxy of the command). The
+minutes whose LIVE record says ``btc_context == "stale"`` (an alt whose BTC bar of the minute had not arrived: HOLD
+``btc_context_stale``) are excluded and counted in ``parity.excluded_btc_stale``.
+
+Feature drift (conflict P1f, docs/decisions/2026-10-25-p1f-psi-v2.md). The criterion ``feature_drift`` of G-DRY-OPS is
+the PSI-v3 rule (``modules/dryrun/drift.py``) of the LAST day of the window, on the declared scope J: ``unmeasured``
+or ``not_testable`` (never a pass) until SIM-P1f-bis adopts it; a ``support`` alarm is in ``alarms`` only. The old
+daily PSI against 90 days is the diagnostic ``feature_psi_daily_v1``; it is no criterion, no anomaly and no alarm.
+``btc_context_alignment`` looks at every day: the alt states whose BTC context was not of the same instant. A product
+in alarm is an entry of ``alarms`` (``feature_drift:<product>``), not of ``anomalies``.
 """
 
 from __future__ import annotations
@@ -82,7 +92,7 @@ RANDOM_ENTRY: Final = "random_entry"
 DAY: Final = timedelta(days=1)
 ECE_BINS: Final = 15
 Status = Literal["PASS", "FAIL", "IN_PROGRESS", "INCOMPLETE"]
-Verdict = Literal["pass", "fail", "unmeasured"]
+Verdict = Literal["pass", "fail", "unmeasured", "not_covered"]
 ZERO: Final = Decimal(0)
 
 
@@ -349,17 +359,21 @@ def decision_parity(
     live: Mapping[tuple[str, str, str], str],
     replay: Mapping[tuple[str, str, str], str],
     excluded: set[tuple[str, str, str]] | None = None,
+    btc_stale: set[tuple[str, str, str]] | None = None,
 ) -> dict[str, Any]:
     """Share of minutes where the replay took the same final decision as the live run. Keys are
-    ``(book, product, ts_bar_close)``; a minute present on one side only is a mismatch; ``excluded`` minutes (after a
-    manual close) are removed from both sides and counted."""
-    skip = excluded or set()
-    keys = (live.keys() | replay.keys()) - skip
+    ``(book, product, ts_bar_close)``; a minute present on one side only is a mismatch. Two kinds of minute are removed
+    from both sides and counted apart: ``excluded`` (after a manual close) and ``btc_stale`` (the LIVE record says its
+    BTC context was not of the same instant, so the engine answered HOLD ``btc_context_stale`` where the replay, with
+    the whole BTC bar, may have bought). A minute in both sets counts as manual."""
+    manual = excluded or set()
+    stale = (btc_stale or set()) - manual
+    every = live.keys() | replay.keys()
+    keys = every - manual - stale
     matched = sum(1 for k in keys if live.get(k) == replay.get(k))
-    excluded_n = len((live.keys() | replay.keys()) & skip)
     return {
         "compared": len(keys), "matched": matched, "decision_match": matched / len(keys) if keys else None,
-        "excluded_manual": excluded_n,
+        "excluded_manual": len(every & manual), "excluded_btc_stale": len(every & stale),
     }  # fmt: skip
 
 
@@ -458,6 +472,178 @@ def _all_days(days: Sequence[Mapping[str, Any]], getter: Any) -> list[Any] | Non
     return None if not values or any(v is None for v in values) else values
 
 
+def _v1_worst(days: Sequence[Mapping[str, Any]]) -> tuple[float | None, str | None, int | None, str | None]:
+    """The day of the window with the highest daily PSI v1: ``(max, feature, features above 0.10, date)``."""
+    best: Mapping[str, Any] | None = None
+    for d in days:
+        par = d.get("parity") or {}
+        if par.get("max_feature_psi") is not None and (
+            best is None or float(par["max_feature_psi"]) > float(best["parity"]["max_feature_psi"])
+        ):
+            best = d
+    if best is None:
+        return None, None, None, None
+    par = best["parity"]
+    above = (par.get("psi_v1") or {}).get("above_0_10")
+    return float(par["max_feature_psi"]), par.get("worst_feature"), above, best.get("date")
+
+
+def feature_drift_unmeasured_note(days: Sequence[Mapping[str, Any]], reason: str) -> str:
+    """The text of the ``feature_drift`` criterion while it is not measured (CONFLITTO P1f, G4)."""
+    value, feature, above, _day = _v1_worst(days)
+    shown = "n/a" if value is None else f"{value:.2f}"
+    count = "n/a" if above is None else str(above)
+    return (
+        "feature_drift: unmeasured. Il PSI giornaliero contro gli ultimi 90 giorni misura in quanti decili cade un "
+        "giorno di feature persistenti (4 prodotti x 1 valore, tetto ~8,3), non la deriva rispetto al training. "
+        "Criterio sospeso (CONFLITTO P1f-bis) fino alla regola PSI-v3 calibrata (SIM-P1f-bis, D1/D1h/D2/D3). "
+        f"Diagnostica: max PSI = {shown} ({feature if feature is not None else 'n/a'}), {count} feature sopra 0,10."
+        f" Motivo: {reason}."
+    )
+
+
+NOT_COVERED_NOTE: Final = (
+    "feature_drift: not_covered. Deriva delle feature non certificata: PSI-v3 respinta per questa versione (D1). "
+    "Coperta solo da sorveglianza senza soglia di gate (feature_drift_watch, riferimento e soglia diagnostici della "
+    "corsa respinta, falsi allarmi fuori campione nel blocco watch). Guardia per prodotto e stop di calibrazione "
+    "obbligatori in R0, non ancora implementati (differiti a P4, CONFLITTO P1g)."
+)
+
+
+def not_testable_note(reason: str) -> str:
+    return (
+        "feature_drift: not_testable. La regola PSI-v3 (ultima, pre-registrata) e' stata respinta da SIM-P1f-bis. "
+        "Il criterio diventa not_covered solo con la sorveglianza feature_drift_watch misurata in ogni giorno della "
+        "finestra e la diagnostica support e PSI di p_edge presenti (CONFLITTO P1g); altrimenti resta unmeasured. "
+        f"Motivo: {reason}."
+    )
+
+
+def _not_covered_gap(days: Sequence[Mapping[str, Any]]) -> str | None:
+    """The first thing that is missing for ``not_covered`` (None: nothing). Every day of the window, every product:
+    the watch measured, ``support`` and the PSI of ``p_edge`` present."""
+    for d in days:
+        day = d.get("date")
+        block = (d.get("parity") or {}).get("feature_drift")
+        if not isinstance(block, Mapping):
+            return f"no_learner_document:{day}"
+        if block.get("status") != "not_testable":
+            return f"not_testable_missing:{day}"
+        products = block.get("products") or {}
+        if not products:
+            return f"no_products:{day}"
+        for product, b in sorted(products.items()):
+            where = f"{day}:{product}"
+            diagnostics = b.get("diagnostics") or {}
+            if b.get("status") != "not_testable":
+                return f"product_not_measured:{where}"
+            if (b.get("watch") or {}).get("status") != "measured":
+                return f"watch_unmeasured:{where}"
+            if not isinstance(diagnostics.get("support"), Mapping):
+                return f"support_missing:{where}"
+            if (diagnostics.get("p_edge_psi") or {}).get("status") != "measured":
+                return f"p_edge_psi_unmeasured:{where}"
+    return None
+
+
+def _flag_list(fd: Mapping[str, Any]) -> str:
+    parts = []
+    for product, block in sorted((fd.get("products") or {}).items()):
+        for fl in block.get("flagged") or []:
+            x_f = "n/a" if fl.get("x_f") is None else f"{fl['x_f']:.2f}"
+            parts.append(f"{product} {fl['feature']} psi={fl['psi']:.2f} x_f={x_f} p={fl['p']:.4f}")
+    return "; ".join(parts) if parts else "no flagged feature"
+
+
+def _feature_drift_criterion(days: Sequence[Mapping[str, Any]]) -> Criterion:
+    """``feature_drift`` (PSI-v2) from the LAST day of the window only: its window of W days ends with that day.
+    ``fail`` if a served product is in alarm, ``pass`` if the rule was measured on every product and nothing rang,
+    otherwise ``unmeasured`` (never a pass)."""
+    fd = (days[-1].get("parity") or {}).get("feature_drift") if days else None
+    if not isinstance(fd, Mapping):
+        return _crit("feature_drift", None, None, None, feature_drift_unmeasured_note(days, "no_learner_document"))
+    if fd.get("status") == "not_testable":  # PSI-v3 rejected, definitive: ``not_covered`` or ``unmeasured``
+        gap = _not_covered_gap(days)
+        if gap is not None:
+            return _crit("feature_drift", None, None, None, not_testable_note(gap))
+        watch = {p: (b.get("watch") or {}).get("S") for p, b in (fd.get("products") or {}).items()}
+        return Criterion("feature_drift", "not_covered", watch, (fd.get("watch") or {}).get("c"), NOT_COVERED_NOTE)
+    products: Mapping[str, Mapping[str, Any]] = fd.get("products") or {}
+    value = {p: b.get("S") for p, b in products.items()}
+    threshold = (fd.get("calibration") or {}).get("c")
+    scope_note = (fd.get("scope") or {}).get("note")
+    detail = _flag_list(fd) + (f" | {scope_note}" if scope_note else "")
+    if fd.get("alarm") is True:
+        return _crit("feature_drift", False, value, threshold, detail)
+    complete = bool(products) and all(b.get("status") == "measured" for b in products.values())
+    if fd.get("status") == "measured" and fd.get("alarm") is False and complete:
+        return _crit("feature_drift", True, value, threshold, detail)
+    reason = fd.get("reason") or next(
+        (str(b.get("reason")) for b in products.values() if b.get("status") != "measured"), "incomplete_window"
+    )
+    return _crit("feature_drift", None, value or None, threshold, feature_drift_unmeasured_note(days, str(reason)))
+
+
+def _btc_alignment_criterion(days: Sequence[Mapping[str, Any]], cfg: GateOpsConfig) -> Criterion:
+    """``btc_context_alignment`` on EVERY day of the window: per day and alt product, the share of states whose BTC
+    context was not of the same instant, the shift m of the model answers and the flips of actionability measured on
+    those states, and the two classes that are defects (``value_mismatch``, ``flag_inconsistent``). Precedence:
+    fail, unmeasured, pass."""
+    failed: list[str] = []
+    unmeasured = False
+    shares: list[float] = []
+    bases: set[str] = set()
+    for d in days:
+        block = (d.get("parity") or {}).get("btc_context")
+        if not isinstance(block, Mapping):
+            unmeasured = True
+            continue
+        for product, b in sorted((block.get("products") or {}).items()):
+            where = f"{product} {d.get('date')}"
+            classes = b.get("classes") or {}
+            if b.get("share") is None:
+                unmeasured = True
+            else:
+                shares.append(float(b["share"]))
+                if float(b["share"]) > cfg.max_btc_stale_share:
+                    failed.append(f"{where}: share {float(b['share']):.4f}")
+            for bug in ("value_mismatch", "flag_inconsistent"):
+                if int(classes.get(bug) or 0) > 0:
+                    failed.append(f"{where}: {bug} {classes[bug]}")
+            status = b.get("shift_status")
+            if status not in ("measured", "policy_untunable"):
+                unmeasured = True
+                continue
+            if b.get("max_shift") is None:
+                unmeasured = True
+            elif float(b["max_shift"]) > cfg.max_btc_stale_shift:
+                failed.append(f"{where}: shift {float(b['max_shift']):.4f}")
+            # a version whose policy is explicitly untunable never buys: ONE BUY decision or order intent of the model
+            # books on the day is a defect (flips would not be 0 by definition any more)
+            breaches = sum(
+                int(v.get("buy_records") or 0) + int(v.get("intent_records") or 0)
+                for v in ((b.get("untunable_check") or {}).get("versions") or {}).values()
+                if v.get("policy") == "untunable"
+            )
+            if breaches > 0:
+                failed.append(f"{where}: untunable_violation {breaches}")
+            if b.get("flips") is None:
+                unmeasured = True
+            elif int(b["flips"]) != 0:
+                failed.append(f"{where}: flips {b['flips']}")
+            elif status == "policy_untunable" and b.get("flips_basis") not in ("policy_untunable", "mixed"):
+                unmeasured = True  # a zero without its explicit basis is not a proof
+            if b.get("flips_basis"):
+                bases.add(str(b["flips_basis"]))
+    threshold = {"share": cfg.max_btc_stale_share, "shift": cfg.max_btc_stale_shift, "flips": 0}
+    ok: bool | None = False if failed else (None if unmeasured or not days else True)
+    note = "; ".join(failed) if failed else (
+        "a day without a measured block, or shift/flips not measurable" if ok is None
+        else "flips_basis: " + ", ".join(sorted(bases))
+    )  # fmt: skip
+    return _crit("btc_context_alignment", ok, max(shares, default=None), threshold, note)
+
+
 def evaluate_gate_ops(
     days: Sequence[Mapping[str, Any]], cfg: GateOpsConfig, book: str, *, expected_buy_rate: float | None = None
 ) -> dict[str, Any]:
@@ -484,9 +670,10 @@ def evaluate_gate_ops(
     else:
         c.append(_crit("decision_parity", None, None, cfg.min_decision_parity, "no replay compared"))
 
-    psi = _all_days(days, lambda d: (d.get("parity") or {}).get("max_feature_psi"))
-    c.append(_crit("feature_psi", None if psi is None else max(psi) < cfg.max_feature_psi,
-                   None if psi is None else max(psi), cfg.max_feature_psi))  # fmt: skip
+    # Feature drift (conflict P1f): PSI-v2 on the window that ends with the last day; the old daily PSI is the
+    # diagnostic ``feature_psi_daily_v1`` below, not a criterion. BTC context of the alt states: every day.
+    c.append(_feature_drift_criterion(days))
+    c.append(_btc_alignment_criterion(days, cfg))
 
     # "Barre REST" (sez. 5.1.7, since 2.11): R1-R4 on the impact of the revisions; the raw ratio is a diagnostic
     ratios: list[float] = []
@@ -562,6 +749,22 @@ def evaluate_gate_ops(
          "detail": revisions_by, "note": nothing},
         {"name": "revision_r2_utilization", "value": max(utilization, default=None), "detail": None, "note": nothing},
     ]  # fmt: skip
+    last_fd = (days[-1].get("parity") or {}).get("feature_drift") if days else None
+    scope = (last_fd or {}).get("scope") if isinstance(last_fd, Mapping) else None
+    diagnostics.append({
+        "name": "feature_drift_scope", "value": None if not scope else len(scope.get("tested") or []),
+        "detail": None if not scope else {
+            "rule": last_fd.get("rule"), "tested": scope.get("tested"), "untested": scope.get("untested"),  # type: ignore[union-attr]
+        },
+        "note": (scope or {}).get("note") or "n/a",
+    })  # fmt: skip
+    v1_value, v1_feature, v1_above, v1_day = _v1_worst(days)
+    diagnostics.append({
+        "name": "feature_psi_daily_v1", "value": v1_value,
+        "detail": {"worst_feature": v1_feature, "above_0_10": v1_above, "day": v1_day},
+        "alarm_threshold": cfg.max_feature_psi, "alarm": v1_value is not None and v1_value >= cfg.max_feature_psi,
+        "note": "diagnostica v1 (CONFLITTO P1f), non entra nello stato del gate",
+    })  # fmt: skip
 
     total_buys = sum(int(_book_block_of(d, book).get("BUY", 0)) for d in days)
     if expected_buy_rate is None:
@@ -592,6 +795,7 @@ def evaluate_gate_ops(
     return {
         "book": book, "days": n, "min_days": cfg.min_days, "status": _gate_status(c, n >= cfg.min_days),
         "criteria": [x.to_dict() for x in c], "diagnostics": diagnostics,
+        "not_covered": [x.name for x in c if x.status == "not_covered"],
     }  # fmt: skip
 
 
@@ -958,14 +1162,37 @@ class DryReporter:
         self, d: date, records: Sequence[Mapping[str, Any]], upto: Sequence[Trade], learner: Mapping[str, Any] | None
     ) -> dict[str, Any]:  # fmt: skip
         out: dict[str, Any] = {
-            "decision_match": None, "compared": None, "matched": None, "excluded_manual": 0,
-            "max_feature_psi": None, "worst_feature": None, "state_match": None,
+            "decision_match": None, "compared": None, "matched": None, "excluded_manual": 0, "excluded_btc_stale": 0,
+            "state_match": None, "state_match_all": None,
+            "max_feature_psi": None, "worst_feature": None,  # the keys of sez. 5.2: now the v1 DIAGNOSTIC
+            "psi_v1": None, "feature_drift": None, "btc_context": None,
         }  # fmt: skip
-        l0 = ((learner or {}).get("steps") or {}).get("L0", {}).get("details", {}).get("state_parity") or {}
+        details = ((learner or {}).get("steps") or {}).get("L0", {}).get("details", {})
+        l0 = details.get("state_parity") or {}
         if l0:
-            out["max_feature_psi"], out["worst_feature"] = l0.get("max_feature_psi"), l0.get("worst_feature")
-            out["state_match"] = (l0.get("state_parity") or {}).get("match")
-            out["drift_alerts"] = l0.get("drift_alerts", [])
+            v1 = l0.get("psi_v1")
+            if v1 is None and "max_feature_psi" in l0:  # a learner document written before P1f: keys at the top level
+                psi = l0.get("psi") or {}
+                v1 = {
+                    "rule": "PSI_V1_DAILY_90D", "status": "diagnostic", "psi": psi,
+                    "max_feature_psi": l0.get("max_feature_psi"), "worst_feature": l0.get("worst_feature"),
+                    "above_0_10": sum(1 for v in psi.values() if v is not None and v > 0.10) if psi else None,
+                    "alert_threshold": None, "alerts": l0.get("drift_alerts", []),
+                }  # fmt: skip
+            if v1 is not None:
+                out["psi_v1"] = v1
+                out["max_feature_psi"], out["worst_feature"] = v1.get("max_feature_psi"), v1.get("worst_feature")
+            parity = l0.get("state_parity") or {}
+            out["state_match"] = parity.get("match")
+            out["state_match_all"] = parity.get("match_all", parity.get("match"))
+            out["btc_context"] = l0.get("btc_context")
+        drift = details.get("feature_drift")
+        if isinstance(drift, Mapping):
+            if "skipped" in drift:
+                drift = {"status": "unmeasured", "reason": drift["skipped"]}
+            elif "failed" in drift:
+                drift = {"status": "unmeasured", "reason": "learner_failed"}
+            out["feature_drift"] = drift
         start, end = _day_start(d), _day_start(d) + DAY
         manual = {(t.book, t.product): t.exit_at for t in upto if t.exit_reason == MANUAL and start <= t.exit_at < end}
         if self.paths.replay_dir is not None:
@@ -978,7 +1205,12 @@ class DryReporter:
                     for k in live_map.keys() | replay_map.keys()
                     if (k[0], k[1]) in manual and _parse_t(k[2]) >= _minute(manual[(k[0], k[1])])
                 }
-                out.update(decision_parity(live_map, replay_map, excluded))
+                stale = {
+                    (str(r.get("book")), str(r.get("product")), str(r.get("ts_bar_close")))
+                    for r in records
+                    if r.get("btc_context") == "stale" and "ts_bar_close" in r
+                }  # the LIVE record says its BTC context was not of the minute: HOLD, not a model disagreement
+                out.update(decision_parity(live_map, replay_map, excluded, stale))
         return out
 
     def _bars(self, ops: OpsDay | None, learner: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -1104,9 +1336,10 @@ class DryReporter:
                     if bad
                 ]
                 by_version.setdefault(version, []).extend(f"{name}:{p}" for name in failed)
+        # parity of the DECISIONS only: the drift of the features measures the market (champion and challenger alike)
+        # and goes to ``alarms``; the old daily PSI is a diagnostic (conflict P1f)
         parity_checks: list[tuple[Any, Callable[[Any], bool], str]] = [
             (par.get("decision_match"), lambda v: v < g.min_decision_parity, "decision_parity"),
-            (par.get("max_feature_psi"), lambda v: v >= g.max_feature_psi, "feature_psi"),
         ]
         for value, bad, note in parity_checks:
             if value is not None and bad(value):
@@ -1117,13 +1350,19 @@ class DryReporter:
         return {"operational": operational, "parity": parity, "notes": notes, "revision_by_version": by_version}
 
     def _alarms(self, doc: Mapping[str, Any]) -> list[str]:
-        """Diagnostics that ring without entering a gate or an anomaly: the raw ratio of revised minutes."""
+        """What rings without entering a gate or an anomaly: the raw ratio of revised minutes, and the products in
+        PSI-v2 alarm (``feature_drift:<product>``)."""
         limit = self.cfg.gate_ops.max_rest_revision_ratio
-        return [
+        alarms = [
             f"rest_revision_ratio:{p}"
             for p, b in doc["bars"].items()
             if b.get("rest_revision_ratio") is not None and b["rest_revision_ratio"] > limit
         ]
+        drift = (doc.get("parity") or {}).get("feature_drift") or {}
+        alarms += [f"feature_drift:{p}" for p, b in sorted((drift.get("products") or {}).items()) if b.get("alarm")]
+        alarms += [f"feature_drift_watch:{p}" for p in drift.get("watch_alarm") or []]  # a warning, never a gate
+        alarms += [f"feature_support:{p}" for p in drift.get("support_alarm") or []]  # outside the training range
+        return alarms
 
     # ------------------------------------------------------------------------------ the window
 
@@ -1259,6 +1498,32 @@ def _fmt(v: Any) -> str:
     return str(v)
 
 
+def _feature_drift_line(fd: Mapping[str, Any] | None) -> str:
+    if not isinstance(fd, Mapping):
+        return "feature_drift unmeasured (no_learner_document)"
+    if fd.get("status") == "not_testable":
+        watching = fd.get("watch_alarm") or []
+        watch = f"ALARM on {', '.join(watching)}" if watching else "no alarm"
+        return f"feature_drift not_testable (PSI_V3_VOLSTD respinta, definitivo) | watch: {watch}"
+    if fd.get("status") != "measured":
+        return f"feature_drift unmeasured ({_fmt(fd.get('reason'))})"
+    ringing = [p for p, b in sorted((fd.get("products") or {}).items()) if b.get("alarm")]
+    scope = fd.get("scope") or {}
+    counts = (len(scope.get("tested") or []), len(scope.get("untested") or []))
+    tail = f" | scope: {counts[0]} testate, {counts[1]} non testate" if scope else ""
+    return "feature_drift measured: " + (f"ALARM on {', '.join(ringing)}" if ringing else "no alarm") + tail
+
+
+def _btc_context_line(block: Mapping[str, Any] | None) -> str:
+    products = (block or {}).get("products") or {}
+    if not products:
+        return "btc_context n/a"
+    worst = max(products, key=lambda k: float(products[k].get("share") or 0.0))
+    b = products[worst]
+    basis = f", flips_basis {b['flips_basis']}" if b.get("flips_basis") else ""
+    return f"btc_context worst share {_fmt(b.get('share'))} ({worst}, misaligned {_fmt(b.get('misaligned'))}{basis})"
+
+
 def render_markdown(doc: Mapping[str, Any], ops_gate: Mapping[str, Any] | None, econ: Mapping[str, Any] | None) -> str:
     lines = [f"# Dry run report {doc['date']} ({doc['mode']})", ""]
     lines += ["## Books", "", "| book | equity end | net PnL | fees | trades today | trades total | PF | win | DD |"]
@@ -1276,9 +1541,17 @@ def render_markdown(doc: Mapping[str, Any], ops_gate: Mapping[str, Any] | None, 
     lines += [f"- {k}: {v} {'#' * max(1, round(20 * v / top))}" for k, v in d["skip_reasons"].items()] or ["- none"]
     p = doc["parity"]
     lines += ["", "## Parity (L0)", ""]
-    lines.append(f"decision_match {_fmt(p['decision_match'])} (excluded_manual {p['excluded_manual']})")
-    lines.append(f"max_feature_psi {_fmt(p['max_feature_psi'])} ({_fmt(p['worst_feature'])})")
-    lines.append(f"state_match {_fmt(p['state_match'])}")
+    lines.append(
+        f"decision_match {_fmt(p['decision_match'])} (excluded_manual {p['excluded_manual']}, "
+        f"excluded_btc_stale {p.get('excluded_btc_stale', 0)})"
+    )
+    lines.append(
+        f"max_feature_psi {_fmt(p['max_feature_psi'])} ({_fmt(p['worst_feature'])}) - diagnostica v1, "
+        "non e' un criterio"
+    )
+    lines.append(_feature_drift_line(p.get("feature_drift")))
+    lines.append(_btc_context_line(p.get("btc_context")))
+    lines.append(f"state_match {_fmt(p['state_match'])} (all rows {_fmt(p.get('state_match_all'))})")
     lines += ["", "## Bars", "", "| product | rest | flat | flat_unproven | lag_s_p99 | rest_revision_ratio | R1 share "
               "| R2 max | R3 flips | R4 appeared/disappeared |"]  # fmt: skip
     lines += ["|---|---|---|---|---|---|---|---|---|---|"]
@@ -1315,6 +1588,8 @@ def render_markdown(doc: Mapping[str, Any], ops_gate: Mapping[str, Any] | None, 
         if gate is None:
             continue
         lines += ["", f"## {title}: {gate['status']}", ""]
+        if gate.get("not_covered"):
+            lines += [f"criteri not_covered (non certificati): {', '.join(gate['not_covered'])}", ""]
         lines += ["| criterion | status | value | threshold | note |", "|---|---|---|---|---|"]
         lines += [
             f"| {c_['name']} | {c_['status']} | {_fmt(c_['value'])} | {_fmt(c_['threshold'])} | {_fmt(c_['note'])} |"

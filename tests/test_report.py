@@ -247,11 +247,36 @@ def impact(**kw: Any) -> dict[str, Any]:
     return {**base, **kw}
 
 
+def measured_drift(alarm: bool = False) -> dict[str, Any]:
+    """The ``feature_drift`` block of L0 for one served product (PSI-v2 adopted), as the parity section carries it."""
+    flagged = [{"feature": "atr_14_1d_bps", "psi": 1.92, "x_f": 0.61, "p": 0.0006}] if alarm else []
+    return {
+        "rule": "PSI_V2", "status": "measured", "reason": None, "alarm": alarm,
+        "calibration": {"c": 0.0021, "window_days": 7, "alpha": 0.01},
+        "products": {"SOL-EUR": {"status": "measured", "states": 168, "S": 0.0006 if alarm else 0.3, "alarm": alarm,
+                                 "flagged": flagged}},
+    }  # fmt: skip
+
+
+def btc_context(**kw: Any) -> dict[str, Any]:
+    """The ``btc_context`` block of L0: one alt product whose states of the day were all aligned."""
+    product = {
+        "alt_states": 1440, "misaligned": 0, "share": 0.0,
+        "classes": {"live_missing": 0, "batch_missing": 0, "value_mismatch": 0, "flag_inconsistent": 0},
+        "max_shift": 0.0, "flips": 0, "shift_status": "measured",
+    }  # fmt: skip
+    return {"products": {"SOL-EUR": {**product, **kw}}}
+
+
 def good_day(day: str = "2026-10-17") -> dict[str, Any]:
     return {
         "date": day,
         "ops": {"uptime": 0.999, "dry_run_violations": 0, "crashes": 0, "kill_switch_bug_trips": 0},
-        "parity": {"compared": 1000, "matched": 995, "max_feature_psi": 0.04},
+        "parity": {
+            "compared": 1000, "matched": 995, "max_feature_psi": 7.81, "worst_feature": "seq_1d_bps_5",
+            "psi_v1": {"status": "diagnostic", "max_feature_psi": 7.81, "above_0_10": 37},
+            "feature_drift": measured_drift(), "btc_context": btc_context(),
+        },
         "bars": {"SOL-EUR": {
             "rest_revision_ratio": 0.001, "out_of_order": 0, "duplicates": 0,
             "rest_revisions_appeared": 0, "rest_revisions_disappeared": 0,
@@ -276,7 +301,9 @@ def ops_gate(days: list[dict[str, Any]], expected: float | None = 2.0) -> dict[s
 def test_ops_gate_passes_on_seven_good_days() -> None:
     g = ops_gate(seven_days())
     assert g["status"] == "PASS", [c for c in g["criteria"] if c["status"] != "pass"]
-    assert {c["name"] for c in g["criteria"]} >= {"uptime", "decision_parity", "feature_psi", "revision_shift_share"}
+    names = {c["name"] for c in g["criteria"]}
+    assert names >= {"uptime", "decision_parity", "feature_drift", "btc_context_alignment", "revision_shift_share"}
+    assert "feature_psi" not in names  # the old daily PSI is a diagnostic, not a criterion
 
 
 def test_ops_gate_is_in_progress_before_seven_days() -> None:
@@ -307,8 +334,6 @@ def test_a_failure_wins_over_an_unmeasured_criterion() -> None:
         ("ops", "dry_run_violations", 1, "zero_dry_run_violations", "fail"),
         ("ops", "crashes", 1, "zero_crashes", "fail"),
         ("ops", "kill_switch_bug_trips", 1, "no_kill_switch_for_bug", "fail"),
-        ("parity", "max_feature_psi", 0.10, "feature_psi", "fail"),  # PSI < 0.10 is strict
-        ("parity", "max_feature_psi", 0.0999, "feature_psi", "pass"),
     ],
 )
 def test_ops_thresholds(section: str, key: str, value: float, name: str, status: str) -> None:
@@ -449,7 +474,9 @@ def test_gate_ops_new_diagnostics_not_criteria() -> None:
     assert by_name["revision_shift_rolling_max"]["value"] == pytest.approx(3 / 1440)
     assert by_name["revision_independent_revisions"]["value"] == 2
     assert by_name["revision_r2_utilization"]["value"] == pytest.approx(0.7)
-    assert all("senza soglia" in by_name[n]["note"] for n in list(by_name)[1:])
+    with_threshold = ("rest_revision_ratio", "feature_psi_daily_v1", "feature_drift_scope")
+    thresholdless = [n for n in by_name if n not in with_threshold]
+    assert all("senza soglia" in by_name[n]["note"] for n in thresholdless)
     assert g["status"] == "PASS"  # whatever they say, they do not move the status
     bare = ops_gate(seven_days())  # no instants in the days: the diagnostics exist and are empty, not an error
     assert next(d for d in bare["diagnostics"] if d["name"] == "revision_shift_rolling_max")["value"] is None
@@ -819,3 +846,436 @@ def test_the_configured_thresholds_are_the_ones_used(tmp_path: Path) -> None:
 def test_uptime_is_the_mean_over_the_window_not_the_worst_day() -> None:
     days = seven_days(lambda ds: ds[0]["ops"].update(uptime=0.95))  # one bad day, six at 0.999: mean 0.992
     assert crit(ops_gate(days), "uptime")["status"] == "pass"
+
+
+# ----------------------------------------------------------------------- conflict P1f: feature drift, BTC context
+
+
+G4_PREFIX = (
+    "feature_drift: unmeasured. Il PSI giornaliero contro gli ultimi 90 giorni misura in quanti decili cade un giorno "
+    "di feature persistenti (4 prodotti x 1 valore, tetto ~8,3), non la deriva rispetto al training. Criterio "
+    "sospeso (CONFLITTO P1f-bis) fino alla regola PSI-v3 calibrata (SIM-P1f-bis, D1/D1h/D2/D3). "
+)
+
+
+def without_drift(reason: str | None = "no_calibration") -> Any:
+    def mutate(ds: list[dict[str, Any]]) -> None:
+        for d in ds:
+            d["parity"]["feature_drift"] = None if reason is None else {"status": "unmeasured", "reason": reason}
+
+    return mutate
+
+
+def test_old_psi_never_fails_the_gate() -> None:
+    """Days with a daily PSI v1 of 7.81 (37 features above 0.10): no criterion fails on it, ``feature_drift`` is
+    ``unmeasured`` with the exact text of the decision, and the gate is INCOMPLETE, never FAIL, because of it."""
+    days = seven_days(without_drift("no_calibration"))
+    days[3]["parity"].update(max_feature_psi=9.0, worst_feature="clock_dow")
+    g = ops_gate(days)
+    assert "feature_psi" not in {c["name"] for c in g["criteria"]}
+    fd = crit(g, "feature_drift")
+    assert fd["status"] == "unmeasured" and g["status"] == "INCOMPLETE"
+    assert not [c for c in g["criteria"] if c["status"] == "fail"]
+    assert fd["note"] == (
+        G4_PREFIX + "Diagnostica: max PSI = 9.00 (clock_dow), 37 feature sopra 0,10. Motivo: no_calibration."
+    )
+    no_data = ops_gate(seven_days(lambda ds: [d.update(parity={"decision_match": 1.0}) for d in ds]))
+    assert crit(no_data, "feature_drift")["note"] == (
+        G4_PREFIX + "Diagnostica: max PSI = n/a (n/a), n/a feature sopra 0,10. Motivo: no_learner_document."
+    )
+
+
+def test_old_psi_is_not_a_parity_anomaly(tmp_path: Path) -> None:
+    learner = {"steps": {"L0": {"details": {"state_parity": {
+        "state_parity": {"match": 0.9979}, "psi_v1": {
+            "status": "diagnostic", "max_feature_psi": 7.81, "worst_feature": "seq_1d_bps_5", "above_0_10": 37,
+            "alerts": [{"feature": "seq_1d_bps_5", "psi": 7.81}]},
+        "max_feature_psi_unused": None,
+    }}}}}  # fmt: skip
+    (tmp_path / "learner").mkdir(parents=True)
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")
+    doc = build(tmp_path).generate(DAY1, 1)["daily"][0]
+    assert doc["parity"]["max_feature_psi"] == 7.81 and doc["anomalies"]["parity"] == 0
+    assert "feature_psi" not in doc["anomalies"]["notes"]
+
+
+def test_feature_drift_pass_fail_from_last_day() -> None:
+    # six days in alarm do not count: the window of the rule ends with the last day
+    def last_day_quiet(ds: list[dict[str, Any]]) -> None:
+        for d in ds[:-1]:
+            d["parity"]["feature_drift"] = measured_drift(alarm=True)
+
+    quiet = ops_gate(seven_days(last_day_quiet))
+    fd = crit(quiet, "feature_drift")
+    assert fd["status"] == "pass" and fd["value"] == {"SOL-EUR": 0.3} and fd["threshold"] == 0.0021
+    assert quiet["status"] == "PASS", [c for c in quiet["criteria"] if c["status"] != "pass"]
+
+    def last_day_alarm(ds: list[dict[str, Any]]) -> None:
+        ds[-1]["parity"]["feature_drift"] = measured_drift(alarm=True)
+
+    loud = ops_gate(seven_days(last_day_alarm))
+    fail = crit(loud, "feature_drift")
+    assert fail["status"] == "fail" and loud["status"] == "FAIL"
+    assert fail["note"] == "SOL-EUR atr_14_1d_bps psi=1.92 x_f=0.61 p=0.0006"
+
+    def one_product_unmeasured(ds: list[dict[str, Any]]) -> None:
+        block = measured_drift()
+        block["products"]["XRP-EUR"] = {"status": "unmeasured", "reason": "incomplete_window"}
+        ds[-1]["parity"]["feature_drift"] = block
+
+    part = ops_gate(seven_days(one_product_unmeasured))
+    assert crit(part, "feature_drift")["status"] == "unmeasured" and part["status"] == "INCOMPLETE"
+    assert crit(part, "feature_drift")["note"].endswith("Motivo: incomplete_window.")
+
+
+def test_feature_drift_alarm_goes_to_alarms_not_anomalies(tmp_path: Path) -> None:
+    learner = {"steps": {"L0": {"details": {
+        "state_parity": {"state_parity": {"match": 1.0}, "psi_v1": {"max_feature_psi": 7.81, "worst_feature": "x"}},
+        "feature_drift": measured_drift(alarm=True),
+    }}}}  # fmt: skip
+    (tmp_path / "learner").mkdir(parents=True)
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")
+    doc = build(tmp_path).generate(DAY1, 1)["daily"][0]
+    assert "feature_drift:SOL-EUR" in doc["alarms"]
+    assert doc["anomalies"]["parity"] == 0 and doc["anomalies"]["operational"] == 0
+    assert doc["parity"]["feature_drift"]["alarm"] is True
+    skipped = {"steps": {"L0": {"details": {"state_parity": {"state_parity": {"match": 1.0}},
+                                            "feature_drift": {"skipped": "no_calibration"}}}}}  # fmt: skip
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(skipped), encoding="utf-8")
+    again = build(tmp_path).generate(DAY1, 1)["daily"][0]
+    assert again["parity"]["feature_drift"] == {"status": "unmeasured", "reason": "no_calibration"}
+    assert not [a for a in again["alarms"] if a.startswith("feature_drift")]
+
+
+def test_feature_psi_daily_v1_diagnostic() -> None:
+    days = seven_days()
+    days[2]["parity"].update(max_feature_psi=9.5, worst_feature="clock_dow")
+    days[2]["parity"]["psi_v1"] = {"status": "diagnostic", "max_feature_psi": 9.5, "above_0_10": 41}
+    g = ops_gate(days)
+    diag = next(d for d in g["diagnostics"] if d["name"] == "feature_psi_daily_v1")
+    assert diag["value"] == 9.5 and diag["alarm"] is True and diag["alarm_threshold"] == 0.10
+    assert diag["detail"] == {"worst_feature": "clock_dow", "above_0_10": 41, "day": "2026-10-13"}
+    assert "feature_psi_daily_v1" not in {c["name"] for c in g["criteria"]}
+    assert g["status"] == "PASS"  # a diagnostic alarm does not move the gate
+    quiet = ops_gate(seven_days(lambda ds: [d["parity"].update(max_feature_psi=0.05) for d in ds]))
+    assert next(d for d in quiet["diagnostics"] if d["name"] == "feature_psi_daily_v1")["alarm"] is False
+    none = ops_gate(seven_days(lambda ds: [d.update(parity={}) for d in ds]))
+    assert next(d for d in none["diagnostics"] if d["name"] == "feature_psi_daily_v1")["value"] is None
+
+
+def test_old_learner_document_still_read(tmp_path: Path) -> None:
+    """A learner document written before P1f carries the PSI keys at the top level of ``state_parity``."""
+    learner = {"steps": {"L0": {"details": {"state_parity": {
+        "state_parity": {"match": 0.9982}, "unmatched_rows": 0, "psi": {"a": 7.8, "b": 0.05, "c": 0.4, "d": None},
+        "max_feature_psi": 7.8, "worst_feature": "a", "drift_alerts": [{"feature": "a", "psi": 7.8}],
+    }}}}}  # fmt: skip
+    (tmp_path / "learner").mkdir(parents=True)
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")
+    par = build(tmp_path).generate(DAY1, 1)["daily"][0]["parity"]
+    assert par["max_feature_psi"] == 7.8 and par["worst_feature"] == "a"
+    assert par["psi_v1"]["above_0_10"] == 2 and par["psi_v1"]["alerts"] == [{"feature": "a", "psi": 7.8}]
+    assert par["state_match"] == 0.9982 and par["state_match_all"] == 0.9982
+    assert par["feature_drift"] is None and par["btc_context"] is None and "drift_alerts" not in par
+
+
+def test_decision_parity_excludes_btc_stale_minutes() -> None:
+    k = ("champion", "ETH-EUR")
+    live = {(*k, f"t{i}"): "HOLD" for i in range(6)}
+    live[(*k, "t2")] = "HOLD"  # the live engine blocked the BUY: btc_context_stale
+    replay = {key: "HOLD" for key in live} | {(*k, "t2"): "BUY", (*k, "t4"): "BUY"}
+    out = decision_parity(live, replay, set(), {(*k, "t2")})
+    assert out["excluded_btc_stale"] == 1 and out["excluded_manual"] == 0
+    assert out["compared"] == 5 and out["matched"] == 4  # t4 is a real disagreement
+    both = decision_parity(live, replay, {(*k, "t2")}, {(*k, "t2"), (*k, "t3")})  # counted ONCE, as manual
+    assert both["excluded_manual"] == 1 and both["excluded_btc_stale"] == 1 and both["compared"] == 4
+
+
+def test_the_report_counts_the_stale_minutes_apart_from_the_manual_ones(tmp_path: Path) -> None:
+    live = [decision("champion", "ETH-EUR", m, "HOLD", btc_context="aligned") for m in range(0, 100)]
+    live[10] = decision("champion", "ETH-EUR", 10, "HOLD", btc_context="stale")
+    replay = [decision("champion", "ETH-EUR", m, "BUY" if m == 10 else "HOLD") for m in range(0, 100)]
+    write_jsonl(tmp_path / "decisions" / "2026-10-17.jsonl", live)
+    write_jsonl(tmp_path / "replay" / "2026-10-17.jsonl", replay)
+    manual_at = datetime(2026, 10, 17, 1, 30, tzinfo=UTC)  # minute 90 up to the end of the day
+    rep = build(tmp_path, [trade("-1", "MANUAL", at=manual_at, product="ETH-EUR")], replay_dir=tmp_path / "replay")
+    par = rep.generate(DAY1, 1)["daily"][0]["parity"]
+    assert par["excluded_btc_stale"] == 1 and par["excluded_manual"] == 10
+    assert par["compared"] == 89 and par["decision_match"] == 1.0
+
+
+def set_btc(**kw: Any) -> Any:
+    def mutate(ds: list[dict[str, Any]]) -> None:
+        ds[2]["parity"]["btc_context"] = btc_context(**kw)
+
+    return mutate
+
+
+def test_btc_context_alignment_pass_fail_unmeasured() -> None:
+    name = "btc_context_alignment"
+    ok = ops_gate(seven_days())
+    assert crit(ok, name)["status"] == "pass" and crit(ok, name)["value"] == 0.0
+    assert crit(ok, name)["threshold"] == {"share": 0.005, "shift": 0.01, "flips": 0}
+    assert crit(ops_gate(seven_days(set_btc(share=0.005, misaligned=7))), name)["status"] == "pass"
+    over = ops_gate(seven_days(set_btc(share=0.006, misaligned=9)))
+    assert crit(over, name)["status"] == "fail" and over["status"] == "FAIL"
+    assert crit(ops_gate(seven_days(set_btc(max_shift=0.01))), name)["status"] == "pass"
+    assert crit(ops_gate(seven_days(set_btc(max_shift=0.011))), name)["status"] == "fail"
+    assert crit(ops_gate(seven_days(set_btc(flips=1))), name)["status"] == "fail"
+    bug = ops_gate(seven_days(set_btc(classes={"live_missing": 0, "batch_missing": 0, "value_mismatch": 1,
+                                               "flag_inconsistent": 0})))  # fmt: skip
+    assert crit(bug, name)["status"] == "fail" and "value_mismatch" in crit(bug, name)["note"]
+    flag = ops_gate(seven_days(set_btc(classes={"flag_inconsistent": 2})))
+    assert crit(flag, name)["status"] == "fail"
+    # a day with no block, a shift that cannot be measured, flips unknown: unmeasured, never a pass
+    missing = ops_gate(seven_days(lambda ds: ds[4]["parity"].update(btc_context=None)))
+    assert crit(missing, name)["status"] == "unmeasured" and missing["status"] == "INCOMPLETE"
+    assert crit(ops_gate(seven_days(set_btc(shift_status="no_deciders", max_shift=None, flips=None))), name)[
+        "status"
+    ] == "unmeasured"
+    untunable = ops_gate(seven_days(set_btc(shift_status="policy_untunable", flips=None)))
+    assert crit(untunable, name)["status"] == "unmeasured"
+    # failure wins over unmeasured
+    def both(ds: list[dict[str, Any]]) -> None:
+        ds[4]["parity"]["btc_context"] = None
+        ds[2]["parity"]["btc_context"] = btc_context(flips=2)
+
+    assert crit(ops_gate(seven_days(both)), name)["status"] == "fail"
+
+
+def test_markdown_shows_the_diagnostic_and_the_new_parity_lines(tmp_path: Path) -> None:
+    learner = {"steps": {"L0": {"details": {
+        "state_parity": {"state_parity": {"match": 0.9998, "match_all": 0.9979}, "unmatched_rows": 0,
+                         "psi_v1": {"max_feature_psi": 7.81, "worst_feature": "seq_1d_bps_5", "above_0_10": 37},
+                         "btc_context": btc_context(share=0.0028, misaligned=4)},
+        "feature_drift": {"skipped": "no_calibration"},
+    }}}}  # fmt: skip
+    (tmp_path / "learner").mkdir(parents=True)
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")
+    build(tmp_path).generate(DAY1, 1)
+    text = (tmp_path / "out" / "2026-10-17.md").read_text(encoding="utf-8")
+    assert "max_feature_psi 7.81 (seq_1d_bps_5) - diagnostica v1, non e' un criterio" in text
+    assert "feature_drift unmeasured (no_calibration)" in text
+    assert "btc_context worst share 0.0028 (SOL-EUR, misaligned 4)" in text
+    assert "excluded_btc_stale 0" in text and "(all rows 0.9979)" in text
+    assert "feature_psi_daily_v1" in text
+
+
+def untunable_context(**kw: Any) -> Any:
+    """A day of a champion whose policy is explicitly untunable: flips 0 with their basis."""
+    base: dict[str, Any] = {
+        "shift_status": "policy_untunable", "flips": 0, "flips_basis": "policy_untunable", "max_shift": 0.0035,
+        "misaligned": 4, "share": 0.0028,
+        "untunable_check": {"versions": {"m@1": {"policy": "untunable", "buy_records": 0, "intent_records": 0}}},
+    }  # fmt: skip
+    return set_btc(**{**base, **kw})
+
+
+def test_btc_alignment_passes_with_policy_untunable_basis() -> None:
+    g = ops_gate(seven_days(untunable_context()))
+    c = crit(g, "btc_context_alignment")
+    assert c["status"] == "pass" and c["note"] == "flips_basis: policy_untunable"
+    # the same document with the flips but without the explicit basis is not a proof
+    no_basis = ops_gate(seven_days(untunable_context(flips_basis=None)))
+    assert crit(no_basis, "btc_context_alignment")["status"] == "unmeasured"
+
+
+def test_btc_alignment_fails_on_untunable_violation() -> None:
+    bad = {"versions": {"m@1": {"policy": "untunable", "buy_records": 1, "intent_records": 0}}}
+    g = ops_gate(seven_days(untunable_context(flips=None, flips_basis=None, untunable_check=bad)))
+    c = crit(g, "btc_context_alignment")
+    assert c["status"] == "fail" and "untunable_violation 1" in c["note"] and g["status"] == "FAIL"
+    intent = {"versions": {"m@1": {"policy": "untunable", "buy_records": 0, "intent_records": 2}}}
+    assert "untunable_violation 2" in crit(
+        ops_gate(seven_days(untunable_context(flips=None, flips_basis=None, untunable_check=intent))),
+        "btc_context_alignment",
+    )["note"]
+    # a missing policy file proves nothing and is not a violation either: unmeasured
+    missing = {"versions": {"m@1": {"policy": "missing", "buy_records": 5, "intent_records": 0}}}
+    unproven = untunable_context(flips=None, flips_basis=None, untunable_check=missing)
+    assert crit(ops_gate(seven_days(unproven)), "btc_context_alignment")["status"] == "unmeasured"
+    # the shift limit still applies under an untunable policy
+    assert crit(ops_gate(seven_days(untunable_context(max_shift=0.011))), "btc_context_alignment")["status"] == "fail"
+
+
+def test_btc_alignment_old_document_without_basis_unmeasured() -> None:
+    old = set_btc(shift_status="policy_untunable", flips=None, max_shift=0.0035)
+    assert crit(ops_gate(seven_days(old)), "btc_context_alignment")["status"] == "unmeasured"
+
+
+SCOPE_NOTE = (
+    "feature_drift (PSI-v3): forma dei rendimenti veloci standardizzati per volatilita'. Livello di volatilita' e 28 "
+    "feature persistenti non testabili in 7 giorni (n_eff_7d < 50): solo diagnostica support."
+)
+
+
+def v3_drift(alarm: bool = False, **kw: Any) -> dict[str, Any]:
+    """The ``feature_drift`` block of PSI-v3 for one product, with its scope and its diagnostics."""
+    block = measured_drift(alarm)
+    block.update(
+        rule="PSI_V3_VOLSTD",
+        scope={"tested": ["z_ret_1h_bps", "z_ret_15m_bps"], "untested": [{"feature": f"f{i}", "n_eff_7d": 1.0}
+                                                                          for i in range(28)], "note": SCOPE_NOTE},
+        support_alarm=[],
+    )  # fmt: skip
+    block.update(kw)
+    return block
+
+
+def last_day(block: dict[str, Any]) -> Any:
+    def mutate(ds: list[dict[str, Any]]) -> None:
+        ds[-1]["parity"]["feature_drift"] = block
+
+    return mutate
+
+
+def test_feature_drift_not_testable_note() -> None:
+    block = {"rule": "PSI_V3_VOLSTD", "status": "not_testable", "reason": "calibration_rejected_final", "alarm": None,
+             "products": {"SOL-EUR": {"status": "not_testable", "states": 168}}}  # fmt: skip
+    g = ops_gate(seven_days(last_day(block)))
+    c = crit(g, "feature_drift")
+    assert c["status"] == "unmeasured" and g["status"] == "INCOMPLETE"  # never a pass, never a fail
+    assert c["note"] == (
+        "feature_drift: not_testable. La regola PSI-v3 (ultima, pre-registrata) e' stata respinta da SIM-P1f-bis. "
+        "Il criterio diventa not_covered solo con la sorveglianza feature_drift_watch misurata in ogni giorno della "
+        "finestra e la diagnostica support e PSI di p_edge presenti (CONFLITTO P1g); altrimenti resta unmeasured. "
+        "Motivo: not_testable_missing:2026-10-11."  # the six days before the last one are not "not_testable" blocks
+    )
+
+
+def test_feature_drift_scope_note_on_pass() -> None:
+    ok = ops_gate(seven_days(last_day(v3_drift())))
+    c = crit(ok, "feature_drift")
+    assert c["status"] == "pass" and c["note"] == "no flagged feature | " + SCOPE_NOTE
+    assert ok["status"] == "PASS", [x for x in ok["criteria"] if x["status"] != "pass"]
+    loud = ops_gate(seven_days(last_day(v3_drift(alarm=True))))
+    fail = crit(loud, "feature_drift")
+    assert fail["status"] == "fail" and fail["note"].endswith(" | " + SCOPE_NOTE) and "atr_14_1d_bps" in fail["note"]
+
+
+def test_feature_drift_scope_diagnostic() -> None:
+    g = ops_gate(seven_days(last_day(v3_drift())))
+    diag = next(d for d in g["diagnostics"] if d["name"] == "feature_drift_scope")
+    assert diag["value"] == 2 and diag["detail"]["rule"] == "PSI_V3_VOLSTD" and len(diag["detail"]["untested"]) == 28
+    assert diag["note"] == SCOPE_NOTE and "alarm" not in diag  # no threshold: outside the gate
+    bare = next(d for d in ops_gate(seven_days())["diagnostics"] if d["name"] == "feature_drift_scope")
+    assert bare["value"] is None and bare["detail"] is None and bare["note"] == "n/a"
+    assert "feature_drift_scope" not in {c["name"] for c in g["criteria"]}
+
+
+def test_feature_support_goes_to_alarms_not_anomalies(tmp_path: Path) -> None:
+    block = v3_drift(support_alarm=["SOL-EUR"])
+    learner = {"steps": {"L0": {"details": {
+        "state_parity": {"state_parity": {"match": 1.0}, "psi_v1": {"max_feature_psi": 7.81, "worst_feature": "x"}},
+        "feature_drift": block,
+    }}}}  # fmt: skip
+    (tmp_path / "learner").mkdir(parents=True)
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")
+    doc = build(tmp_path).generate(DAY1, 1)["daily"][0]
+    assert "feature_support:SOL-EUR" in doc["alarms"] and "feature_drift:SOL-EUR" not in doc["alarms"]
+    assert doc["anomalies"]["parity"] == 0 and doc["anomalies"]["operational"] == 0
+    text = (tmp_path / "out" / "2026-10-17.md").read_text(encoding="utf-8")
+    assert "feature_drift measured: no alarm | scope: 2 testate, 28 non testate" in text
+    rejected = {"rule": "PSI_V3_VOLSTD", "status": "not_testable", "reason": "calibration_rejected_final"}
+    learner["steps"]["L0"]["details"]["feature_drift"] = rejected
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")
+    build(tmp_path).generate(DAY1, 1)
+    again = (tmp_path / "out" / "2026-10-17.md").read_text(encoding="utf-8")
+    assert "feature_drift not_testable (PSI_V3_VOLSTD respinta, definitivo)" in again
+
+
+NOT_COVERED_TEXT = (
+    "feature_drift: not_covered. Deriva delle feature non certificata: PSI-v3 respinta per questa versione (D1). "
+    "Coperta solo da sorveglianza senza soglia di gate (feature_drift_watch, riferimento e soglia diagnostici della "
+    "corsa respinta, falsi allarmi fuori campione nel blocco watch). Guardia per prodotto e stop di calibrazione "
+    "obbligatori in R0, non ancora implementati (differiti a P4, CONFLITTO P1g)."
+)
+
+
+def rejected_drift(
+    *, watch_alarm: bool = False, watch: Any = "measured", edge: Any = "measured", support: bool = True
+) -> Any:
+    """The ``feature_drift`` block of a rejected PSI-v3 run for one product, with its watch and diagnostics."""
+    diagnostics: dict[str, Any] = {"p_edge_psi": {"status": edge}}
+    if support:
+        diagnostics["support"] = {"states": 168, "states_outside": 0, "share": 0.0, "features": {}}
+    block = {"status": "not_testable", "states": 168, "diagnostics": diagnostics}
+    block["watch"] = {"status": watch, "S": 0.3, "alarm": watch_alarm, "flagged": []}
+    return {
+        "rule": "PSI_V3_VOLSTD", "status": "not_testable", "reason": "calibration_rejected_final", "alarm": None,
+        "calibration": {"decision": "rejected", "final": True}, "scope": {"tested": [], "untested": [], "note": "n"},
+        "watch": {"rule": "PSI_V3_VOLSTD", "reference": "reference_diagnostic", "c": 0.002265, "gate": False,
+                  "false_alarm_oos": {"max": 0.0204}},  # fmt: skip
+        "products": {"SOL-EUR": block}, "support_alarm": [], "watch_alarm": ["SOL-EUR"] if watch_alarm else [],
+    }  # fmt: skip
+
+
+def every_day(**kw: Any) -> Any:
+    def mutate(ds: list[dict[str, Any]]) -> None:
+        for d in ds:
+            d["parity"]["feature_drift"] = rejected_drift(**kw)
+
+    return mutate
+
+
+def test_not_covered_note_exact() -> None:
+    from modules.dryrun import report as report_mod
+
+    assert report_mod.NOT_COVERED_NOTE == NOT_COVERED_TEXT
+    assert report_mod.not_testable_note("x").endswith("Motivo: x.")
+
+
+def test_feature_drift_not_covered_when_watch_every_day() -> None:
+    g = ops_gate(seven_days(every_day()))
+    c = crit(g, "feature_drift")
+    assert c["status"] == "not_covered" and c["note"] == NOT_COVERED_TEXT
+    assert c["value"] == {"SOL-EUR": 0.3} and c["threshold"] == 0.002265  # the threshold of the rejected run
+
+
+def test_not_covered_does_not_block_gate_and_is_listed() -> None:
+    g = ops_gate(seven_days(every_day()))
+    assert g["status"] == "PASS" and g["not_covered"] == ["feature_drift"]  # never a pass, never a block
+    assert ops_gate(seven_days())["not_covered"] == []
+    others = [c for c in g["criteria"] if c["name"] != "feature_drift"]
+    assert all(c["status"] == "pass" for c in others)
+
+
+def test_feature_drift_unmeasured_if_one_day_lacks_watch() -> None:
+    def hole(ds: list[dict[str, Any]]) -> None:
+        every_day()(ds)
+        ds[3]["parity"]["feature_drift"] = rejected_drift(watch="unmeasured")
+
+    g = ops_gate(seven_days(hole))
+    c = crit(g, "feature_drift")
+    assert c["status"] == "unmeasured" and c["note"].endswith("Motivo: watch_unmeasured:2026-10-14:SOL-EUR.")
+    assert g["status"] == "INCOMPLETE" and g["not_covered"] == []
+
+    def no_block(ds: list[dict[str, Any]]) -> None:
+        every_day()(ds)
+        ds[0]["parity"]["feature_drift"] = None
+
+    assert crit(ops_gate(seven_days(no_block)), "feature_drift")["note"].endswith("no_learner_document:2026-10-11.")
+
+
+def test_feature_drift_unmeasured_if_p_edge_psi_missing() -> None:
+    g = ops_gate(seven_days(every_day(edge="unmeasured")))
+    assert crit(g, "feature_drift")["note"].endswith("p_edge_psi_unmeasured:2026-10-11:SOL-EUR.")
+    g2 = ops_gate(seven_days(every_day(support=False)))
+    assert crit(g2, "feature_drift")["note"].endswith("support_missing:2026-10-11:SOL-EUR.")
+    assert crit(g, "feature_drift")["status"] == "unmeasured" and g["status"] == "INCOMPLETE"
+
+
+def test_watch_alarm_in_alarms_not_anomalies_not_gate(tmp_path: Path) -> None:
+    g = ops_gate(seven_days(every_day(watch_alarm=True)))
+    assert crit(g, "feature_drift")["status"] == "not_covered" and g["status"] == "PASS"  # a warning only
+    learner = {"steps": {"L0": {"details": {
+        "state_parity": {"state_parity": {"match": 1.0}, "psi_v1": {"max_feature_psi": 7.81, "worst_feature": "x"}},
+        "feature_drift": rejected_drift(watch_alarm=True),
+    }}}}  # fmt: skip
+    (tmp_path / "learner").mkdir(parents=True)
+    (tmp_path / "learner" / "2026-10-18.json").write_text(json.dumps(learner), encoding="utf-8")
+    doc = build(tmp_path).generate(DAY1, 1)["daily"][0]
+    assert "feature_drift_watch:SOL-EUR" in doc["alarms"] and "feature_drift:SOL-EUR" not in doc["alarms"]
+    assert doc["anomalies"]["parity"] == 0 and doc["anomalies"]["operational"] == 0
+    text = (tmp_path / "out" / "2026-10-17.md").read_text(encoding="utf-8")
+    assert "criteri not_covered (non certificati): feature_drift" in text
+    assert "feature_drift not_testable (PSI_V3_VOLSTD respinta, definitivo) | watch: ALARM on SOL-EUR" in text

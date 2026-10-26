@@ -8,7 +8,15 @@ What it does, step by step (ids of the spec table):
 
 * L0 parity live/training. Audit of the REST revisions of the previous UTC day (``rest_revisions``, read only: the
   store is never modified), state parity (the FLAT states logged by the engine against the batch path
-  ``flat_matrix``) and the PSI of each feature against the last 90 days of history.
+  ``flat_matrix``), the BTC context of the alt states (``btc_context``: the states whose BTC bar was not of the same
+  instant, by class, with the shift of the model answers and the flips of a BUY they cause; zero flips with the
+  basis ``policy_untunable`` when the policy of the version is explicitly untunable and the day shows no BUY), the
+  drift of the inputs against the training reference (``feature_drift``: PSI-v3, ``modules/dryrun/drift.py``,
+  calibrated by SIM-P1f-bis, PSI-v2 as a fallback; ``unmeasured`` without a calibration, ``not_testable`` when PSI-v3
+  was rejected; always with the diagnostics ``support``, PSI percentile of the features the test does not cover and
+  PSI of ``p_edge``) and, as a DIAGNOSTIC only (``state_parity.psi_v1``), the old daily PSI of each feature against
+  the last 90 days of history. Conflicts P1f and P1f-bis, docs/decisions/2026-10-25-p1f-psi-v2.md and
+  2026-10-26-p1f-bis-psi-v3.md.
 * L4 cost model. Maker fill rate of the dry ledger, REST latency p75, median spread per product and hour. Only
   ``latency_ms`` can change ``fill_model.json`` (the file stays loadable by ``FillModelParams``); the rest goes to
   ``cost_table.json``. Never touches a label (decision O1.3).
@@ -72,6 +80,7 @@ import pandas as pd
 import structlog
 
 from modules.config import GateEconConfig, GateOpsConfig, LearnerConfig, RiskConfig
+from modules.dryrun import drift
 from modules.dryrun.fill_model import FillModelParams
 from modules.dryrun.registry import (
     CHALLENGER,
@@ -92,7 +101,14 @@ from modules.dryrun.registry import (
     artifacts_from_dir,
     decide_promotion,
 )
-from modules.dryrun.revision_impact import ImpactSkip, day_impact, revisions_frame, write_revisions
+from modules.dryrun.revision_impact import (
+    ImpactSkip,
+    day_impact,
+    flat_pair_shift,
+    policy_kind,
+    revisions_frame,
+    write_revisions,
+)
 from modules.features.schemas import DecisionState
 from modules.features.serializer import FLAT_COLUMNS, flatten_state
 from modules.market.backfill import BarStore, CandleSource, candles_to_frame
@@ -127,6 +143,12 @@ PSI_BINS: Final = 10
 PSI_MIN_SAMPLES: Final = 100  # implementation choice (10 per bin): the spec gives the threshold, not the sample size
 PSI_FLOOR: Final = 1e-4
 PSI_ALERT: Final = 0.25
+PSI_V1_RULE: Final = "PSI_V1_DAILY_90D"  # the old daily PSI against 90 days: a diagnostic since conflict P1f
+PSI_V1_ABOVE: Final = 0.10
+BTC_COLUMNS: Final = tuple(j for j, c in enumerate(FLAT_COLUMNS) if c.startswith("btc_"))
+BTC_CLASSES: Final = ("live_missing", "batch_missing", "value_mismatch", "flag_inconsistent")
+MODEL_BOOKS: Final = ("champion", "challenger")  # the books where the MODEL decides (the others are benchmarks)
+_SHIFT_RANK: Final = {"measured": 0, "policy_untunable": 1, "decider_without_batch": 2, "no_deciders": 3}
 REST_CHUNK_MIN: Final = 300
 OOS_EMBARGO: Final = timedelta(days=2)  # the embargo of ``training.splits.purged_walk_forward`` (V1 of rule L5)
 _DONE_PREFIXES: Final = ("ok", "skipped")
@@ -207,6 +229,37 @@ def feature_parity(live: np.ndarray, batch: np.ndarray) -> dict[str, Any]:
         "worst_feature": FLAT_COLUMNS[worst] if per_feature[worst] > 0 else None,
         "mismatch_by_feature": {FLAT_COLUMNS[j]: int(n) for j, n in enumerate(per_feature) if n > 0},
     }
+
+
+def classify_btc_row(flag: str | None, live: np.ndarray, batch: np.ndarray) -> tuple[str | None, bool]:
+    """``(class, misaligned)`` of one alt FLAT state from its ``btc_*`` values: ``live`` as the engine logged them,
+    ``batch`` as the batch path rebuilds them (always aligned, A8). ``flag`` is the ``btc_context`` of the record
+    (``aligned`` / ``stale``, ``None`` for a record written before P1f).
+
+    * ``live_missing`` / ``batch_missing``: a ``btc_*`` token exists on one side only (``misaligned``: the model
+      answered on a state without it, or with another one);
+    * ``value_mismatch``: both finite and different, and ``flag_inconsistent``: the flag contradicts the values
+      (``stale`` with finite values, ``aligned`` with none where the batch has them). Both are DEFECTS, never
+      ``misaligned``: the gate fails on them. A token is compared one by one (a young BTC history has no
+      ``rv_ratio_1d_30d`` on either side)."""
+    live_ok, batch_ok = np.isfinite(live), np.isfinite(batch)
+    live_missing = bool((~live_ok & batch_ok).any())  # a token the batch has and the live state lacks
+    batch_missing = bool((live_ok & ~batch_ok).any())
+    value_mismatch = bool((live_ok & batch_ok & (live != batch)).any())
+    live_any = bool(live_ok.any())
+    if flag == "stale":  # the engine had no BTC bar of the instant: every btc token of the state is missing
+        if live_any:
+            return "flag_inconsistent", False
+        return ("live_missing" if live_missing else "batch_missing"), True
+    if flag == "aligned" and live_missing and not live_any:
+        return "flag_inconsistent", False
+    if live_missing:
+        return "live_missing", True
+    if batch_missing:
+        return "batch_missing", True
+    if value_mismatch:
+        return "value_mismatch", False
+    return None, False
 
 
 # --------------------------------------------------------------------------------------- collaborators
@@ -564,6 +617,57 @@ class _ChallengerOnly:
         self._inner.promote(version, alias, reason=reason)
 
 
+class AuditLabels:
+    """The ``label_config`` the AUDITS (L0: state parity, revision impact) measure with: the one of the MODEL THAT RUNS
+    (the registry champion; for a decision, the version that took it), not the one of the research pool the refit
+    trains on (``train.yml``). The two differ as soon as the champion was extended to a product the research pool does
+    not have (``script/extend_label_config.py``): auditing it with the pool's label fails on the spread of that
+    product. The refit (L1-L3) keeps the training label. Without a champion the audits fall back to the training label,
+    and say so (``audit_label.source`` in the L0 details, and a warning in the log)."""
+
+    def __init__(self, registry: _ChallengerOnly, training: Any | None) -> None:
+        self._registry, self._training = registry, training
+        self._by_dir: dict[Path, Any] = {}
+        self._fallback_logged = False
+
+    def _load(self, model_dir: Path) -> Any:
+        from modules.risk.label_config import load_label_config
+
+        if model_dir not in self._by_dir:
+            self._by_dir[model_dir] = load_label_config(model_dir / "label_config.json")
+        return self._by_dir[model_dir]
+
+    def champion(self) -> tuple[Any | None, dict[str, Any]]:
+        """``(label, info)``: the champion's label_config, else the training one (``info["source"]`` says which)."""
+        try:
+            model = self._registry.get(CHAMPION)
+            label = self._load(Path(model.path))
+        except (UnknownAlias, RegistryError, OSError, ValueError, KeyError) as exc:
+            reason = f"{type(exc).__name__}: {exc}"
+            if self._training is None:
+                return None, {"source": "none", "reason": reason}
+            if not self._fallback_logged:
+                self._fallback_logged = True
+                log.warning("learner_audit_label_fallback", reason=reason, label_sha256=self._training.sha256)
+            return self._training, {
+                "source": "training_fallback", "reason": reason, "label_config_sha256": self._training.sha256,
+                "products": sorted(self._training.spread_bps),
+            }  # fmt: skip
+        return label, {
+            "source": "champion", "version": model.version, "label_config_sha256": label.sha256,
+            "products": sorted(label.spread_bps),
+        }  # fmt: skip
+
+    def of_version(self, version: str | None) -> Any | None:
+        """The label_config stored in a registry version (the one that took a decision), None if it cannot be read."""
+        if not version:
+            return None
+        try:
+            return self._load(Path(self._registry.get_version(version).path))
+        except (RegistryError, OSError, ValueError, KeyError):
+            return None
+
+
 @dataclass(frozen=True)
 class LearnerPaths:
     reports_dir: Path  # data/reports/learner
@@ -573,9 +677,11 @@ class LearnerPaths:
     fill_model_path: Path  # models/registry/fill_model.json
     label_config: Path  # data/datasets/label_config.json (read only)
     work_dir: Path  # scratch for nothing the spec needs to keep
+    drift_dir: Path | None = None  # data/reports/sim_p1f: <version>/ holds the PSI-v2 calibration of that champion
 
 
-MarketsLoader = Callable[[], Mapping[str, Any]]  # product -> training.backtest.ProductMarket
+# label_config -> product -> training.backtest.ProductMarket (the products and the BTC context are the label's)
+MarketsLoader = Callable[[Any], Mapping[str, Any]]
 
 
 class NightlyLearner:
@@ -599,7 +705,7 @@ class NightlyLearner:
         psi_alert: float = PSI_ALERT,
         gate_ops: GateOpsConfig | None = None,
         risk: RiskConfig | None = None,
-        deciders: Callable[[str], tuple[Any, Any]] | None = None,
+        deciders: Callable[[str], tuple[Any, ...]] | None = None,
         ledger_db: Path | None = None,
     ) -> None:
         self._cfg, self._paths, self._products = cfg, paths, tuple(products)
@@ -612,9 +718,13 @@ class NightlyLearner:
         self._clock = clock
         self._candles, self._costs = candle_source, cost_source
         self._pipeline, self._backtester, self._shadow, self._oos = pipeline, backtester, shadow, oos
-        self._markets_loader, self._label = markets, label
+        self._markets_loader, self._label = markets, label  # ``label``: the TRAINING label (L1-L3)
+        self._audit = AuditLabels(self._registry, label)
         self._psi_alert = psi_alert
-        self._markets_cache: Mapping[str, Any] | None = None
+        self._markets_cache: dict[str, Mapping[str, Any]] = {}
+        # BUY records and intents of the model books of the audited day, per model version (set by ``_state_parity``)
+        self._buy_records: dict[str, int] = {}
+        self._intent_records: dict[str, int] = {}
         self._doc: dict[str, Any] = {}
         self._cutoff = datetime.now(UTC)
 
@@ -722,8 +832,9 @@ class NightlyLearner:
         errors: list[str] = []
         parts: dict[str, Callable[[date], dict[str, Any]]] = {
             "rest_revisions": self._rest_audit, "revision_impact": self._revision_impact,
-            "state_parity": self._state_parity,
+            "state_parity": self._state_parity, "feature_drift": self._feature_drift,
         }  # fmt: skip
+        result.details["audit_label"] = self._audit.champion()[1]
         for name, part in parts.items():
             try:
                 result.details[name] = part(audited)
@@ -735,7 +846,7 @@ class NightlyLearner:
         result.details["audited_day"] = audited.isoformat()
         if errors:
             raise RuntimeError("; ".join(errors))
-        if all("skipped" in v for v in result.details.values() if isinstance(v, dict)):
+        if all("skipped" in result.details[name] for name in parts):
             raise Skip("insufficient_samples", result.details)
         return result
 
@@ -782,7 +893,8 @@ class NightlyLearner:
 
     def _revision_impact(self, audited: date) -> dict[str, Any]:
         """R1-R3 of the audited day for every registry book and model version in use (revision_impact.day_impact)."""
-        if self._label is None:
+        label, _info = self._audit.champion()
+        if label is None:
             raise Skip("no_label_config")
         if self._deciders is None:
             raise Skip("no_deciders")
@@ -791,44 +903,61 @@ class NightlyLearner:
                 audited=audited, products=self._products, bars_root=self._paths.bars_root,
                 revisions_dir=self._paths.reports_dir / "revisions",
                 decisions_path=self._paths.decisions_dir / f"{audited.isoformat()}.jsonl", loader=self._deciders,
-                label=self._label, risk=self._risk, gate=self._gate_ops, ledger_db=self._ledger_db,
+                label=label, risk=self._risk, gate=self._gate_ops, ledger_db=self._ledger_db,
             )  # fmt: skip
         except ImpactSkip as skip:
             raise Skip(skip.reason, skip.details) from skip
 
-    def _markets(self) -> Mapping[str, Any]:
+    def _markets(self, label: Any) -> Mapping[str, Any]:
+        """The markets of ``label`` (its products, its BTC context), loaded once per label_config."""
         if self._markets_loader is None:
             raise Skip("no_markets_loader")
-        if self._markets_cache is None:
-            self._markets_cache = self._markets_loader()
-        return self._markets_cache
+        if label.sha256 not in self._markets_cache:
+            self._markets_cache[label.sha256] = self._markets_loader(label)
+        return self._markets_cache[label.sha256]
 
     def _state_parity(self, audited: date) -> dict[str, Any]:
         """FLAT states of ``audited`` as the engine logged them against the batch path, and PSI against 90 days."""
         from modules.features.state_matrix import flat_matrix
 
-        if self._label is None:
+        champion_label, _info = self._audit.champion()
+        if champion_label is None:
             raise Skip("no_label_config")
         path = self._paths.decisions_dir / f"{audited.isoformat()}.jsonl"
         if not path.exists():
             raise Skip("no_decisions")
-        live_rows: dict[str, dict[datetime, list[float]]] = defaultdict(dict)
+        # the state of a decision was built with the label_config of the version that took it: that is the one the
+        # batch path must use (a champion extended to another product, a challenger with other barriers)
+        labels: dict[str, Any] = {champion_label.sha256: champion_label}
+        # (label sha, product) -> close instant -> (FLAT vector as logged, ``btc_context`` of the record, model version)
+        live_rows: dict[tuple[str, str], dict[datetime, tuple[list[float], str | None, str | None]]] = defaultdict(dict)
+        self._buy_records, self._intent_records = {}, {}
         for line in path.read_text(encoding="utf-8").splitlines():
             try:
                 rec = json.loads(line)
+                self._count_model_record(rec)
                 state = DecisionState.model_validate_json(rec["state"])
                 t = datetime.fromisoformat(rec["ts_bar_close"].replace("Z", "+00:00")).astimezone(UTC)
             except (ValueError, KeyError, TypeError):
                 continue
             if state.position.side == "FLAT":
+                version = (rec.get("policy") or {}).get("policy_version")
+                label = self._audit.of_version(version) or champion_label
+                labels[label.sha256] = label
                 flat = flatten_state(state)
-                live_rows[state.product][t] = [flat[c] for c in FLAT_COLUMNS]
+                context = rec.get("btc_context")
+                live_rows[(label.sha256, state.product)][t] = (
+                    [flat[c] for c in FLAT_COLUMNS], context if isinstance(context, str) else None, version,
+                )  # fmt: skip
         if not live_rows:
             raise Skip("no_decisions")
-        markets = self._markets()
         live_all, batch_all, psi_by_feature = [], [], defaultdict(list)
+        # per compared row, in the order of ``live_all``: label sha, product, ``btc_context`` of the record, version
+        meta: list[tuple[str, str, str | None, str | None]] = []
         unmatched = 0
-        for product, by_t in sorted(live_rows.items()):
+        for (sha, product), by_t in sorted(live_rows.items()):
+            label = labels[sha]
+            markets = self._markets(label)
             pm = markets.get(product)
             if pm is None:
                 unmatched += len(by_t)
@@ -842,21 +971,30 @@ class NightlyLearner:
             if rows.size == 0:
                 continue
             btc_rows = None if pm.btc_rows is None else pm.btc_rows[rows]
-            batch_all.append(flat_matrix(pm.ind, rows, product, self._label, pm.btc_ind, btc_rows))
-            live_all.append(np.array([by_t[stamps[i]] for i in np.flatnonzero(keep)], dtype=np.float64))
+            batch_all.append(flat_matrix(pm.ind, rows, product, label, pm.btc_ind, btc_rows))
+            kept = [by_t[stamps[i]] for i in np.flatnonzero(keep)]
+            live_all.append(np.array([vec for vec, _, _ in kept], dtype=np.float64))
+            meta += [(sha, product, ctx, version) for _, ctx, version in kept]
             lo = np.datetime64((self._cutoff - timedelta(days=PSI_HISTORY_DAYS)).replace(tzinfo=None), "ns")
             hi = np.datetime64(datetime(audited.year, audited.month, audited.day).replace(tzinfo=None), "ns")
             hist_rows = np.flatnonzero((pm.bars.ts_close >= lo) & (pm.bars.ts_close < hi) & (close.minute == 0))
             if hist_rows.size:
                 hist = flat_matrix(
-                    pm.ind, hist_rows, product, self._label, pm.btc_ind,
+                    pm.ind, hist_rows, product, label, pm.btc_ind,
                     None if pm.btc_rows is None else pm.btc_rows[hist_rows],
                 )  # fmt: skip
                 for j, name in enumerate(FLAT_COLUMNS):
                     psi_by_feature[name].append((live_all[-1][:, j], hist[:, j]))
         if not live_all:
             raise Skip("no_matching_bars")
-        parity = feature_parity(np.vstack(live_all), np.vstack(batch_all))
+        live, batch = np.vstack(live_all), np.vstack(batch_all)
+        misaligned, btc_block = self._btc_context(live, batch, meta, labels)
+        every = feature_parity(live, batch)
+        aligned = feature_parity(live[~misaligned], batch[~misaligned])
+        parity = {
+            "rows": every["rows"], "match": aligned["match"], "match_all": every["match"],
+            "worst_feature": aligned["worst_feature"], "mismatch_by_feature": aligned["mismatch_by_feature"],
+        }  # fmt: skip
         psi: dict[str, float | None] = {
             name: population_stability_index(
                 np.concatenate([a for a, _ in pairs]), np.concatenate([b for _, b in pairs])
@@ -867,9 +1005,281 @@ class NightlyLearner:
         worst = max(finite, key=lambda k: finite[k]) if finite else None
         alerts = sorted(k for k, v in finite.items() if v > self._psi_alert)
         return {
-            "state_parity": parity, "unmatched_rows": unmatched, "psi": psi,
-            "max_feature_psi": None if worst is None else finite[worst], "worst_feature": worst,
-            "drift_alerts": [{"feature": k, "psi": finite[k]} for k in alerts],
+            "state_parity": parity, "unmatched_rows": unmatched, "btc_context": btc_block,
+            # the old daily PSI against 90 days: a DIAGNOSTIC (conflict P1f), no criterion, no guard, no gate
+            "psi_v1": {
+                "rule": PSI_V1_RULE, "status": "diagnostic", "psi": psi,
+                "max_feature_psi": None if worst is None else finite[worst], "worst_feature": worst,
+                "above_0_10": sum(1 for v in finite.values() if v > PSI_V1_ABOVE),
+                "alert_threshold": self._psi_alert, "alerts": [{"feature": k, "psi": finite[k]} for k in alerts],
+            },
+        }  # fmt: skip
+
+    def _count_model_record(self, rec: Mapping[str, Any]) -> None:
+        """Per model version, the BUY decisions (a BUY turned into HOLD ``btc_context_stale`` is a BUY of the model)
+        and the order intents of the model books: with a policy that is ``untunable`` there must be none."""
+        pol = rec.get("policy")
+        if "error" in rec or rec.get("book") not in MODEL_BOOKS or not isinstance(pol, Mapping):
+            return
+        version = pol.get("policy_version")
+        if not isinstance(version, str):
+            return
+        risk = rec.get("risk") or {}
+        if pol.get("final") == "BUY" or pol.get("reason") == "btc_context_stale":
+            self._buy_records[version] = self._buy_records.get(version, 0) + 1
+        if rec.get("order_intent_id") or risk.get("outcome") == "intent":
+            self._intent_records[version] = self._intent_records.get(version, 0) + 1
+
+    def _btc_context(
+        self, live: np.ndarray, batch: np.ndarray, meta: Sequence[tuple[str, str, str | None, str | None]],
+        labels: Mapping[str, Any],
+    ) -> tuple[np.ndarray, dict[str, Any]]:  # fmt: skip
+        """BTC context of the alt states (never of BTC itself): which rows had a context that was not of the same
+        instant (``misaligned``: the model answered on a state without the BTC features, or with others), by class,
+        and how much the model answers and the actionability of a BUY move between the state as served and the aligned
+        one (the batch state), with the model and the policy of the version that took the decision. Returns the mask
+        of misaligned rows (aligned with ``live``) and the block of the document."""
+        misaligned = np.zeros(len(meta), dtype=bool)
+        by_product: dict[str, list[int]] = defaultdict(list)
+        for i, (_sha, product, _ctx, _version) in enumerate(meta):
+            if not product.startswith("BTC-"):
+                by_product[product].append(i)
+        products: dict[str, Any] = {}
+        for product, idx in sorted(by_product.items()):
+            classes = dict.fromkeys(BTC_CLASSES, 0)
+            mine: list[int] = []
+            for i in idx:
+                cls, bad = classify_btc_row(meta[i][2], live[i, list(BTC_COLUMNS)], batch[i, list(BTC_COLUMNS)])
+                if cls is not None:
+                    classes[cls] += 1
+                if bad:
+                    misaligned[i] = True
+                    mine.append(i)
+            status, max_shift, flips, basis, check = self._btc_shift(mine, live, batch, meta, labels)
+            products[product] = {
+                "alt_states": len(idx), "misaligned": len(mine), "share": len(mine) / len(idx), "classes": classes,
+                "max_shift": max_shift, "flips": flips, "shift_status": status, "flips_basis": basis,
+                "untunable_check": check,
+            }  # fmt: skip
+        return misaligned, {"products": products}
+
+    def _btc_shift(
+        self, rows: Sequence[int], live: np.ndarray, batch: np.ndarray,
+        meta: Sequence[tuple[str, str, str | None, str | None]], labels: Mapping[str, Any],
+    ) -> tuple[str, float | None, int | None, str | None, dict[str, Any] | None]:  # fmt: skip
+        """``(shift_status, max_shift, flips, flips_basis, untunable_check)`` of the misaligned ``rows`` of ONE
+        product. Nothing to measure is a measured zero (basis ``computed``). ``max_shift`` stays measured under
+        ``policy_untunable``. Flips of a version whose ``policy.json`` is explicitly ``untunable`` are exactly 0 (basis
+        ``policy_untunable``: the BUY is not actionable for ANY input, live or batch) but only if the model books of
+        the day show no BUY decision and no order intent of that version; otherwise (or with the policy file missing)
+        they are ``None`` and the report decides (a BUY under an untunable policy is a defect: ``fail``)."""
+        if not rows:
+            return "measured", 0.0, 0, "computed", None
+        groups: dict[tuple[str, str | None], list[int]] = defaultdict(list)
+        for i in rows:
+            groups[(meta[i][0], meta[i][3])].append(i)
+        status, shift, flips, flips_known = "measured", 0.0, 0, True
+        bases: set[str] = set()
+        check_versions: dict[str, Any] = {}
+        for (sha, version), members in sorted(groups.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
+            part, part_shift, part_flips = "no_deciders", None, None
+            try:
+                if self._deciders is not None and version is not None:
+                    decider, policy = self._deciders(version)[:2]
+                    if not hasattr(decider, "answers_batch"):
+                        part = "decider_without_batch"
+                    else:
+                        m, part_flips = flat_pair_shift(
+                            decider, policy, labels[sha], self._risk, live[members], batch[members]
+                        )
+                        part = "measured" if part_flips is not None else "policy_untunable"
+                        part_shift = float(np.where(np.isfinite(m), m, 1.0).max())  # +inf: the largest possible shift
+            except Exception as exc:  # a version that cannot be loaded: reported as not measured, never a pass
+                log.warning("learner_btc_shift_unavailable", version=version, error=f"{type(exc).__name__}: {exc}")
+            if part == "measured":
+                bases.add("computed")
+            elif part == "policy_untunable" and version is not None:
+                try:
+                    kind = policy_kind(Path(self._registry.get_version(version).path))
+                except Exception:
+                    kind = "missing"
+                buys, intents = self._buy_records.get(version, 0), self._intent_records.get(version, 0)
+                check_versions[version] = {"policy": kind, "buy_records": buys, "intent_records": intents}
+                if kind == "untunable" and buys == 0 and intents == 0:
+                    part_flips = 0
+                    bases.add("policy_untunable")
+            if _SHIFT_RANK[part] > _SHIFT_RANK[status]:
+                status = part
+            shift = shift if part_shift is None else max(shift, part_shift)
+            flips_known = flips_known and part_flips is not None
+            flips += part_flips or 0
+        known = flips_known and status in ("measured", "policy_untunable")
+        basis = (next(iter(bases)) if len(bases) == 1 else "mixed") if known and bases else None
+        measured_shift = status in ("measured", "policy_untunable")
+        return (
+            status, shift if measured_shift else None, flips if known else None, basis,
+            {"versions": check_versions} if check_versions else None,
+        )  # fmt: skip
+
+    # ------------------------------------------------------------------------------------- feature drift
+
+    def _feature_drift(self, audited: date) -> dict[str, Any]:
+        """Feature drift (``modules/dryrun/drift.py``) on the last ``window_days`` complete UTC days that end at the
+        cutoff of the run: hourly states rebuilt from the stored bars, per served product, against the training
+        reference frozen by SIM-P1f-bis (PSI-v3, folder ``PSI_V3_VOLSTD``) or, as a fallback, by SIM-P1f (PSI-v2) for
+        the champion in use. No adopted calibration: ``unmeasured`` (PSI-v2) or ``not_testable`` (PSI-v3 rejected,
+        final), with the reason; a PSI-v3 calibration always brings the diagnostics."""
+        if self._paths.drift_dir is None:
+            raise Skip("no_drift_dir")
+        label, info = self._audit.champion()
+        if label is None or info.get("source") != "champion":
+            raise Skip("no_champion")
+        version = str(info["version"])
+        cal = None
+        for rule in (drift.RULE_V3, drift.RULE):  # CalibrationError: the part fails (L0 failed), never a quiet pass
+            cal = drift.load_calibration(drift.run_dir_of(self._paths.drift_dir, rule, version), rule)
+            if cal is not None:
+                break
+        if cal is None:
+            raise Skip("no_calibration")
+        run_dir = cal.run_dir
+        if cal.rule_id == drift.RULE_V3["id"]:
+            return self._feature_drift_v3(label, version, cal)
+        summary = {
+            "run_dir": run_dir.as_posix(), "sha256": cal.sha256, "champion_version": cal.champion_version,
+            "window_days": cal.window_days, "alpha": cal.alpha, "c": cal.c,
+        }  # fmt: skip
+        if cal.decision != "adopted" or cal.window_days is None:
+            return {"rule": "PSI_V2", "status": "unmeasured", "reason": f"calibration_{cal.decision}",
+                    "calibration": summary}  # fmt: skip
+        if cal.label_config_sha256 != label.sha256:
+            return {"rule": "PSI_V2", "status": "unmeasured", "reason": "calibration_label_mismatch",
+                    "calibration": summary}  # fmt: skip
+        end = self._cutoff  # only the past: the window ends at 00:00 UTC of the run date
+        start = end - timedelta(days=cal.window_days)
+        products: dict[str, Any] = {}
+        for product, pm in sorted(self._markets(label).items()):
+            x, _ts = drift.hourly_states(pm, label, start, end)
+            if x.shape[0] < 24 * cal.window_days:
+                products[product] = {"status": "unmeasured", "reason": "incomplete_window", "states": int(x.shape[0])}
+                continue
+            res = drift.window_stat(x, cal, product)
+            products[product] = {
+                "status": "measured", "states": int(x.shape[0]), "S": res.S, "alarm": res.alarm,
+                "flagged": [
+                    {"feature": n, "psi": r.psi, "x_f": r.x_f, "p": r.p} for n, r in res.features.items() if r.flag
+                ],
+                "features": {
+                    n: {"psi": r.psi, "p": r.p, "x_f": r.x_f, "n_finite": r.n_finite,
+                        "out_of_range_share": r.out_of_range_share, "n_eff_7d": cal.features[n].n_eff_7d}
+                    for n, r in res.features.items()
+                },
+                "unmeasured_features": [n for n, r in res.features.items() if r.psi is None],
+            }  # fmt: skip
+        measured = [b for b in products.values() if b["status"] == "measured"]
+        return {
+            "rule": "PSI_V2", "status": "measured" if measured else "unmeasured",
+            "reason": None if measured else "incomplete_window", "calibration": summary,
+            "window": {"start": _iso(start), "end": _iso(end)}, "products": products,
+            "alarm": any(b["alarm"] for b in measured) if measured else None,
+        }  # fmt: skip
+
+    def _p_edge(self, version: str, x: np.ndarray) -> tuple[np.ndarray | None, str | None]:
+        """The ``p_edge`` of the model version on the states ``x`` (diagnostic ``p_edge_psi``): ``(array, None)`` or
+        ``(None, reason)`` with ``no_deciders`` / ``decider_error``."""
+        if self._deciders is None:
+            return None, "no_deciders"
+        try:
+            decider = self._deciders(version)[0]
+            return np.asarray(decider.answers_batch(x).p_edge, dtype=np.float64), None
+        except Exception as exc:
+            log.warning("learner_p_edge_unavailable", version=version, error=f"{type(exc).__name__}: {exc}")
+            return None, "decider_error"
+
+    @staticmethod
+    def _watch(wcal: drift.Calibration | None, x: np.ndarray, product: str) -> dict[str, Any]:
+        """The watch of a product (rejected PSI-v3): the statistic of ``drift.window_stat`` with the diagnostic
+        reference and threshold of the rejected run. An alarm only, never a verdict of the gate."""
+        if wcal is None:
+            return {"status": "unmeasured", "reason": "no_diagnostic_reference"}
+        res = drift.window_stat(x, wcal, product)
+        if res.S is None:
+            return {"status": "unmeasured", "reason": "incomplete"}
+        return {
+            "status": "measured", "S": res.S, "alarm": res.alarm,
+            "flagged": [
+                {"feature": n, "psi": r.psi, "x_f": r.x_f, "p": r.p} for n, r in res.features.items() if r.flag
+            ],
+        }  # fmt: skip
+
+    def _feature_drift_v3(self, label: Any, version: str, cal: drift.Calibration) -> dict[str, Any]:
+        """PSI-v3 block. ``measured``: the rule on J (``window_stat``) plus the diagnostics; ``not_testable`` (the
+        calibration was rejected, definitively): no test, the diagnostics only. ``scope`` says what is covered."""
+        untested = [{"feature": n, "n_eff_7d": e} for n, e in cal.untested]
+        scope = {"tested": list(cal.features), "untested": untested, "note": drift.scope_note(len(untested))}
+        summary = {
+            "run_dir": cal.run_dir.as_posix(), "sha256": cal.sha256, "champion_version": cal.champion_version,
+            "window_days": cal.window_days, "alpha": cal.alpha, "c": cal.c, "decision": cal.decision,
+            "final": cal.final,
+        }  # fmt: skip
+        head = {"rule": drift.RULE_V3["id"], "calibration": summary, "scope": scope}
+        if cal.label_config_sha256 != label.sha256:
+            return {**head, "status": "unmeasured", "reason": "calibration_label_mismatch"}
+        testable = cal.decision == "adopted" and cal.window_days is not None
+        days = cal.window_days or 7
+        end = self._cutoff  # only the past: the window ends at 00:00 UTC of the run date
+        start = end - timedelta(days=days)
+        products: dict[str, Any] = {}
+        watch_cal = None if testable else drift.watch_calibration(cal)  # the watch of a rejected run (conflict P1g)
+        for product, pm in sorted(self._markets(label).items()):
+            x, _ts = drift.hourly_states(pm, label, start, end)
+            if x.shape[0] < 24 * days:
+                products[product] = {"status": "unmeasured", "reason": "incomplete_window", "states": int(x.shape[0])}
+                continue
+            p_edge, why = self._p_edge(version, x)
+            diagnostics = drift.window_diagnostics(x, cal, product, p_edge)
+            if why == "decider_error":
+                diagnostics["p_edge_psi"] = {"status": "unmeasured", "reason": why}
+            if not testable:
+                products[product] = {
+                    "status": "not_testable", "states": int(x.shape[0]), "diagnostics": diagnostics,
+                    "watch": self._watch(watch_cal, x, product),
+                }  # fmt: skip
+                continue
+            res = drift.window_stat(x, cal, product)
+            products[product] = {
+                "status": "measured", "states": int(x.shape[0]), "S": res.S, "alarm": res.alarm,
+                "flagged": [
+                    {"feature": n, "psi": r.psi, "x_f": r.x_f, "p": r.p} for n, r in res.features.items() if r.flag
+                ],
+                "features": {
+                    n: {"psi": r.psi, "p": r.p, "x_f": r.x_f, "n_finite": r.n_finite,
+                        "out_of_range_share": r.out_of_range_share, "n_eff_7d": cal.features[n].n_eff_7d}
+                    for n, r in res.features.items()
+                },
+                "unmeasured_features": [n for n, r in res.features.items() if r.psi is None],
+                "diagnostics": diagnostics,
+            }  # fmt: skip
+        support_alarm = [
+            p for p, b in products.items() if ((b.get("diagnostics") or {}).get("support") or {}).get("share", 0) > 0
+        ]
+        window = {"start": _iso(start), "end": _iso(end)}
+        if not testable:
+            watch_alarm = sorted(p for p, b in products.items() if (b.get("watch") or {}).get("alarm") is True)
+            return {
+                **head, "status": "not_testable", "reason": f"calibration_{cal.decision}_final", "window": window,
+                "products": products, "alarm": None, "support_alarm": support_alarm,
+                "watch": {
+                    "rule": drift.RULE_V3["id"], "reference": "reference_diagnostic", "c": cal.watch_c,
+                    "false_alarm_oos": cal.watch_false_alarm, "gate": False,
+                },
+                "watch_alarm": watch_alarm,
+            }  # fmt: skip
+        measured = [b for b in products.values() if b["status"] == "measured"]
+        return {
+            **head, "status": "measured" if measured else "unmeasured",
+            "reason": None if measured else "incomplete_window", "window": window, "products": products,
+            "alarm": any(b["alarm"] for b in measured) if measured else None, "support_alarm": support_alarm,
         }  # fmt: skip
 
     # ----------------------------------------------------------------------------------------------- L4
@@ -1180,17 +1590,18 @@ def build_learner(config_path: str, train_config: str) -> NightlyLearner:
     label_path = Path(train_config and _label_path(train_config))
     label = load_label_config(label_path) if label_path.exists() else None
 
-    def markets() -> Mapping[str, Any]:
+    def markets(audit_label: Any) -> Mapping[str, Any]:
         from training.tune_policy import load_markets
 
-        assert label is not None
-        return load_markets(bars_root(app), app.market.products, label)
+        # the products and the BTC context of the label_config being audited (the champion's, not the research pool's)
+        products = [p for p in app.market.products if p in audit_label.spread_bps]
+        return load_markets(bars_root(app), products, audit_label)
 
     paths = LearnerPaths(
         reports_dir=data / "reports" / "learner", decisions_dir=data / "decisions",
         live_labels_dir=data / "live_labels", bars_root=bars_root(app),
         fill_model_path=Path(app.dry_run.fill_model.path), label_config=label_path,
-        work_dir=data / "reports" / "learner" / "work",
+        work_dir=data / "reports" / "learner" / "work", drift_dir=data / "reports" / "sim_p1f",
     )  # fmt: skip
     return NightlyLearner(
         cfg=app.dry_run.learner, paths=paths, registry=registry,
@@ -1201,7 +1612,7 @@ def build_learner(config_path: str, train_config: str) -> NightlyLearner:
         oos=PairedOosComparator(Path(train_config)), econ=app.dry_run.gate_econ,
         markets=markets, label=label, psi_alert=app.risk.kill_switch.psi_threshold,
         gate_ops=app.dry_run.gate_ops, risk=app.risk, ledger_db=Path(app.dry_run.db_path),
-        deciders=None if label is None else RegistryDeciderLoader(registry, label),
+        deciders=RegistryDeciderLoader(registry, label),
     )  # fmt: skip
 
 

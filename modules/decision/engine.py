@@ -69,6 +69,7 @@ if TYPE_CHECKING:
     from modules.execution.gateway import EntryResult, ExecutionGateway, ExitResult
 
 __all__ = [
+    "BTC_CONTEXT_STALE",
     "BaselineBackend",
     "BookContext",
     "DecisionEngine",
@@ -263,6 +264,9 @@ class _Work:
     p_breakeven: float | None = None
     side: Literal["FLAT", "LONG"] = "FLAT"
     answered: _Answered | None = None
+    # BTC context of an alt state: ``aligned`` (the BTC snapshot of the same instant is in the state), ``stale`` (it is
+    # not: the BTC bar had not arrived, or BTC's indicators are down). ``None``: BTC itself, or BTC is not served here.
+    btc_context: Literal["aligned", "stale"] | None = None
 
 
 def _iso(t: datetime, spec: Literal["seconds", "milliseconds"]) -> str:
@@ -274,6 +278,7 @@ def _dec(x: float) -> Decimal:
 
 
 LABEL_CONFIG_MISMATCH: Final = "label_config_mismatch"
+BTC_CONTEXT_STALE: Final = "btc_context_stale"  # an alt state whose BTC context is not of its instant never buys
 KEEP_BACKEND: Final = object()  # "leave the backend as it is" in ``DecisionEngine.build_swap``
 
 
@@ -523,7 +528,10 @@ class DecisionEngine:
             raise RuntimeError(f"indicators of {p} are down: {self._broken.get(p, 'unknown')}")
         w.view = self._positions.view(p)
         btc = self._snap.get(self._btc)
-        btc = btc if (btc is not None and btc.ts == snap.ts and not p.startswith("BTC-")) else None
+        is_alt = not p.startswith("BTC-")
+        btc = btc if (btc is not None and btc.ts == snap.ts and is_alt) else None
+        if is_alt and self._btc in self.indicators:
+            w.btc_context = "aligned" if btc is not None else "stale"  # BTC is served here: its bar must be of ``t``
         state = self._builder.build(
             snapshot=snap,
             btc=btc,
@@ -594,6 +602,10 @@ class DecisionEngine:
                 # the SELL head of this model was trained on other barriers than the ones the position was opened
                 # under: it does not apply. Bracket, the position's own horizon and the watchdog still govern it.
                 decision = replace(decision, action="HOLD", reason=LABEL_CONFIG_MISMATCH)
+            if decision.action == "BUY" and w.btc_context == "stale":
+                # the state lacks the BTC tokens the model was trained with (the BTC bar of this minute has not
+                # arrived): no new exposure on an incomplete state. SELL, bracket and watchdog reduce risk: unchanged.
+                decision = replace(decision, action="HOLD", reason=BTC_CONTEXT_STALE)
 
         intent: OrderIntent | ExitIntent | None = None
         skip: tuple[str, str] | None = None
@@ -720,6 +732,7 @@ class DecisionEngine:
             "bar_lag_s": round(w.event.lag_s, 3),
             "product": w.event.product_id,
             "book": self._risk.book,
+            "btc_context": w.btc_context,
             "state_sha256": w.state_sha,
             "state": w.state_str,
             "questions_version": self._questions.version_tag,

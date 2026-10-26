@@ -78,7 +78,7 @@ risk:
     stale_data_s: 90                  # last ticker
     stale_bar_s: 270                  # last 1m bar (published at t + S) = S + 150; > decision_max_lag_s
     max_fallback_ratio_1h: 0.20
-    psi_threshold: 0.25
+    psi_threshold: 0.25               # alert of the DIAGNOSTIC daily PSI v1 in L0; linked to no guard (conflict P1f)
   watchdog:
     sl_breach_atr_1h: 1.0
     grace_s: 10
@@ -124,7 +124,9 @@ dry_run:
     min_days: 7
     min_uptime: 0.99
     min_decision_parity: 0.99
-    max_feature_psi: 0.10
+    max_feature_psi: 0.10             # ALARM of the diagnostic feature_psi_daily_v1 (conflict P1f), not a gate
+    max_btc_stale_share: 0.005        # btc_context_alignment: max share of alt states with a BTC context of another instant
+    max_btc_stale_shift: 0.01         # ... and max shift m of the model answers between the served and the aligned state
     buy_rate_tolerance: 0.50
     min_maker_fill_rate: 0.50
     max_spread_ratio_vs_labels: 2.0

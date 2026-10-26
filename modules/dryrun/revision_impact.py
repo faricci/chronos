@@ -84,9 +84,11 @@ __all__ = [
     "calendar_verdict",
     "certify",
     "day_blocks",
+    "flat_pair_shift",
     "impact_day",
     "main",
     "note_text",
+    "policy_kind",
     "revised_world",
     "revision_impact",
     "rolling_max",
@@ -121,6 +123,7 @@ NOT_CERTIFIABLE: Final[Mapping[str, str]] = {
     "(fail) stays as it is; the rule v2 was written after seeing it (decision U2, 2026-10-23). Use --info-only.",
 }
 DECISION_DOC: Final = "docs/decisions/2026-10-20-revisioni-rest-e-promozione.md"
+SOAK_PRIOR_KEYS: Final = ("minutes", "revised", "ratio", "max_close_diff_bps")
 EXIT_PASS, EXIT_FAIL, EXIT_CONFIG = 0, 1, 2
 INF_AS_JSON: Final = 1.0  # a shift of +inf is written as 1.0: the largest possible change of a probability
 _COL: Final = {c: i for i, c in enumerate(FLAT_COLUMNS)}
@@ -341,6 +344,30 @@ def actionable_mask(
     return out
 
 
+def flat_pair_shift(
+    decider: Any, policy: PolicyConfig | None, label: LoadedLabelConfig, risk: RiskConfig, x_a: np.ndarray,
+    x_b: np.ndarray,
+) -> tuple[np.ndarray, int | None]:  # fmt: skip
+    """``m`` of every pair of FLAT states ``(x_a[i], x_b[i])`` and the number of pairs whose BUY actionability flips:
+    the FLAT half of ``impact_day`` (``m = max(de, db)``, a NaN in one answer only is ``+inf``) for two matrices that
+    are not the served/revised worlds of a day (the BTC context of the live engine against the aligned batch state).
+    Flips are ``None`` when the version has no tuned policy (R3 cannot be measured). The caller handles a decider
+    without ``answers_batch``."""
+    a, b = decider.answers_batch(x_a), decider.answers_batch(x_b)
+    pa_a, pa_b = np.asarray(a.p_action, np.float64), np.asarray(b.p_action, np.float64)
+    pe_a, pe_b = np.asarray(a.p_edge, np.float64), np.asarray(b.p_edge, np.float64)
+    de, _ = _shift(pe_a, pe_b)
+    db, _ = _shift(masked_buy_prob(pa_a), masked_buy_prob(pa_b))
+    m = np.maximum(de, db)
+    if policy is None:
+        return m, None
+    flat = np.zeros(len(x_a), dtype=bool)
+    changed = actionable_mask(x_a, pa_a, pe_a, flat, policy, label, risk) != actionable_mask(
+        x_b, pa_b, pe_b, flat, policy, label, risk
+    )
+    return m, int(changed.sum())
+
+
 def impact_day(
     *, product: str, day: date, version: str, x_served: np.ndarray, x_revised: np.ndarray, is_long: np.ndarray,
     decider: Any, policy: PolicyConfig | None, label: LoadedLabelConfig, risk: RiskConfig,
@@ -440,6 +467,8 @@ def revision_impact(
     btc = next((p for p in served if p.startswith("BTC-")), None)
     out: list[ImpactDay] = []
     for product, grid in served.items():
+        if product not in label.spread_bps:
+            continue  # the label_config of this version does not cover the product: it never decided on it
         ts = pd.DatetimeIndex(grid.index)
         close_t = ts + MINUTE
         keep = np.ones(len(ts), dtype=bool)
@@ -717,6 +746,20 @@ def _load_policy(model_dir: Path, subset: str, label: LoadedLabelConfig) -> Poli
     return load_policy(path, label.sha256)
 
 
+def policy_kind(model_dir: Path, subset: str = "final") -> Literal["tuned", "untunable", "missing"]:
+    """What the version's ``policy.json`` says: ``untunable`` (the tuner found no policy: the model never buys),
+    ``tuned``, or ``missing`` (no file: nothing is proven). ``RegistryDeciderLoader`` gives ``policy = None`` for the
+    first and the last alike; only the first lets the BTC-context check say that no BUY is actionable."""
+    path = model_dir / subset / "policy.json"
+    if not path.exists():
+        return "missing"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except ValueError:
+        return "missing"
+    return "untunable" if isinstance(raw, dict) and raw.get("untunable") else "tuned"
+
+
 def _clusters(states: Sequence[ShiftedState]) -> tuple[int, int]:
     """(independent revisions, size of the largest cluster) among shifted states: same origin = one revision, a state
     of unknown origin is a cluster of its own."""
@@ -739,20 +782,23 @@ def _save_reread(path: Path, fresh: pd.DataFrame) -> str:
     return _sha256_file(path)
 
 
-def _previous_run(previous: Path | None, soak_sha: str, version: str, subset: str) -> dict[str, Any] | None:
-    """The earlier certification of the SAME soak, model version and subset (read only), or ``ConfigurationError``."""
+def _previous_run(
+    previous: Path | None, soak_sha: str, version: str, subset: str, dry_days: Mapping[str, Any] | None = None
+) -> dict[str, Any] | None:
+    """The earlier certification of the SAME soak (or, in the days mode, the same ``dry_run_days``), model version and
+    subset (read only), or ``ConfigurationError``."""
     if previous is None:
         return None
     try:
         doc = json.loads(previous.read_text(encoding="utf-8"))
-        same = (
-            doc["soak_report"]["sha256"] == soak_sha and doc["model"]["version"] == version
-            and doc["model"]["subset"] == subset
-        )  # fmt: skip
+        same_source = (
+            doc.get("dry_run_days") == dry_days if dry_days is not None else doc["soak_report"]["sha256"] == soak_sha
+        )
+        same = same_source and doc["model"]["version"] == version and doc["model"]["subset"] == subset
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise ConfigurationError(f"cannot read the previous certification {previous}: {exc}") from exc
     if not same:
-        raise ConfigurationError("--previous belongs to another soak report, model version or subset")
+        raise ConfigurationError("--previous belongs to another soak report (or days), model version or subset")
     return {
         "path": previous.as_posix(), "sha256": _sha256_file(previous), "created_at": doc.get("created_at"),
         "p0_bars_criterion": doc.get("p0_bars_criterion"),
@@ -761,9 +807,10 @@ def _previous_run(previous: Path | None, soak_sha: str, version: str, subset: st
 
 
 def certify(
-    *, soak_report: Path, model_dir: Path, subset: str, out: Path | None, bars_root: Path, label_path: Path,
-    source: CandleSource, risk: RiskConfig, gate: GateOpsConfig, now: datetime, previous: Path | None = None,
-    info_only: bool = False,
+    *, soak_report: Path | None = None, model_dir: Path, subset: str, out: Path | None, bars_root: Path,
+    label_path: Path, source: CandleSource, risk: RiskConfig, gate: GateOpsConfig, now: datetime,
+    previous: Path | None = None, info_only: bool = False, days: tuple[date, date] | None = None,
+    products: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], int]:  # fmt: skip
     """R1-R4 on a soak (rule v2, schema ``chronos.p0_bars_certification.v2``). Returns the document and the exit code
     (0 pass, 1 fail or unmeasured). Also reports the outcome under the rule v1 (diagnostic).
@@ -773,31 +820,53 @@ def certify(
     and the re-read candles are saved next to it (``<out stem>.reread/<product>.parquet``) with their sha256, so a
     later question about the rule can be answered on the same data. ``info_only`` computes the same document and
     writes NOTHING; it is the only mode allowed on a soak listed in ``NOT_CERTIFIABLE`` (decision U2).
-    ``ConfigurationError`` for anything that must be fixed first."""
+    ``ConfigurationError`` for anything that must be fixed first.
+
+    Days mode (conflict P1g): exactly one of ``soak_report`` and ``days``. ``days=(START, END)`` certifies the whole UTC
+    days of the dry run ``[START 00:00Z, END + 1 day 00:00Z)`` for ``products`` (required), same computation, no soak
+    report (``soak_report`` null in the document, a ``dry_run_days`` key instead); END must be a concluded day."""
     from modules.decision.baseline import BaselineDecider
     from modules.decision.questions import build_questions
     from modules.risk.label_config import load_label_config
 
+    if (soak_report is None) == (days is None):
+        raise ConfigurationError("exactly one of a soak report and --days is required")
+    if days is not None:
+        if not products:
+            raise ConfigurationError("--products is required with --days")
+        if days[0] > days[1]:
+            raise ConfigurationError("--days: START is after END")
     if not info_only:
         if out is None:
             raise ConfigurationError("--out is required (or use --info-only)")
-        if out.resolve() == soak_report.resolve():
+        if soak_report is not None and out.resolve() == soak_report.resolve():
             raise ConfigurationError("--out would overwrite the soak report: the soak verdict is never rewritten")
         if bars_root.resolve() in out.resolve().parents:
             raise ConfigurationError("--out lies under the bars store: the store is never written")
         if out.exists():
             raise ConfigurationError("a certification is never rewritten: choose a new --out")
-    try:
-        soak_bytes = soak_report.read_bytes()
-        soak = json.loads(soak_bytes)
-        started, updated = _parse_t(soak["started_at"]), _parse_t(soak["updated_at"])
-        products: list[str] = list(soak["products"])
-    except (OSError, ValueError, KeyError) as exc:
-        raise ConfigurationError(f"cannot read the soak report {soak_report}: {exc}") from exc
-    soak_sha = hashlib.sha256(soak_bytes).hexdigest()
-    if not info_only and soak_sha in NOT_CERTIFIABLE:
-        raise ConfigurationError(f"this soak is not certified after the rule v2: {NOT_CERTIFIABLE[soak_sha]}")
-    lo, hi = floor_minute(started), floor_minute(updated)
+    soak: dict[str, Any] = {}
+    soak_sha = ""
+    dry_days: dict[str, Any] | None = None
+    if days is not None:
+        assert products is not None
+        chosen: list[str] = list(products)
+        lo = datetime(days[0].year, days[0].month, days[0].day, tzinfo=UTC)
+        hi = datetime(days[1].year, days[1].month, days[1].day, tzinfo=UTC) + timedelta(days=1)
+        dry_days = {"start": days[0].isoformat(), "end": days[1].isoformat(), "products": chosen}
+    else:
+        assert soak_report is not None
+        try:
+            soak_bytes = soak_report.read_bytes()
+            soak = json.loads(soak_bytes)
+            started, updated = _parse_t(soak["started_at"]), _parse_t(soak["updated_at"])
+            chosen = list(soak["products"])
+        except (OSError, ValueError, KeyError) as exc:
+            raise ConfigurationError(f"cannot read the soak report {soak_report}: {exc}") from exc
+        soak_sha = hashlib.sha256(soak_bytes).hexdigest()
+        if not info_only and soak_sha in NOT_CERTIFIABLE:
+            raise ConfigurationError(f"this soak is not certified after the rule v2: {NOT_CERTIFIABLE[soak_sha]}")
+        lo, hi = floor_minute(started), floor_minute(updated)
     if now - hi < MIN_AGE:
         raise ConfigurationError(f"the window ends at {_z(hi)}: its minutes are younger than 15 minutes")
     label = load_label_config(label_path)
@@ -807,7 +876,7 @@ def certify(
     policy = _load_policy(model_dir, subset, label)
     card = json.loads((model_dir / "model_card.json").read_text(encoding="utf-8"))
     version = str(card.get("model") or model_dir.name)
-    prev = _previous_run(previous, soak_sha, version, subset)
+    prev = _previous_run(previous, soak_sha, version, subset, dry_days)
     thr = ImpactThresholds.from_config(gate)
     reread_dir = None if out is None or info_only else out.parent / f"{out.stem}.reread"
     if reread_dir is not None and bars_root.resolve() in reread_dir.resolve().parents:
@@ -820,7 +889,7 @@ def certify(
     ends: dict[str, datetime] = {}
     minutes: dict[str, pd.DatetimeIndex] = {}
     fresh_frames: dict[str, pd.DataFrame] = {}
-    for product in products:
+    for product in chosen:
         # the soak stops publishing at ``bars.<p>.next_minute``: past it the store has no row and REST has candles
         # (the "appeared" of a window edge, not a revision). The window of each product ends there.
         edge = (soak.get("bars") or {}).get(product, {}).get("next_minute")
@@ -840,7 +909,7 @@ def certify(
                 "minutes": stats.minutes, "revised": stats.revised, "ratio": stats.ratio,
                 "alarm": stats.ratio > gate.max_rest_revision_ratio, "max_close_diff_bps": stats.max_close_diff_bps,
                 "value_revised": stats.value_revised,
-                "soak_report": {k: prior.get(k) for k in ("minutes", "revised", "ratio", "max_close_diff_bps")},
+                "soak_report": None if days is not None else {k: prior.get(k) for k in SOAK_PRIOR_KEYS},
             },
             "R4": {"appeared": stats.appeared, "disappeared": stats.disappeared,
                    "status": "pass" if stats.appeared == 0 and stats.disappeared == 0 else "fail"},
@@ -848,13 +917,13 @@ def certify(
         }  # fmt: skip
 
     start_day, end_day = lo.date(), max(ends.values()).date()
-    days = [start_day + timedelta(days=i) for i in range((end_day - start_day).days + 1)]
+    all_days = [start_day + timedelta(days=i) for i in range((end_day - start_day).days + 1)]
     window = (lo, max(ends.values()))  # a product whose grid ends earlier simply has no later states
-    impact = revision_impact(served, revised, days, decider, policy, label, [], risk, version, thresholds=thr,
+    impact = revision_impact(served, revised, all_days, decider, policy, label, [], risk, version, thresholds=thr,
                              window=window, revised_minutes=minutes)  # fmt: skip
     worst_v2: list[Verdict] = []
     worst_v1: list[Verdict] = []
-    for product in products:
+    for product in chosen:
         mine = [d for d in impact if d.product == product and d.states > 0]
         v = verdict(mine, thr)
         v1 = calendar_verdict(mine, thr)
@@ -926,7 +995,7 @@ def certify(
     criterion = _worst(worst_v2)
     doc: dict[str, Any] = {
         "v": CERT_SCHEMA, "created_at": _z(now),
-        "soak_report": {
+        "soak_report": None if soak_report is None else {
             "path": soak_report.as_posix(), "sha256": soak_sha,
             "started_at": soak["started_at"], "updated_at": soak["updated_at"],
             "verdict_rest_revision_ratio_within_limit": (soak.get("verdict") or {}).get(
@@ -961,6 +1030,12 @@ def certify(
             "UTC anche parziale (diagnostica)",
         ],
     }  # fmt: skip
+    if dry_days is not None:
+        doc["dry_run_days"] = dry_days
+        doc["notes"].append(
+            "modo giorni del dry run: finestra [START 00:00Z, END+1 00:00Z) per ogni prodotto, stati FLAT di ogni "
+            "minuto (nessun book)"
+        )
     if not info_only:
         assert out is not None
         _write_atomic(out, doc)
@@ -982,7 +1057,9 @@ class ImpactSkip(Exception):
         self.reason, self.details = reason, dict(details or {})
 
 
-DeciderLoader = Any  # callable: policy_version -> (decider with answers_batch, PolicyConfig | None)
+# callable: policy_version -> (decider with answers_batch, PolicyConfig | None[, LoadedLabelConfig of that version]).
+# Without the third item the version is measured with the ``label`` given to ``day_impact``.
+DeciderLoader = Any
 
 
 def revisions_frame(product: str, rev: Any, stored: pd.DataFrame, fresh: pd.DataFrame) -> pd.DataFrame:
@@ -1154,18 +1231,22 @@ def day_impact(
         )
         for version in book_versions:
             try:
-                decider, policy = loader(version)
+                loaded = loader(version)
+                decider, policy = loaded[0], loaded[1]
+                v_label = loaded[2] if len(loaded) > 2 else label  # each version with ITS OWN label_config
             except Exception as exc:  # a version that cannot be loaded is reported, the others are still measured
                 errors[f"{book}:{version}"] = f"{type(exc).__name__}: {exc}"
                 continue
 
             kw: dict[str, Any] = {"thresholds": thr, "indicators": inds, "revised_minutes": revised_at}
             main_days = revision_impact(
-                served, revised, [audited], decider, policy, label, positions, risk, version, **kw
+                served, revised, [audited], decider, policy, v_label, positions, risk, version, **kw
             )
             partial = any(d.states < thr.block_states for d in main_days)
             aux = (
-                revision_impact(served, revised, [previous_day], decider, policy, label, positions, risk, version, **kw)
+                revision_impact(
+                    served, revised, [previous_day], decider, policy, v_label, positions, risk, version, **kw
+                )
                 if partial
                 else []
             )
@@ -1206,23 +1287,33 @@ def day_impact(
 
 
 class RegistryDeciderLoader:
-    """``policy_version`` -> ``(decider, policy)`` for the audit: the ``final`` model of that registry version. An
-    ``untunable`` policy (or none) gives ``None``: R3 is then not measurable. Cached by version."""
+    """``policy_version`` -> ``(decider, policy, label)`` for the audit: the ``final`` model of that registry version
+    with the ``label_config`` stored IN THAT VERSION (the dry run serves each version with its own: a champion
+    extended to a product the research pool does not have, a challenger with other barriers). ``fallback`` is used
+    only for a version directory that has no ``label_config.json``. An ``untunable`` policy (or none) gives ``None``:
+    R3 is then not measurable. Cached by version."""
 
-    def __init__(self, registry: Any, label: LoadedLabelConfig) -> None:
-        self._registry, self._label = registry, label
-        self._cache: dict[str, tuple[Any, PolicyConfig | None]] = {}
+    def __init__(self, registry: Any, fallback: LoadedLabelConfig | None = None) -> None:
+        self._registry, self._fallback = registry, fallback
+        self._cache: dict[str, tuple[Any, PolicyConfig | None, LoadedLabelConfig]] = {}
 
-    def __call__(self, version: str) -> tuple[Any, PolicyConfig | None]:
+    def __call__(self, version: str) -> tuple[Any, PolicyConfig | None, LoadedLabelConfig]:
         if version not in self._cache:
             from modules.decision.baseline import BaselineDecider
             from modules.decision.questions import build_questions
+            from modules.risk.label_config import load_label_config
 
             path = Path(self._registry.get_version(version).path)
-            cfg = self._label.cfg
+            if (path / "label_config.json").is_file():
+                label = load_label_config(path / "label_config.json")
+            elif self._fallback is not None:
+                label = self._fallback
+            else:
+                raise ConfigurationError(f"version {version} has no label_config.json")
+            cfg = label.cfg
             questions = build_questions(cfg.horizon_min, cfg.k_tp, cfg.k_sl, cfg.atr_tf)
-            decider = BaselineDecider.load(path, label=self._label, questions=questions, subset="final")
-            self._cache[version] = (decider, _load_policy(path, "final", self._label))
+            decider = BaselineDecider.load(path, label=label, questions=questions, subset="final")
+            self._cache[version] = (decider, _load_policy(path, "final", label), label)
         return self._cache[version]
 
 
@@ -1296,7 +1387,12 @@ def main(argv: Sequence[str] | None = None, *, source: CandleSource | None = Non
     ap = argparse.ArgumentParser(prog="python -m modules.dryrun.revision_impact", description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("certify", help="R1-R4 on a soak (reads the store and public REST candles)")
-    c.add_argument("--soak-report", default="data/reports/p0_soak.json")
+    c.add_argument("--soak-report", default=None, help="default (without --days): data/reports/p0_soak.json")
+    c.add_argument(
+        "--days", nargs=2, metavar=("START", "END"), default=None,
+        help="certify whole UTC days of the dry run (ISO dates, END concluded) instead of a soak",
+    )
+    c.add_argument("--products", nargs="+", default=None, help="products of --days")
     c.add_argument("--model-dir", required=True)
     c.add_argument("--subset", default="final")
     c.add_argument("--out", default=None, help="NEW file (never rewritten); required unless --info-only")
@@ -1311,6 +1407,10 @@ def main(argv: Sequence[str] | None = None, *, source: CandleSource | None = Non
     from modules.config import AppConfig, ConfigError, load_config
 
     try:
+        if args.days is not None and args.soak_report is not None:
+            raise ConfigurationError("--days and --soak-report are alternatives")
+        window = None if args.days is None else (date.fromisoformat(args.days[0]), date.fromisoformat(args.days[1]))
+        soak_arg = None if window is not None else Path(args.soak_report or "data/reports/p0_soak.json")
         app = load_config(args.config) if args.config else AppConfig()
         src = source
         if src is None:
@@ -1318,7 +1418,8 @@ def main(argv: Sequence[str] | None = None, *, source: CandleSource | None = Non
 
             src = CoinbaseCandleSource()
         doc, code = certify(
-            soak_report=Path(args.soak_report), model_dir=Path(args.model_dir), subset=args.subset,
+            soak_report=soak_arg, days=window, products=args.products, model_dir=Path(args.model_dir),
+            subset=args.subset,
             out=None if args.out is None else Path(args.out), bars_root=Path(args.bars_root),
             label_path=Path(args.label_config), source=src, risk=app.risk, gate=app.dry_run.gate_ops,
             now=datetime.now(UTC), previous=None if args.previous is None else Path(args.previous),

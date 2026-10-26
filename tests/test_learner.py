@@ -915,7 +915,7 @@ def parity_rig(tmp_path: Path, tamper: bool) -> tuple[Rig, dict[str, Any]]:
     path = rig.paths.decisions_dir / f"{audited.isoformat()}.jsonl"
     path.write_text("".join(json.dumps(r) + "\n" for r in recs), encoding="utf-8")
     markets = {"SOL-EUR": m_sol, "BTC-EUR": m_btc}
-    doc = rig.learner(markets=lambda: markets, products=["SOL-EUR", "BTC-EUR"]).run(date(2024, 1, 21))
+    doc = rig.learner(markets=lambda label: markets, products=["SOL-EUR", "BTC-EUR"]).run(date(2024, 1, 21))
     return rig, doc
 
 
@@ -925,8 +925,9 @@ def test_l0_state_parity_matches_the_batch_path_on_real_states(tmp_path: Path) -
     assert doc["steps"]["L0"]["outcome"] == "ok"
     assert p["state_parity"]["rows"] == 560 and p["state_parity"]["match"] == 1.0
     assert p["unmatched_rows"] == 0
-    assert p["max_feature_psi"] is not None and p["worst_feature"] in FLAT_COLUMNS
-    assert set(p["psi"]) == set(FLAT_COLUMNS)
+    assert p["state_parity"]["match_all"] == 1.0  # nothing misaligned: the two coincide
+    assert p["psi_v1"]["max_feature_psi"] is not None and p["psi_v1"]["worst_feature"] in FLAT_COLUMNS
+    assert set(p["psi_v1"]["psi"]) == set(FLAT_COLUMNS)
 
 
 def test_l0_state_parity_catches_a_state_that_differs(tmp_path: Path) -> None:
@@ -936,12 +937,13 @@ def test_l0_state_parity_catches_a_state_that_differs(tmp_path: Path) -> None:
     assert p["worst_feature"] is not None
 
 
-def test_l0_reports_drift_alerts_over_the_threshold(tmp_path: Path) -> None:
+def test_l0_reports_the_psi_v1_alerts_over_the_threshold(tmp_path: Path) -> None:
+    """The daily PSI against 90 days is a diagnostic since conflict P1f: its alert list stays, inside ``psi_v1``."""
     _, doc = parity_rig(tmp_path, tamper=False)
-    details = doc["steps"]["L0"]["details"]["state_parity"]
-    over = [a["feature"] for a in details["drift_alerts"]]
-    assert all(details["psi"][f] > 0.25 for f in over)
-    assert all(v <= 0.25 for k, v in details["psi"].items() if v is not None and k not in over)
+    v1 = doc["steps"]["L0"]["details"]["state_parity"]["psi_v1"]
+    over = [a["feature"] for a in v1["alerts"]]
+    assert all(v1["psi"][f] > 0.25 for f in over)
+    assert all(v <= 0.25 for k, v in v1["psi"].items() if v is not None and k not in over)
 
 
 # ------------------------------------------------------------------------- shadow evidence and pipeline

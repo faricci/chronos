@@ -688,9 +688,11 @@ async def test_one_entry_at_a_time_per_product() -> None:
     assert isinstance(first.intent, OrderIntent) and w.engine.pending("BTC-EUR") == "entry"
     second = await w.next("BTC-EUR")
     assert second.intent is None and second.skip_reason == "entry_pending"
-    other = await w.next("SOL-EUR")  # another product is independent
-    assert isinstance(other.intent, OrderIntent)
-    assert len(w.gateway.entries) == 2 and len(w.sink.records) == 3
+    catch_up = await w.next("SOL-EUR")  # the BTC bar of this minute was consumed two bars ago: not an entry (stale)
+    assert catch_up.intent is None and catch_up.record["btc_context"] == "stale"
+    other = await w.next("SOL-EUR")  # another product is independent (its BTC bar is the one just consumed)
+    assert isinstance(other.intent, OrderIntent) and other.record["btc_context"] == "aligned"
+    assert len(w.gateway.entries) == 2 and len(w.sink.records) == 4
     w.gateway.hold.set()
     await w.engine.drain()
     assert w.engine.pending("BTC-EUR") is None and [r.kind for r in w.reports] == ["entry", "entry"]
@@ -755,8 +757,12 @@ async def test_a_failing_product_does_not_stop_the_others_or_the_next_bar() -> N
     assert bad.skip_reason == "engine_error" and bad.decision is None and "ledger offline" in bad.skip_detail
     assert bad.record["error"]["stage"] == "state" and bad.record["policy"]["reason"] == "engine_error"
     assert w.engine.stats.errors == 1 and len(w.sink.records) == 2
-    del w.positions.fail["SOL-EUR"]  # the next bar of the same product works again
-    (ok,) = await w.feed("SOL-EUR", i + 1)
+    del w.positions.fail["SOL-EUR"]  # the next bar of the same product works again (BTC of the minute arrives too)
+    w.cursor["BTC-EUR"] = w.cursor["SOL-EUR"] = i + 2
+    w.clock.now = w.event("SOL-EUR", i + 1).published_at
+    again = await w.engine.on_bars([w.event("BTC-EUR", i + 1), w.event("SOL-EUR", i + 1)])
+    await w.engine.drain()
+    ok = next(p for p in again if p.product_id == "SOL-EUR")
     assert ok.decision is not None and ok.decision.action == "BUY"
 
 
@@ -965,3 +971,110 @@ async def test_run_consumes_a_queue_and_survives_a_bad_batch(monkeypatch: pytest
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+# ==================================================== BTC context of an alt state (conflict P1f, decision Q3)
+
+
+async def minute(w: World, i: int, *, with_btc: bool = True, btc_first: bool = True) -> dict[str, Processed]:
+    """One minute ``i`` for both products. ``with_btc`` False: the BTC bar of the minute has not arrived (an alt alone).
+    ``btc_first`` False: it arrives in a batch AFTER the alt (late)."""
+    for p in ("BTC-EUR", "SOL-EUR"):
+        w.ctx.quotes[p] = quote_around(float(frame(p).close.iloc[i]))
+    w.clock.now = w.event("SOL-EUR", i).published_at
+    batches = [[w.event("BTC-EUR", i), w.event("SOL-EUR", i)]] if with_btc and btc_first else []
+    if not with_btc:
+        batches = [[w.event("SOL-EUR", i)]]
+    elif not btc_first:
+        batches = [[w.event("SOL-EUR", i)], [w.event("BTC-EUR", i)]]
+    done: dict[str, Processed] = {}
+    for batch in batches:
+        for p in await w.engine.on_bars(batch):
+            done[p.product_id] = p
+    await w.engine.drain()
+    return done
+
+
+async def test_alt_buy_blocked_when_btc_bar_of_the_minute_is_missing() -> None:
+    w = make_world()
+    i = w.cursor["SOL-EUR"]
+    done = await minute(w, i, with_btc=False)
+    sol = done["SOL-EUR"]
+    assert sol.decision is not None and sol.decision.action == "HOLD" and sol.decision.reason == "btc_context_stale"
+    assert sol.record["policy"]["final"] == "HOLD" and sol.record["policy"]["reason"] == "btc_context_stale"
+    assert sol.record["btc_context"] == "stale" and sol.intent is None and sol.skip_reason is None
+    assert w.gateway.entries == [] and w.engine.stats.reasons["btc_context_stale"] == 1
+    assert json.loads(sol.record["state"])["btc_context"] is None  # the state lacks the BTC tokens
+
+
+async def test_record_carries_btc_context() -> None:
+    w = make_world()
+    done = await minute(w, w.cursor["SOL-EUR"])
+    assert done["SOL-EUR"].record["btc_context"] == "aligned"
+    assert done["BTC-EUR"].record["btc_context"] is None  # BTC itself has no BTC context
+    assert json.loads(done["SOL-EUR"].record["state"])["btc_context"] is not None
+    assert json.loads(json.dumps(done["SOL-EUR"].record))["btc_context"] == "aligned"  # survives the JSONL
+
+
+async def test_alt_buy_allowed_when_btc_aligned() -> None:
+    w = make_world()
+    done = await minute(w, w.cursor["SOL-EUR"])
+    sol = done["SOL-EUR"]
+    assert sol.decision is not None and sol.decision.action == "BUY" and isinstance(sol.intent, OrderIntent)
+    assert len(w.gateway.entries) == 2  # BTC and SOL
+
+
+async def test_stale_btc_never_blocks_sell() -> None:
+    w = make_world(inner=StubDecider(sell_after_h=2))
+    i = w.cursor["SOL-EUR"]
+    w.positions.views["SOL-EUR"] = long_view("SOL-EUR", i)
+    done = await minute(w, i, with_btc=False)
+    sol = done["SOL-EUR"]
+    assert sol.record["btc_context"] == "stale"
+    assert sol.decision is not None and sol.decision.action == "SELL" and isinstance(sol.intent, ExitIntent)
+    assert len(w.gateway.exits) == 1 and w.gateway.entries == []
+
+
+async def test_btc_not_served_no_rule() -> None:
+    w = make_world(products=("SOL-EUR",))
+    p = await w.next("SOL-EUR")
+    assert p.record["btc_context"] is None
+    assert p.decision is not None and p.decision.action == "BUY" and isinstance(p.intent, OrderIntent)
+
+
+async def test_same_bars_same_records() -> None:
+    """Determinism: two engines, the same bars in the same order, the same states and decisions minute by minute. With
+    the BTC bar one batch late the only difference in the state is the BTC context and the only decision that changes is
+    BUY -> HOLD ``btc_context_stale``."""
+    n = 6
+    twin_a, twin_b, late = make_world(), make_world(), make_world()
+    i0 = twin_a.cursor["SOL-EUR"]
+    for k in range(n):
+        await minute(twin_a, i0 + k)
+        await minute(twin_b, i0 + k)
+        await minute(late, i0 + k, btc_first=False)
+
+    def sol(w: World) -> list[dict[str, Any]]:
+        return [r for r in w.sink.records if r["product"] == "SOL-EUR"]
+
+    assert [r["state_sha256"] for r in sol(twin_a)] == [r["state_sha256"] for r in sol(twin_b)]
+    assert [r["policy"]["final"] for r in sol(twin_a)] == [r["policy"]["final"] for r in sol(twin_b)]
+    assert len(sol(twin_a)) == len(sol(late)) == n
+    changed = 0
+    for ra, rl in zip(sol(twin_a), sol(late), strict=True):
+        sa, sl = json.loads(ra["state"]), json.loads(rl["state"])
+        assert sa.pop("btc_context") is not None and sl.pop("btc_context") is None
+        assert sa == sl  # only the btc tokens differ
+        assert rl["btc_context"] == "stale" and ra["btc_context"] == "aligned"
+        if ra["policy"]["final"] != rl["policy"]["final"]:
+            changed += 1
+            assert (ra["policy"]["final"], rl["policy"]["final"]) == ("BUY", "HOLD")
+            assert rl["policy"]["reason"] == "btc_context_stale"
+    assert changed >= 1
+    hold = make_world(inner=StubDecider(buy=0.1))  # a model that never buys: nothing changes with a late BTC bar
+    hold_late = make_world(inner=StubDecider(buy=0.1))
+    for k in range(3):
+        await minute(hold, i0 + k)
+        await minute(hold_late, i0 + k, btc_first=False)
+    finals = [r["policy"]["final"] for r in hold.sink.records]
+    assert finals == [r["policy"]["final"] for r in hold_late.sink.records] and "BUY" not in finals

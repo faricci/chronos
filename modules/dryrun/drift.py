@@ -24,7 +24,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -75,6 +75,7 @@ __all__ = [
     "rule_json",
     "run_dir_of",
     "scope_note",
+    "watch_calibration",
     "window_diagnostics",
     "window_stat",
     "x_threshold",
@@ -336,6 +337,11 @@ class Calibration:
     untested: tuple[tuple[str, float | None], ...] = ()
     p_edge_ref: FeatureRef | None = None
     final: bool = False
+    # PSI-v3 REJECTED (conflict P1g): the diagnostic reference and threshold of the rejected run, for the watch (alarm
+    # only, never a gate), and the out-of-sample false-alarm record of that run (``window.d1`` of the file, as is)
+    watch: Mapping[str, FeatureRef] = field(default_factory=dict)
+    watch_c: float | None = None
+    watch_false_alarm: Any = None
 
 
 @dataclass(frozen=True)
@@ -503,6 +509,12 @@ def load_calibration(run_dir: Path, rule: Mapping[str, Any] = RULE) -> Calibrati
                 (str(u["feature"]), None if u.get("n_eff_7d") is None else float(u["n_eff_7d"]))
                 for u in (doc.get("scope") or {}).get("untested", [])
             ),
+            "watch": {} if doc.get("decision") == "adopted" else {
+                n: feature_ref(n, r) for n, r in ((doc.get("reference_diagnostic") or {}).get("features") or {}).items()
+            },
+            "watch_c": None if doc.get("decision") == "adopted" or doc.get("c_diagnostic") is None
+            else float(doc["c_diagnostic"]),
+            "watch_false_alarm": None if doc.get("decision") == "adopted" else (doc.get("window") or {}).get("d1"),
             "p_edge_ref": None if not edge else FeatureRef(
                 "p_edge", np.asarray(edge["inner"], dtype=np.float64), np.asarray(edge["p"], dtype=np.float64),
                 float(edge["r_min"]), float(edge["r_max"]), 0.0, np.array([]), math.inf, 0.0,
@@ -514,3 +526,13 @@ def load_calibration(run_dir: Path, rule: Mapping[str, Any] = RULE) -> Calibrati
         features=features, decision=str(doc["decision"]), preregistration_sha256=prereg_sha,
         sha256=_sha256_file(path), run_dir=Path(run_dir), **extra,
     )  # fmt: skip
+
+
+def watch_calibration(cal: Calibration) -> Calibration | None:
+    """The calibration of the WATCH of a rejected PSI-v3 run: its diagnostic reference and threshold
+    (``reference_diagnostic``, ``c_diagnostic``) as an ordinary calibration, so that ``window_stat`` is the one function
+    that computes the statistic. ``None`` when the run left no such reference. The result is an alarm only, never a
+    ``pass`` or ``fail`` of the gate."""
+    if not cal.watch or cal.watch_c is None:
+        return None
+    return replace(cal, features=cal.watch, window_days=int(RULE_V3["WINDOW_DAYS"][0]), c=cal.watch_c)

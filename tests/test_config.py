@@ -256,3 +256,24 @@ def test_gate_ops_has_no_block_states_key(tmp_path: Path) -> None:
     from modules.dryrun.revision_impact import STATES_PER_DAY, ImpactThresholds
 
     assert ImpactThresholds.from_config(AppConfig().dry_run.gate_ops).block_states == STATES_PER_DAY == 1440
+
+
+def test_psi_keys_still_accepted(tmp_path: Path) -> None:
+    """A YAML written before conflict P1f (``max_feature_psi``, ``psi_threshold``) loads unchanged: the keys now only
+    set the alarm of the daily-PSI diagnostic (v1), they gate nothing."""
+    data = {
+        "risk": {"kill_switch": {"psi_threshold": 0.3}},
+        "dry_run": {"gate_ops": {"max_feature_psi": 0.2, "min_days": 7}},
+    }
+    cfg = load_config(_write(tmp_path, data))
+    assert cfg.risk.kill_switch.psi_threshold == 0.3 and cfg.dry_run.gate_ops.max_feature_psi == 0.2
+
+
+def test_btc_stale_keys_defaults(tmp_path: Path) -> None:
+    g = AppConfig().dry_run.gate_ops
+    assert (g.max_btc_stale_share, g.max_btc_stale_shift) == (0.005, 0.01)
+    cfg = load_config(_write(tmp_path, {"dry_run": {"gate_ops": {"max_btc_stale_share": 0.01}}}))
+    assert cfg.dry_run.gate_ops.max_btc_stale_share == 0.01 and cfg.dry_run.gate_ops.max_btc_stale_shift == 0.01
+    for key, value in (("max_btc_stale_share", 1.5), ("max_btc_stale_shift", 0.0), ("max_btc_stale_shift", 1.0)):
+        with pytest.raises(ConfigError):
+            load_config(_write(tmp_path, {"dry_run": {"gate_ops": {key: value}}}))

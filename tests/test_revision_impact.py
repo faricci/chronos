@@ -1008,3 +1008,114 @@ def test_gate_config_defaults_feed_the_thresholds() -> None:
     thr = ImpactThresholds.from_config(GateOpsConfig())
     assert thr == THR
     assert AppConfig().dry_run.gate_ops.revision_shift_threshold == 0.01
+
+
+def test_policy_kind(tmp_path: Path) -> None:
+    """``untunable`` (explicit), ``tuned`` and ``missing`` (no file, or unreadable): the loader gives ``None`` for the
+    first and the last alike, only the first proves that the model never buys."""
+    from modules.dryrun.revision_impact import policy_kind
+
+    assert policy_kind(tmp_path) == "missing"
+    (tmp_path / "final").mkdir()
+    (tmp_path / "final" / "policy.json").write_text('{"untunable": true, "reason": "untunable_ev"}', encoding="utf-8")
+    assert policy_kind(tmp_path) == "untunable"
+    (tmp_path / "final" / "policy.json").write_text('{"tau_buy": 0.5}', encoding="utf-8")
+    assert policy_kind(tmp_path) == "tuned"
+    (tmp_path / "final" / "policy.json").write_text("{not json", encoding="utf-8")
+    assert policy_kind(tmp_path) == "missing"
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "policy.json").write_text('{"untunable": false}', encoding="utf-8")
+    assert policy_kind(tmp_path, "other") == "tuned"
+
+
+# ------------------------------------------------------- certify on whole days of the dry run (conflict P1g)
+
+
+def argv_days(rig: dict[str, Any], *, first: int = 2, last: int = 1, **over: Any) -> list[str]:
+    """``certify --days`` over the last ``first`` .. ``last`` days of the rig's store."""
+    start = (START + timedelta(days=DAYS - first)).date().isoformat()
+    end = (START + timedelta(days=DAYS - last)).date().isoformat()
+    a: dict[str, Any] = {"--days": [start, end], "--products": ["BTC-EUR", "ETH-EUR"], "--model-dir": str(rig["model"]),
+                         "--out": str(rig["out"]), "--bars-root": str(rig["root"]),
+                         "--label-config": str(rig["tmp"] / "label.json")} | over  # fmt: skip
+    out = ["certify"]
+    for key, value in a.items():
+        if value is not None:
+            out += [key, *(value if isinstance(value, list) else [value])]
+    return out
+
+
+def test_certify_days_mode_window_and_document(cert_rig: dict[str, Any]) -> None:
+    rig = cert_rig
+    files = sorted(rig["root"].rglob("*.parquet"))
+    store_before = {f: hashlib.sha256(f.read_bytes()).hexdigest() for f in files}
+    assert ri.main(argv_days(rig), source=rig["source"]) == 0
+    assert {f: hashlib.sha256(f.read_bytes()).hexdigest() for f in files} == store_before  # the store is only read
+    doc = json.loads(rig["out"].read_text(encoding="utf-8"))
+    start = (START + timedelta(days=DAYS - 2)).date().isoformat()
+    end = (START + timedelta(days=DAYS - 1)).date().isoformat()
+    assert doc["v"] == "chronos.p0_bars_certification.v2" and doc["p0_bars_criterion"] == "pass"
+    assert doc["soak_report"] is None
+    assert doc["dry_run_days"] == {"start": start, "end": end, "products": ["BTC-EUR", "ETH-EUR"]}
+    w_end = (START + timedelta(days=DAYS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    w_start = (START + timedelta(days=DAYS - 2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert doc["window"]["start"] == w_start and doc["window"]["end"] == w_end  # [START 00:00, END + 1 day 00:00)
+    assert doc["window"]["end_by_product"] == {"BTC-EUR": w_end, "ETH-EUR": w_end}
+    eth = doc["products"]["ETH-EUR"]
+    assert eth["diagnostic"]["soak_report"] is None and eth["diagnostic"]["revised"] == 1
+    assert eth["R4"]["status"] == "pass" and (eth["R1"], eth["R2"], eth["R3"]) == ("pass", "pass", "unmeasured")
+    # R1 on blocks of 1440 as in the soak mode; the last bar (23:59) closes at 00:00 of END + 1: a day of one state
+    assert [b["kind"] for b in eth["blocks"]] == ["extended_forward", "day", "extended_back"]
+    assert doc["notes"][-1].startswith("modo giorni del dry run: finestra [START 00:00Z, END+1 00:00Z)")
+    assert (rig["out"].parent / "cert.reread" / "ETH-EUR.parquet").exists()
+    # the soak mode of the same rig is unchanged: it still names its soak report and has no ``dry_run_days``
+    assert ri.main(argv(rig, **{"--out": fresh_out(rig, "soak.json")}), source=rig["source"]) == 0
+    soak_doc = json.loads((rig["tmp"] / "out" / "soak.json").read_text(encoding="utf-8"))
+    assert soak_doc["soak_report"]["sha256"] and "dry_run_days" not in soak_doc
+    assert soak_doc["products"]["ETH-EUR"]["blocks"][:2] == eth["blocks"][:2]  # the same blocks over the same days
+
+
+def test_certify_days_refuses_soak_together(cert_rig: dict[str, Any]) -> None:
+    rig = cert_rig
+    both = argv_days(rig, **{"--soak-report": str(rig["soak"])})
+    assert ri.main(both, source=rig["source"]) == 2 and not rig["out"].exists()
+    with pytest.raises(ri.ConfigurationError, match="exactly one"):
+        ri.certify(soak_report=rig["soak"], days=(date(2024, 1, 1), date(2024, 1, 2)), products=["BTC-EUR"],
+                   model_dir=rig["model"], subset="final", out=rig["out"], bars_root=rig["root"],
+                   label_path=rig["tmp"] / "label.json", source=rig["source"], risk=RISK, gate=GateOpsConfig(),
+                   now=datetime.now(UTC))  # fmt: skip
+    with pytest.raises(ri.ConfigurationError, match="exactly one"):
+        ri.certify(model_dir=rig["model"], subset="final", out=rig["out"], bars_root=rig["root"],
+                   label_path=rig["tmp"] / "label.json", source=rig["source"], risk=RISK, gate=GateOpsConfig(),
+                   now=datetime.now(UTC))  # fmt: skip
+
+
+def test_certify_days_requires_products(cert_rig: dict[str, Any]) -> None:
+    rig = cert_rig
+    assert ri.main(argv_days(rig, **{"--products": None}), source=rig["source"]) == 2 and not rig["out"].exists()
+    reversed_days = argv_days(rig, first=1, last=2)  # START after END
+    assert ri.main(reversed_days, source=rig["source"]) == 2 and not rig["out"].exists()
+
+
+def test_certify_days_end_not_concluded_refused(cert_rig: dict[str, Any]) -> None:
+    rig = cert_rig
+    today = datetime.now(UTC).date().isoformat()
+    args = argv_days(rig)
+    args[args.index("--days") + 1 : args.index("--days") + 3] = [today, today]
+    assert ri.main(args, source=rig["source"]) == 2 and not rig["out"].exists()  # younger than 15 minutes
+
+
+def test_certify_days_never_rewrites_out(cert_rig: dict[str, Any]) -> None:
+    rig = cert_rig
+    assert ri.main(argv_days(rig), source=rig["source"]) == 0
+    first = rig["out"].read_bytes()
+    assert ri.main(argv_days(rig), source=rig["source"]) == 2 and rig["out"].read_bytes() == first
+    # --previous: the same days are accepted, other days or a soak certification are refused
+    same = argv_days(rig, **{"--out": fresh_out(rig, "again.json"), "--previous": str(rig["out"])})
+    assert ri.main(same, source=rig["source"]) == 0
+    again = json.loads((rig["tmp"] / "out" / "again.json").read_text(encoding="utf-8"))
+    assert again["previous_run"]["sha256"] == hashlib.sha256(first).hexdigest()
+    other = argv_days(rig, first=3, last=2, **{"--out": fresh_out(rig, "other.json"), "--previous": str(rig["out"])})
+    assert ri.main(other, source=rig["source"]) == 2
+    assert ri.main(argv(rig, **{"--out": fresh_out(rig, "s.json"), "--previous": str(rig["out"])}),
+                   source=rig["source"]) == 2  # fmt: skip
