@@ -50,7 +50,24 @@ C:\Users\faric\Documents\sviluppo\chronos-dryrun\config.yml --out data/reports/p
 
 ## Esito P0
 
-(da compilare dopo la corsa)
+UNA corsa (2026-10-26), file `data/reports/p0_bars_certification_dry_2026-10-24_2026-10-25.json` (sha256 `88261afc...d`), schema
+`chronos.p0_bars_certification.v2`, config e dati del dry run in sola lettura, prodotti BTC-EUR, ETH-EUR, SOL-EUR, XRP-EUR,
+champion `baseline-lgbm@2026-10-18.2` (policy `untunable`), finestra `[2026-10-24 00:00Z, 2026-10-26 00:00Z)`, 2.880 stati per prodotto.
+
+**`p0_bars_criterion` = `fail`** (exit 1; anche con la regola v1). Nessun ritocco.
+
+| prodotto | R1 | R2 (max m) | R4 | note |
+|---|---|---|---|---|
+| BTC-EUR | pass (0 stati spostati) | pass (0,0037) | pass (0/0) | 4 minuti rivisti |
+| ETH-EUR | pass (0) | pass (0,0046) | pass (0/0) | 21 minuti rivisti |
+| SOL-EUR | pass (0) | pass (0,0028) | pass (0/0) | 6 minuti rivisti |
+| XRP-EUR | **fail** | pass (0,0157) | pass (0/0) | 65 minuti rivisti (3,4%), 16 stati spostati |
+
+R1 di XRP-EUR per blocco di 1.440 stati: `extended_forward` (il 24-ott ha 1.439 stati, l'ultima barra chiude a mezzanotte)
+12 stati spostati = 0,83% contro lo 0,5% ammesso; `day` 4 (0,28%); `extended_back` (un solo stato del 26-ott) 4 (0,28%). R3
+`unmeasured` per tutti (policy `untunable`; non fa parte di P0). Il criterio P0 "barre REST" NON e' certificato: XRP-EUR
+e' fuori dai prodotti di training (R1 era gia' vicino al limite il 23-ott: 0,417% con max m 0,0198). BTC, ETH e SOL, i tre
+prodotti di training, passano tutti i criteri.
 
 ## Allegato: CONFLITTO P1g
 
