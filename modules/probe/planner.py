@@ -87,8 +87,10 @@ class PlanFacts:
 
 
 class ProbePlanner:
-    def __init__(self, cfg: ExecProbeConfig) -> None:
+    def __init__(self, cfg: ExecProbeConfig, *, expires_on_exchange: bool = True) -> None:
         self._cfg = cfg
+        # False only for the GTC fallback the user would have to accept in writing (plan sez. 3.3, 10.1)
+        self._gtd = expires_on_exchange
 
     def plan(self, f: PlanFacts) -> OrderIntent | ProbeSkip:
         cfg = self._cfg
@@ -140,7 +142,7 @@ class ProbePlanner:
         if not (0 < stop_loss < entry < take_profit) or take_profit - entry < 2 * qinc or entry - stop_loss < 2 * qinc:
             return ProbeSkip("invalid_levels", f"sl={stop_loss} entry={entry} tp={take_profit}")
         if size <= 0 or size * entry < limits.n_br(meta.quote_min_size, cfg.sl_frac):
-            # the cap leaves less than a protectable notional (one tick of cushion and the rounding eat the margin)
+            # the cap leaves less than a protectable notional (one tick of cushion and the rounding eat the slack)
             reason = "budget_exhausted" if budget_cap <= f.free_quote else "insufficient_balance"
             return ProbeSkip(reason, f"size {size} at {entry} is below the protectable notional")
         if not is_sellable(size, stop_loss, meta):
@@ -162,7 +164,7 @@ class ProbePlanner:
                 "type": "limit_post_only",
                 "limit_price": entry,
                 "time_in_force_s": self._cfg.entry_timeout_s,
-                "expires_on_exchange": True,
+                "expires_on_exchange": self._gtd,
             },
             "base_size": size,
             "bracket": {

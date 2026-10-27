@@ -27,8 +27,9 @@ without touching the existing rows.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -423,6 +424,13 @@ class PositionLedger:
     def connection(self) -> aiosqlite.Connection:
         """For the KillSwitch, which persists its state in this same database (sez. 0.6)."""
         return self._db
+
+    @contextlib.asynccontextmanager
+    async def exclusive(self) -> AsyncIterator[None]:
+        """Hold the ledger's own lock. A writer that shares ``connection`` (the KillSwitch's ``save``) takes it, so its
+        transaction never interleaves with a ledger transaction on the same connection (the live probe does)."""
+        async with self._lock:
+            yield
 
     async def _load_cache(self) -> None:
         self._cache.clear()

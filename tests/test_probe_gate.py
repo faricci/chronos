@@ -31,6 +31,7 @@ from modules.probe.stages import (
     crossing_buy_intent,
     far_buy_intent,
     read_stage,
+    skipped_record,
     write_stage,
 )
 
@@ -273,34 +274,41 @@ def test_the_stage_file_round_trips(tmp_path: Path) -> None:
 
 
 def chain_until(out: Path, last: str, *, entry_mode: str = "gtd", at: datetime = NOW) -> None:
-    for stage in ("preflight", "preview", "place-cancel", "expire", "reject"):
-        write_stage(out, rec(stage, at=at, entry_mode=entry_mode if stage == "preview" else None))  # type: ignore[arg-type]
+    for stage in ("preflight", "preview", "place-cancel", "expire", "reject", "stop-switch"):
+        stage_at = at if stage != "stop-switch" else NOW
+        write_stage(out, rec(stage, at=stage_at, entry_mode=entry_mode if stage == "preview" else None))  # type: ignore[arg-type]
         if stage == last:
             break
 
 
 def test_live_accepts_a_reject_of_up_to_seven_days(tmp_path: Path) -> None:
-    chain_until(tmp_path, "reject", at=NOW - timedelta(days=6, hours=23))
+    chain_until(tmp_path, "stop-switch", at=NOW - timedelta(days=6, hours=23))
     assert check_chain(tmp_path, "live", ENABLED, NOW) is not None
-    chain_until(tmp_path, "reject", at=NOW - timedelta(days=7, hours=1))
+    chain_until(tmp_path, "stop-switch", at=NOW - timedelta(days=7, hours=1))
     with pytest.raises(StageBlocked, match="older than 7 days"):
         check_chain(tmp_path, "live", ENABLED, NOW)
 
 
+def test_live_needs_the_stop_switch_proved_today(tmp_path: Path) -> None:
+    chain_until(tmp_path, "stop-switch")
+    write_stage(tmp_path, rec("stop-switch", at=NOW - timedelta(days=1)))
+    with pytest.raises(StageBlocked, match="not today"):
+        check_chain(tmp_path, "live", ENABLED, NOW)
+
+
 def test_live_needs_every_earlier_stage_ok_with_this_config(tmp_path: Path) -> None:
-    chain_until(tmp_path, "reject")
+    chain_until(tmp_path, "stop-switch")
     write_stage(tmp_path, rec("preview", ok=False, entry_mode="gtd"))
     with pytest.raises(StageBlocked, match="'preview'"):
         check_chain(tmp_path, "live", ENABLED, NOW)
 
 
 def test_the_gtc_fallback_is_not_accepted_unless_the_user_wrote_it(tmp_path: Path) -> None:
-    chain_until(tmp_path, "reject", entry_mode="gtc_fallback")
+    chain_until(tmp_path, "stop-switch", entry_mode="gtc_fallback")
     with pytest.raises(StageBlocked, match="has not accepted the GTC fallback"):
         check_chain(tmp_path, "live", ENABLED, NOW)
     accepted = ExecProbeConfig(enabled=True, accept_gtc_fallback=True)
-    chain_until(tmp_path, "reject", entry_mode="gtc_fallback")
-    for stage in ("preflight", "preview", "place-cancel", "expire", "reject"):  # the hash changed with the flag
+    for stage in ("preflight", "preview", "place-cancel", "expire", "reject", "stop-switch"):  # the hash changed
         r = read_stage(tmp_path, stage)
         assert r is not None
         write_stage(
@@ -309,10 +317,14 @@ def test_the_gtc_fallback_is_not_accepted_unless_the_user_wrote_it(tmp_path: Pat
     assert check_chain(tmp_path, "live", accepted, NOW) is not None
 
 
-def test_the_expire_stage_exists_only_for_gtd(tmp_path: Path) -> None:
+def test_the_expire_stage_can_be_skipped_and_the_chain_goes_on(tmp_path: Path) -> None:
     chain_until(tmp_path, "place-cancel", entry_mode="gtc_fallback")
-    with pytest.raises(StageBlocked, match="only for a GTD"):
-        check_chain(tmp_path, "expire", ENABLED, NOW)
+    assert check_chain(tmp_path, "expire", ENABLED, NOW) is not None  # allowed to start: the runner skips it
+    skipped = skipped_record("expire", ENABLED, NOW, "not applicable with the GTC fallback")
+    assert skipped.ok and skipped.skipped
+    write_stage(tmp_path, skipped)
+    assert read_stage(tmp_path, "expire") == skipped
+    assert check_chain(tmp_path, "reject", ENABLED, NOW) is not None
 
 
 # ----------------------------------------------------------------------------------------- stage intents

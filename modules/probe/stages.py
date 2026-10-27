@@ -25,7 +25,7 @@ from modules.execution.rounding import ceil_to, floor_to
 from modules.probe import limits
 from modules.risk.risk_manager import OrderIntent
 
-STAGES: Final = ("preflight", "preview", "place-cancel", "expire", "reject", "live")
+STAGES: Final = ("preflight", "preview", "place-cancel", "expire", "reject", "stop-switch", "live")
 PREVIOUS: Final = dict(zip(STAGES[1:], STAGES[:-1], strict=True))
 EntryMode = Literal["gtd", "gtc_fallback"]
 TEST_DECISION_PREFIX: Final = "probe-test"  # never counted as an entry of the probe
@@ -70,6 +70,11 @@ class StageRecord:
         )  # fmt: skip
 
 
+def skipped_record(stage: str, cfg: ExecProbeConfig, now: datetime, why: str) -> StageRecord:
+    """A stage that does not apply (``expire`` with the GTC fallback): ok, so that the chain goes on, and said so."""
+    return StageRecord(stage, True, now, config_hash(cfg), skipped=True, details={"skipped": why})
+
+
 def stage_path(out_dir: Path, stage: str) -> Path:
     return out_dir / f"{stage}.json"
 
@@ -108,23 +113,20 @@ def check_chain(out_dir: Path, stage: str, cfg: ExecProbeConfig, now: datetime) 
         raise StageBlocked(f"stage {previous!r} has no ok outcome: run it first")
     if prev.config_sha256 != sha:
         raise StageBlocked(f"stage {previous!r} was run with another config: run it again")
-    if stage == "live":
-        age = now - prev.at
-        if age > timedelta(days=limits.LIVE_REJECT_MAX_AGE_DAYS) or age < timedelta(0):
-            raise StageBlocked(
-                f"the 'reject' outcome is older than {limits.LIVE_REJECT_MAX_AGE_DAYS} days: run it again"
-            )
-        for earlier in STAGES[: STAGES.index("reject")]:
+    if prev.at.astimezone(UTC).date() != today:
+        raise StageBlocked(f"stage {previous!r} was run on {prev.at.astimezone(UTC).date()}, not today: run it again")
+    if stage == "live":  # the STOP switch was proved today; the 'reject' outcome may be up to a week old
+        reject = read_stage(out_dir, "reject")
+        age = None if reject is None else now - reject.at
+        if reject is None or age is None or age > timedelta(days=limits.LIVE_REJECT_MAX_AGE_DAYS) or age < timedelta(0):
+            raise StageBlocked(f"the 'reject' outcome is missing or older than {limits.LIVE_REJECT_MAX_AGE_DAYS} days")
+        for earlier in STAGES[: STAGES.index("live")]:
             rec = read_stage(out_dir, earlier)
             if rec is None or not rec.ok or rec.config_sha256 != sha:
                 raise StageBlocked(f"stage {earlier!r} has no ok outcome with this config")
-    elif prev.at.astimezone(UTC).date() != today:
-        raise StageBlocked(f"stage {previous!r} was run on {prev.at.astimezone(UTC).date()}, not today: run it again")
     preview = read_stage(out_dir, "preview") if stage != "preview" else None
     if stage in ("expire", "live") and (preview is None or preview.entry_mode is None):
         raise StageBlocked("the 'preview' outcome does not say whether the entry is GTD")
-    if stage == "expire" and preview is not None and preview.entry_mode != "gtd":
-        raise StageBlocked("the 'expire' stage exists only for a GTD entry")
     if stage == "live" and preview is not None and preview.entry_mode != "gtd" and not cfg.accept_gtc_fallback:
         raise StageBlocked(
             "the exchange does not accept the GTD entry and the user has not accepted the GTC fallback in writing "
@@ -177,23 +179,23 @@ def stage_order_size(quote: Decimal, price: Decimal, meta: ProductMeta) -> Decim
 
 
 def far_buy_intent(
-    stage: str, bid: Decimal, meta: ProductMeta, cfg: ExecProbeConfig, now: datetime, *, tif_s: int
+    stage: str, bid: Decimal, meta: ProductMeta, cfg: ExecProbeConfig, now: datetime, *, tif_s: int, gtd: bool = True
 ) -> OrderIntent:
     """``place-cancel`` / ``expire``: a GTD BUY of ``test_order_quote`` at ``floor_to(bid * 0.95)``, far from the
     market, so that it should not fill. If it fills it is a normal entry (bracket included)."""
     price = floor_to(bid * Decimal("0.95"), meta.quote_increment)
     size = stage_order_size(cfg.test_order_quote, price, meta)
     return _base_intent(
-        stage_decision_id(stage, now), meta.product_id, meta, price, size, tif_s, now, expires_on_exchange=True
+        stage_decision_id(stage, now), meta.product_id, meta, price, size, tif_s, now, expires_on_exchange=gtd
     )
 
 
 def crossing_buy_intent(
-    stage: str, ask: Decimal, meta: ProductMeta, cfg: ExecProbeConfig, now: datetime, *, tif_s: int
+    stage: str, ask: Decimal, meta: ProductMeta, cfg: ExecProbeConfig, now: datetime, *, tif_s: int, gtd: bool = True
 ) -> OrderIntent:
     """``reject``: a post-only BUY at ``ceil_to(ask)`` that would take liquidity, so the exchange must refuse it."""
     price = ceil_to(ask, meta.quote_increment)
     size = stage_order_size(cfg.test_order_quote, price, meta)
     return _base_intent(
-        stage_decision_id(stage, now), meta.product_id, meta, price, size, tif_s, now, expires_on_exchange=True
+        stage_decision_id(stage, now), meta.product_id, meta, price, size, tif_s, now, expires_on_exchange=gtd
     )

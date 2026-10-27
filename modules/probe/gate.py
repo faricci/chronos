@@ -29,6 +29,7 @@ from dotenv import dotenv_values
 from pydantic import SecretStr
 
 from modules.config import LIVE_CONFIRM_ENV, LIVE_CONFIRM_VALUE, CoinbaseConfig, ExecProbeConfig
+from modules.execution.raw_log import secrets_of  # noqa: F401 (re-exported: the one list of credential forms)
 
 PROBE_CONFIRM_ENV: Final = "CHRONOS_EXEC_PROBE_CONFIRM"
 FORBIDDEN_ENV: Final = ("COINBASE_API_KEY", "COINBASE_API_SECRET")
@@ -119,18 +120,6 @@ def key_fingerprint(cfg: CoinbaseConfig) -> str:
     """``sha256(api_key)[:8]``: enough to recognise the key, useless to anyone else."""
     assert cfg.api_key is not None
     return hashlib.sha256(cfg.api_key.get_secret_value().encode("utf-8")).hexdigest()[:8]
-
-
-def secrets_of(cfg: CoinbaseConfig) -> list[str]:
-    """Every form in which the credentials could appear in a log line or a message (for the redaction)."""
-    out: list[str] = []
-    if cfg.api_key is not None:
-        out.append(cfg.api_key.get_secret_value())
-    if cfg.api_secret is not None:
-        pem = cfg.api_secret.get_secret_value()
-        out += [pem, pem.replace("\n", "\\n"), pem.replace("\n", "\\\\n")]
-        out += [line.strip() for line in pem.splitlines() if len(line.strip()) >= 20]
-    return out
 
 
 @dataclass(frozen=True, slots=True)
