@@ -87,12 +87,14 @@ class Env:
         await self.settle()
 
 
-async def build(tmp_path: Path, *, venue_kw: dict[str, Any] | None = None, **probe: Any) -> Env:
+async def build(
+    tmp_path: Path, *, venue_kw: dict[str, Any] | None = None, entry_mode: str = "gtd", **probe: Any
+) -> Env:
     clock = Clock()
     venue = Venue(clock, **(venue_kw or {}))
     cfg = make_cfg(tmp_path, **probe)
     deps = make_deps(venue, clock, tmp_path)
-    rt = await build_runtime(cfg, deps, CoinbaseConfig(_env_file=None), [], "gtd")  # type: ignore[call-arg]
+    rt = await build_runtime(cfg, deps, CoinbaseConfig(_env_file=None), [], entry_mode)  # type: ignore[call-arg]
     return Env(rt, venue, clock, cfg, deps, tmp_path)
 
 
@@ -506,3 +508,30 @@ async def test_the_horizon_exit_carries_its_reason_in_the_decision_id(env: Env) 
     await env.rt.watchdog.drain()
     exits = [o for o in await env.rt.ledger.book_orders(limits.BOOK) if o.leg.startswith("exit")]
     assert exits and all((o.intent_id or "").startswith("probe-exit:HORIZON:") for o in exits)
+
+
+async def test_a_coverage_breach_ends_the_probe_until_someone_has_looked(env: Env) -> None:
+    env.rt.account.trip_coverage_breach("hold_exceeds_reservation:EUR:test")
+    await env.rt.equity_once()
+    finished = env.rt.marker.read()
+    assert finished is not None and finished.reason == "coverage_breach"
+    await env.at(9)
+    assert await env.rt.scheduler.tick() == "skip:entry_blocked"
+
+
+async def test_with_the_gtc_fallback_the_bot_itself_cancels_an_unfilled_entry(tmp_path: Path) -> None:
+    """The fallback the user did NOT accept (only reachable with ``accept_gtc_fallback``): no ``end_time`` on the order,
+    the gateway cancels it at ``entry_timeout_s`` with confirmation."""
+    e = await build(tmp_path, entry_mode="gtc_fallback")
+    try:
+        await e.at(9)
+        assert await e.rt.scheduler.tick() == "entered"
+        await e.settle(timeout_s=30)
+        (entry,) = e.venue.creates("BUY")
+        assert entry.end_time is None  # a plain GTC order
+        (result,) = [x for x in e.events() if x["kind"] == "probe_entry_result"]
+        assert (result["status"], result["reason"]) == ("no_fill", "cancelled")
+        assert [x for x in e.venue.log if x[0] == "cancel"]
+        assert e.rt.balances.reservation(ENTRY9) is None
+    finally:
+        await close(e)

@@ -227,3 +227,21 @@ def test_clopper_pearson_matches_the_known_intervals() -> None:
     assert clopper_pearson(0, 5)[0] == 0.0 and clopper_pearson(5, 5)[1] == 1.0
     lo0, hi0 = clopper_pearson(0, 5)
     assert hi0 == pytest.approx(0.5218, abs=1e-3)
+
+
+def test_the_child_order_of_a_triggered_stop_is_listed_with_its_floor_ratio() -> None:
+    from modules.probe.report import bracket_child_fields
+
+    bracket = orders_for("br")[0].__class__(
+        "br", limits.BOOK, P, "SELL", "bracket", "FILLED",
+        orders_for("br")[0].created_at, orders_for("br")[0].updated_at, "ex-br", None,
+    )  # fmt: skip
+    open_msg = message("OPEN", cid="br", oid="ex-br", side="SELL", limit="80480.00", stop="79520.00")
+    open_msg["order_type"], open_msg["trigger_status"] = "LIMIT", "STOP_PENDING"
+    child = message("OPEN", cid="br", oid="ex-br", side="SELL", limit="75544.00", stop="79520.00")
+    child["order_type"], child["trigger_status"] = "STOP_LIMIT", "STOP_TRIGGERED"
+    other = message("OPEN", cid="not-a-bracket", oid="ex-x")
+    got = bracket_child_fields([(1.0, open_msg), (2.0, child), (3.0, child), (4.0, other)], [bracket])
+    assert [g["trigger_status"] for g in got] == ["STOP_PENDING", "STOP_TRIGGERED"]  # distinct states, in order
+    assert got[1]["order_type"] == "STOP_LIMIT" and got[1]["limit_over_stop"] == pytest.approx(0.95)
+    assert bracket_child_fields([], [bracket]) == []

@@ -285,6 +285,39 @@ def _user_channel(
     return _check("pass", detail + f"; partial fill seen: {'PARTIAL' in seen}", missing_samples=[]), messages
 
 
+def bracket_child_fields(
+    messages: Sequence[tuple[float, dict[str, Any]]], orders: Sequence[OrderRecord]
+) -> list[dict[str, Any]]:
+    """What the ``user`` channel said about the brackets (plan Allegato A/10.5): the order type, the trigger status, the
+    limit and the stop of each distinct state, and ``limit / stop`` (the stop-limit floor, about 0.95, is what the plan
+    expects the child order of a triggered stop to carry). Empty when the recording has no bracket message."""
+    brackets = {o.client_order_id for o in orders if o.leg == "bracket"}
+    seen: dict[tuple[str, str, str, str, str], dict[str, Any]] = {}
+    for _, m in messages:
+        if str(m.get("client_order_id")) not in brackets:
+            continue
+        key = (
+            str(m.get("status")), str(m.get("order_type")), str(m.get("trigger_status")),
+            str(m.get("limit_price")), str(m.get("stop_price")),
+        )  # fmt: skip
+        if key in seen:
+            continue
+        limit, stop = _dec_or_none(m.get("limit_price")), _dec_or_none(m.get("stop_price"))
+        ratio = None if not limit or not stop else float(limit / stop)
+        seen[key] = {
+            "status": key[0], "order_type": key[1], "trigger_status": key[2], "limit_price": key[3],
+            "stop_price": key[4], "limit_over_stop": ratio,
+        }  # fmt: skip
+    return list(seen.values())
+
+
+def _dec_or_none(value: object) -> Decimal | None:
+    try:
+        return None if value in (None, "") else Decimal(str(value))
+    except ArithmeticError:
+        return None
+
+
 def _latency(
     events: Sequence[dict[str, Any]], messages: list[tuple[float, dict[str, Any]]], poll_s: float
 ) -> dict[str, Any]:
@@ -361,6 +394,7 @@ async def build_report(
         "sl_slippage_alarms": sum(1 for e in events if e.get("kind") in ("sl_slippage_alarm", "sl_slippage_severe")),
         "fill_latency_s": criteria["fill_latency"].get("values", []),
         "held_min": [t.held_min for t in trades],
+        "bracket_child_fields": bracket_child_fields(messages, orders),
     }  # fmt: skip
     statuses = [c["status"] for c in criteria.values()]
     return {
@@ -388,7 +422,10 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines += ["", "## Misure descrittive (senza soglia)", ""]
     lines += [f"- Ingressi: {d['entries']}", f"- Chiusure: {d['exit_reasons']}", f"- PnL: {d['pnl_quote']} EUR"]
     lines += [f"- Latenza bracket (s): {d['bracket_open_seconds']}", f"- Slittamento SL (bps): {d['sl_slippage_bps']}"]
-    lines += [f"- Latenza fill WS->REST (s): {d['fill_latency_s']}", "", report["note"], ""]
+    lines += [f"- Latenza fill WS->REST (s): {d['fill_latency_s']}"]
+    for child in d.get("bracket_child_fields", []):
+        lines.append(f"- Bracket (canale user): {child}")
+    lines += ["", report["note"], ""]
     return "\n".join(lines)
 
 

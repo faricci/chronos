@@ -250,3 +250,9 @@ def test_too_few_or_broken_candles_give_none() -> None:
     assert atr_wilder(hourly(14), now) is None  # 14 candles = 13 ranges
     assert atr_wilder([{"start": "x"}], now) is None
     assert atr_wilder([], now) is None
+
+
+def test_the_gtc_fallback_planner_does_not_ask_the_exchange_to_expire_the_entry() -> None:
+    out = ProbePlanner(CFG, expires_on_exchange=False).plan(facts())
+    assert isinstance(out, OrderIntent) and out.entry.expires_on_exchange is False
+    assert out.entry.time_in_force_s == 1800 and out.entry.type == "limit_post_only"

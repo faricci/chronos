@@ -39,6 +39,7 @@ aiolimiter
 tenacity
 pydantic>=2
 pydantic-settings
+python-dotenv
 structlog
 sortedcontainers
 aiosqlite

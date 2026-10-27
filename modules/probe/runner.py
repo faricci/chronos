@@ -28,7 +28,7 @@ from typing import IO, Any, Final, TypeVar
 
 import structlog
 
-from modules.app import configure_logging, install_signal_handlers
+from modules.app import collect_secrets, configure_logging, install_signal_handlers
 from modules.config import (
     AppConfig,
     CoinbaseConfig,
@@ -50,7 +50,7 @@ from modules.execution.exchange import (
     build_exchange,
 )
 from modules.execution.gateway import EntryResult, LiveExecutionGateway
-from modules.execution.raw_log import RawLog, secrets_of
+from modules.execution.raw_log import RawLog, redact, secrets_of
 from modules.execution.reconciler import CoverageMonitor, Reconciler
 from modules.execution.spot import (
     SPOT_EXIT_CODE,
@@ -370,7 +370,9 @@ class ProbeRuntime:
         await self.deps.sleep(5.0)  # the switch watcher asks again if the position is still there
 
     async def equity_once(self) -> None:
-        """One look at the notional equity: the daily-loss guard, the anomaly loss and the total loss."""
+        """One look at the guards: coverage breach, then the notional equity (daily loss, anomaly, total loss)."""
+        if self.kill.coverage_breach_active(limits.BOOK):  # a balance the exchange contradicts: no automatic reset
+            self.finish("coverage_breach", "the exchange contradicts the local balances (plan sez. 5): analyse first")
         bid = await self.bid_source.bid()
         if bid is None:
             return
@@ -540,6 +542,8 @@ class ProbeRuntime:
             for task in done:
                 if task is stop_task or task is job_task:
                     continue
+                if task.get_name() == "idle" and not task.cancelled() and task.exception() is None:
+                    continue  # the idle watcher ends by itself, after asking for the stop
                 failure = task.exception() if not task.cancelled() else RuntimeError(f"{task.get_name()} was cancelled")
                 if failure is None:
                     failure = RuntimeError(f"component {task.get_name()} ended")
@@ -796,7 +800,7 @@ async def execute_stage(cfg: AppConfig, deps: Deps, stage: str, key_file: str | 
     except GateRefused as exc:
         complain(deps, f"RIFIUTATO: {exc}")
         return EXIT_GATE
-    secrets = secrets_of(creds)
+    secrets = [*secrets_of(creds), *collect_secrets(cfg, deps.env)]  # the probe key AND any other key in sight
     if deps.configure_logs:
         configure_logging(secrets)
     fingerprint = key_fingerprint(creds)
@@ -841,6 +845,10 @@ async def execute_stage(cfg: AppConfig, deps: Deps, stage: str, key_file: str | 
         return EXIT_DRY_VIOLATION
     except ExchangeAuthError as exc:
         complain(deps, f"CREDENZIALI RIFIUTATE da Coinbase: {exc}")
+        return EXIT_FAILED
+    except Exception as exc:  # no traceback on the screen: an error text could carry a fragment of a request
+        complain(deps, f"ERRORE: {type(exc).__name__}: {redact(str(exc), secrets)[:500]}")
+        log.exception("probe_stage_crashed", stage=stage)
         return EXIT_FAILED
 
 

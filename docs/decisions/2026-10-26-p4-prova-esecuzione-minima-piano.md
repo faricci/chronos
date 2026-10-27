@@ -301,6 +301,21 @@ Valore della variabile di conferma: `CHRONOS_EXEC_PROBE_CONFIRM=BTC-EUR:3.00` (`
 7. La serie unica SL+WATCHDOG di `AccountGuards` resta nel resto del sistema; la separazione vale solo per la prova. Se debba valere anche per R0 e' una domanda futura per la spec, fuori da P4-pre.
 8. Con orizzonte di 8 h lo slot delle 11:00 si usa solo se quello delle 09:00 non si e' riempito: in pratica circa un ciclo al giorno.
 
+## 12. Note di implementazione (2026-10-27)
+
+Dove il codice dice qualcosa che il piano lasciava aperto o che si discosta dal testo. Nessuna cambia un limite o un criterio.
+
+1. La prova di STOP della 4.6 e' lo stadio `stop-switch` (dopo `reject`, prima di `live`): crea `STOP`, verifica che lo `status` riporti `entries_blocked: manual_stop`, aspetta che l'operatore cancelli il file a mano, verifica che il blocco sparisca. `live` richiede `stop-switch` dello stesso giorno e `reject` di al massimo 7 giorni prima.
+2. `OrderInfo` non ha `trigger_status` (e `exchange.py` non cambia): lo "SL scattato e non eseguito" si riconosce dal bid sotto lo SL per `sl_fill_max_s` con la posizione ancora aperta, piu' il pavimento `SL * sl_floor_ratio`. I campi dell'ordine figlio (`order_type`, `trigger_status`, `limit_price`, `stop_price`) si leggono dalla registrazione grezza del canale `user` e il rapporto li elenca con il rapporto limite/stop.
+3. L'equity della prova si calcola dai fill del ledger (flusso di cassa piu' base in mano al bid), non dai `closed_trades`: un dust che non ha mai chiuso un trade, o fuso nella posizione successiva, e' contato una volta sola.
+4. Ogni slot ha una finestra di 300 s (`SLOT_WINDOW_S`): dentro la finestra i motivi di salto "transitori" (quote vecchia, spread largo, ATR, saldo vecchio) vengono ritentati, fuori lo slot e' perso, mai servito in ritardo. Lo slot servito e' scritto nel ledger prima dell'ingresso.
+5. Gli ingressi contati dai limiti (2 al giorno, 5 in tutto) sono gli ORDINI d'ingresso registrati, riempiti o no (un ingresso scaduto senza fill usa un'operazione): e' la lettura prudente di "5 operazioni". Gli ordini degli stadi di prova non contano come ingressi.
+6. L'uscita d'emergenza (`WATCHDOG`) ha il `decision_id` interno del gateway (`emergency:...`); le uscite per orizzonte e manuali hanno `probe-exit:<motivo>:<ts>`.
+7. Con il ripiego GTC (non accettato dall'utente) lo stadio `expire` si salta (esito `skipped`), gli ordini di prova non sono GTD e lo stadio `live` resta chiuso finche' `exec_probe.accept_gtc_fallback` non e' `true`.
+8. `commission_total` con al massimo 2 decimali ferma lo stadio `preview` (non verificabile). Con 3 o piu' decimali procede, ma il criterio Fee del rapporto fallisce se TUTTE le commissioni dei fill hanno al massimo 2 decimali.
+9. Il salvataggio del kill switch scrive sulla connessione del ledger: ora prende il lock del ledger (`PositionLedger.exclusive()`), perche' una scrittura concorrente poteva incrociarsi con una transazione del ledger.
+10. Un allarme di copertura (`coverage_breach`) chiude la prova (`finished.json`), come la perdita anomala: nessun reset automatico.
+
 ---
 
 ## Allegato A. Risposta del trader-quant (testo originale, era la sez. 10 della rev. 1)

@@ -344,3 +344,66 @@ def test_the_live_stage_runs_a_cycle_and_stops_cleanly(tmp_path: Path) -> None:
     assert status["position"]["side"] == "FLAT" and status["counts"]["entries_total"] == 1
     kinds = [json.loads(line)["kind"] for line in (world.out_dir / "events.jsonl").read_text().splitlines()]
     assert "probe_entry" in kinds and "bracket_open_latency" in kinds and "trade_closed" in kinds
+
+
+def test_an_unexpected_error_prints_no_traceback_and_no_secret(world: World) -> None:
+    async def boom() -> None:
+        raise RuntimeError(
+            "request failed: Bearer eyJhbGciOiJFUzI1NiJ9.eyJzdWIiOiJ4In0.c2lnbmF0dXJl organizations/o/apiKeys/k1"
+        )
+
+    world.venue.get_api_key_permissions = boom  # type: ignore[assignment]
+    assert world.run("preflight") == 1
+    text = world.err.getvalue()
+    assert "ERRORE: RuntimeError" in text and "eyJhbGci" not in text and "apiKeys/k1" not in text
+    assert "Traceback" not in text
+
+
+def write_ladder(world: World, cfg: Any, clock: ScaledClock) -> None:
+    from modules.probe.stages import StageRecord, config_hash, write_stage
+
+    for stage in ("preflight", "preview", "place-cancel", "expire", "reject", "stop-switch"):
+        record = StageRecord(
+            stage, True, clock(), config_hash(cfg.exec_probe), entry_mode="gtd" if stage == "preview" else None
+        )
+        write_stage(world.out_dir, record)
+
+
+def test_a_finished_probe_with_nothing_open_stops_by_itself(tmp_path: Path) -> None:
+    clock = ScaledClock(scale=400.0)
+    world = World(tmp_path, clock)
+    cfg = make_cfg(tmp_path)
+    write_ladder(world, cfg, clock)
+    from modules.probe.control import FinishMarker
+
+    FinishMarker(world.out_dir).write("anomaly_loss", "a test", clock())
+    world.stdin = Tty(PHRASE)
+    code = asyncio.run(asyncio.wait_for(execute_stage(cfg, world.deps(), "live", str(world.key)), timeout=30))
+    assert code == 0 and "terminata" in world.err.getvalue()
+    kinds = [json.loads(x)["kind"] for x in (world.out_dir / "events.jsonl").read_text().splitlines()]
+    assert "probe_idle_stop" in kinds
+    assert not world.venue.creates()  # nothing was sent
+
+
+def test_a_live_run_with_all_the_entries_used_stops_by_itself(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from modules.ledger.positions import OrderRecord, PositionLedger
+
+    clock = ScaledClock(scale=400.0)
+    world = World(tmp_path, clock)
+    cfg = make_cfg(tmp_path)
+    write_ladder(world, cfg, clock)
+
+    async def seed() -> None:
+        led = await PositionLedger.open(Path(cfg.exec_probe.db_path), "live")
+        now = datetime(2026, 10, 27, 9, 0, tzinfo=UTC)
+        for i in range(5):
+            rec = OrderRecord(f"e{i}", "probe", P, "BUY", "entry", "EXPIRED", now, now, f"x{i}", f"probe:BTC-EUR:{i}")
+            await led.record_order(rec)
+        await led.close()
+
+    asyncio.run(seed())
+    world.stdin = Tty(PHRASE)
+    code = asyncio.run(asyncio.wait_for(execute_stage(cfg, world.deps(), "live", str(world.key)), timeout=30))
+    assert code == 0 and not world.venue.creates()
