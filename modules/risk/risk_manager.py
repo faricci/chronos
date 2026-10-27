@@ -19,9 +19,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Final, Literal, Protocol
+from typing import Any, Final, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, SerializerFunctionWrapHandler, model_serializer
 
 from modules.config import EntryTimeout, FallbackFees, RiskConfig
 from modules.decision.policy import ENTRY_REGIMES, Decision
@@ -92,6 +92,17 @@ class _EntryLeg(BaseModel):
     type: Literal["limit_post_only", "limit_marketable"]
     limit_price: Decimal
     time_in_force_s: int
+    # True: the exchange expires the order itself (``limit_limit_gtd``, spec 2.15). Only the P4-pre probe sets it;
+    # dry, shadow and backtest keep the default and the behaviour they have always had.
+    expires_on_exchange: bool = False
+
+    @model_serializer(mode="wrap")
+    def _omit_the_default_flag(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        """The spec 4.2 JSON of every other intent stays byte for byte what it is: the flag is written only when set."""
+        data: dict[str, Any] = handler(self)
+        if not self.expires_on_exchange:
+            data.pop("expires_on_exchange", None)
+        return data
 
 
 class _Bracket(BaseModel):

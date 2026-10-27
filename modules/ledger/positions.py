@@ -821,6 +821,11 @@ class PositionLedger:
             row = await cur.fetchone()
         return None if row is None else _row_to_order(row)
 
+    async def book_orders(self, book: str) -> list[OrderRecord]:
+        """Every order the book ever recorded, in any status, oldest first (the probe counts its limits from this)."""
+        async with self._db.execute("SELECT * FROM orders WHERE book=? ORDER BY created_at, rowid", (book,)) as cur:
+            return [_row_to_order(r) for r in await cur.fetchall()]
+
     async def open_orders(self, book: str) -> list[OrderRecord]:
         marks = ",".join("?" * len(TERMINAL_STATUSES))
         sql = f"SELECT * FROM orders WHERE book=? AND status NOT IN ({marks}) ORDER BY created_at"

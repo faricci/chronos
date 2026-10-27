@@ -61,6 +61,7 @@ class FakeExchange:
         self.auto_sell = True  # marketable SELL limits and market SELLs fill at once, in full
         self.cancel_lag = 0  # polls after a cancel request before CANCELLED shows
         self.stuck: set[str] = set()  # order ids whose cancel is never confirmed
+        self.no_expire: set[str] = set()  # GTD order ids the exchange never expires (the bot's cancel is the backstop)
         self.bid = D("92.03")
         self.ask = D("92.06")
         self.on_get_order: Callable[[], None] | None = None
@@ -112,6 +113,13 @@ class FakeExchange:
                 if self._clock() >= o.created + timedelta(seconds=delay):
                     o.plan.remove((delay, size, price))
                     self._fill(o, min(size, o.spec.base_size - o.filled), price)
+        if (
+            o.status == "OPEN"
+            and o.spec.end_time is not None
+            and self._clock() >= o.spec.end_time
+            and o.order_id not in self.no_expire
+        ):
+            o.status = "EXPIRED"  # a GTD order: the exchange itself ends it at ``end_time``
         if o.status == "OPEN" and o.cancel_polls is not None and o.order_id not in self.stuck:
             if o.cancel_polls >= self.cancel_lag:
                 o.status = "CANCELLED"

@@ -23,6 +23,8 @@ import yaml
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from modules.probe import limits as probe_limits
+
 log = structlog.get_logger(__name__)
 
 EXIT_CONFIG_ERROR: Final = 2
@@ -457,6 +459,89 @@ class LiveRampConfig(_Section):
     parity: ParityTolerance = ParityTolerance()
 
 
+# ------------------------------------------------------------------------------------------- exec probe
+
+
+class ExecProbeConfig(_Section):
+    """P4-pre, the minimum-size execution probe (spec 2.15). Off by default. Every number is bounded by a CONSTANT in
+    ``modules/probe/limits.py``: the configuration can only lower a limit (or raise the ``sl_floor_ratio`` floor).
+    The enabling of the real run needs three more acts outside this file (``modules/probe/gate.py``)."""
+
+    enabled: bool = False
+    product: str = probe_limits.PRODUCT
+    max_total_loss_quote: Decimal = Field(default=probe_limits.MAX_TOTAL_LOSS_QUOTE, gt=0)
+    max_entry_quote: Decimal = Field(default=probe_limits.MAX_ENTRY_QUOTE, gt=0)
+    test_order_quote: Decimal = Field(default=probe_limits.TEST_ORDER_QUOTE, gt=0)
+    max_daily_loss_quote: Decimal = Field(default=probe_limits.MAX_DAILY_LOSS_QUOTE, gt=0)
+    anomaly_loss_quote: Decimal = Field(default=probe_limits.ANOMALY_LOSS_QUOTE, gt=0)
+    tp_frac: Decimal = Field(default=probe_limits.TP_FRAC, gt=0, lt=1)
+    sl_frac: Decimal = Field(default=probe_limits.SL_FRAC, gt=0, lt=1)
+    horizon_min: int = Field(default=probe_limits.HORIZON_MIN, ge=1)
+    entry_timeout_s: int = Field(default=probe_limits.ENTRY_TIMEOUT_S, ge=120)
+    gtd_grace_s: float = Field(default=probe_limits.GTD_GRACE_S, gt=0)
+    max_atr1h_bps: float = Field(default=probe_limits.MAX_ATR1H_BPS, gt=0)
+    max_spread_bps: float = Field(default=probe_limits.MAX_SPREAD_BPS, gt=0)
+    quote_max_age_s: float = Field(default=probe_limits.QUOTE_MAX_AGE_S, gt=0)
+    max_consecutive_sl: int = Field(default=probe_limits.MAX_CONSECUTIVE_SL, ge=1)
+    max_watchdog_exits: int = Field(default=probe_limits.MAX_WATCHDOG_EXITS, ge=1)
+    max_entries_per_day: int = Field(default=probe_limits.MAX_ENTRIES_PER_DAY, ge=1)
+    max_entries_total: int = Field(default=probe_limits.MAX_ENTRIES_TOTAL, ge=1)
+    max_orders_per_day: int = Field(default=probe_limits.MAX_ORDERS_PER_DAY, ge=1)
+    bracket_open_alarm_s: float = Field(default=probe_limits.BRACKET_OPEN_ALARM_S, gt=0)
+    bracket_open_max_s: float = Field(default=probe_limits.BRACKET_OPEN_MAX_S, gt=0)
+    sl_fill_max_s: float = Field(default=probe_limits.SL_FILL_MAX_S, gt=0)
+    sl_floor_ratio: Decimal = Field(default=probe_limits.SL_FLOOR_RATIO, gt=0, le=1)
+    sl_slip_alarm_bps: float = Field(default=probe_limits.SL_SLIP_ALARM_BPS, gt=0)
+    sl_slip_severe_bps: float = Field(default=probe_limits.SL_SLIP_SEVERE_BPS, gt=0)
+    entry_slots_utc: tuple[str, ...] = tuple(
+        probe_limits.slot_label(t.hour, t.minute) for t in probe_limits.ENTRY_SLOTS_UTC
+    )
+    # The user did NOT accept an entry without an expiry date written by the exchange (plan sez. 10.1, punto 5):
+    # when the preview refuses GTD, the live stage refuses to go on until this is set after a new written acceptance.
+    accept_gtc_fallback: bool = False
+    db_path: str = "state/chronos_probe.db"
+    out_dir: str = "data/exec_probe"
+
+    @field_validator("product")
+    @classmethod
+    def _product_allowed(cls, v: str) -> str:
+        if v not in probe_limits.ALLOWED_PRODUCTS:
+            raise ValueError(f"product {v!r} is not in the probe allowlist {sorted(probe_limits.ALLOWED_PRODUCTS)}")
+        return v
+
+    @field_validator("entry_slots_utc")
+    @classmethod
+    def _slots_allowed(cls, v: tuple[str, ...]) -> tuple[str, ...]:
+        allowed = {probe_limits.slot_label(t.hour, t.minute) for t in probe_limits.ENTRY_SLOTS_UTC}
+        if not v or not set(v) <= allowed or len(set(v)) != len(v):
+            raise ValueError(f"entry_slots_utc must be a non-empty subset of {sorted(allowed)} without duplicates")
+        return v
+
+    @model_validator(mode="after")
+    def _only_lower_the_limits(self) -> ExecProbeConfig:
+        problems: list[str] = []
+        for name, cap in probe_limits.CAPS.items():
+            if getattr(self, name) > cap:
+                problems.append(f"{name}={getattr(self, name)} is above the hard limit {cap}")
+        for name, floor in probe_limits.FLOORS.items():
+            if getattr(self, name) < floor:
+                problems.append(f"{name}={getattr(self, name)} is below the hard floor {floor}")
+        if self.bracket_open_alarm_s > self.bracket_open_max_s:
+            problems.append("bracket_open_alarm_s cannot exceed bracket_open_max_s")
+        if self.sl_slip_alarm_bps > self.sl_slip_severe_bps:
+            problems.append("sl_slip_alarm_bps cannot exceed sl_slip_severe_bps")
+        if not self.max_daily_loss_quote <= self.anomaly_loss_quote <= self.max_total_loss_quote:
+            problems.append("max_daily_loss_quote <= anomaly_loss_quote <= max_total_loss_quote must hold")
+        if problems:
+            raise ValueError("; ".join(problems))
+        return self
+
+    @property
+    def confirm_value(self) -> str:
+        """What ``CHRONOS_EXEC_PROBE_CONFIRM`` must hold: ``<product>:<L_tot>`` (e.g. ``BTC-EUR:3.00``)."""
+        return f"{self.product}:{self.max_total_loss_quote:.2f}"
+
+
 # ----------------------------------------------------------------------------------------------- secrets
 
 
@@ -503,6 +588,7 @@ class AppConfig(_Section):
     execution: ExecutionConfig = ExecutionConfig()
     dry_run: DryRunConfig = DryRunConfig()
     live_ramp: LiveRampConfig = LiveRampConfig()
+    exec_probe: ExecProbeConfig = ExecProbeConfig()
     telemetry: TelemetryConfig = TelemetryConfig()
     coinbase: CoinbaseConfig = Field(default_factory=CoinbaseConfig)
 

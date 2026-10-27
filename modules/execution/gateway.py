@@ -197,6 +197,11 @@ ExecutionGateway = GatewayContract
 
 
 def entry_spec(intent: OrderIntent) -> OrderSpec:
+    end_time = (
+        intent.created_at + timedelta(seconds=intent.entry.time_in_force_s)
+        if intent.entry.expires_on_exchange
+        else None
+    )  # GTD (spec 2.15): the exchange expires the entry; every other caller gets the plain GTC it always got
     return OrderSpec(
         client_order_id=client_order_id(intent.decision_id, "entry"),
         book=intent.book,
@@ -206,6 +211,7 @@ def entry_spec(intent: OrderIntent) -> OrderSpec:
         base_size=intent.base_size,
         limit_price=intent.entry.limit_price,
         post_only=intent.entry.type == "limit_post_only",
+        end_time=end_time,
     )
 
 
@@ -503,6 +509,8 @@ class LiveExecutionGateway:
         confirm_poll_s: float = 1.0,
         max_cancel_rounds: int = 6,
         settle_attempts: int = 3,
+        gtd_grace_s: float = 30.0,
+        min_gtd_lead_s: float = 60.0,
     ) -> None:
         if not isinstance(guard, BalanceGuard):  # a look-alike or None is not the coverage circuit
             raise TypeError("LiveExecutionGateway needs a BalanceGuard")
@@ -530,6 +538,8 @@ class LiveExecutionGateway:
         self._confirm_poll_s = confirm_poll_s
         self._max_cancel_rounds = max_cancel_rounds
         self._settle_attempts = settle_attempts
+        self._gtd_grace_s = gtd_grace_s  # how long past ``end_time`` the exchange gets to report EXPIRED
+        self._min_gtd_lead_s = min_gtd_lead_s  # an ``end_time`` closer than this is refused without any effect
         self._pending: dict[str, _PendingEntry] = {}
         self._exit_locks: dict[str, asyncio.Lock] = {}
         self._contexts = EntryContexts()
@@ -677,6 +687,8 @@ class LiveExecutionGateway:
             return EntryResult("blocked", cid, reason="entry_already_pending")
         if position.is_long:
             return EntryResult("blocked", cid, reason="position_open")
+        if spec.end_time is not None and (spec.end_time - self._clock()).total_seconds() < self._min_gtd_lead_s:
+            return EntryResult("refused", cid, reason="end_time_too_close")  # nothing was reserved or sent
         plan = EntryPlan(
             intent.bracket.take_profit, intent.bracket.stop_loss, intent.bracket.k_tp, intent.bracket.k_sl,
             intent.bracket.atr,
@@ -703,6 +715,8 @@ class LiveExecutionGateway:
         assert sent.order_id is not None
         p.order_id = sent.order_id
         timeout_s = float(p.intent.entry.time_in_force_s)
+        if p.spec.end_time is not None:  # the exchange expires the order: wait for EXPIRED, cancel only as a backstop
+            timeout_s = max((p.spec.end_time - self._clock()).total_seconds(), 0.0) + self._gtd_grace_s
 
         async def on_info(info: OrderInfo) -> None:
             if info.filled_size > p.filled:  # the first fill already makes the position LONG
@@ -767,7 +781,9 @@ class LiveExecutionGateway:
             return filled("none", "position_not_recorded")
         size = sellable_base(position, self._balances, meta)
         reference = await self._best_bid(intent.product_id) or p.avg_price or intent.entry.limit_price
-        if not is_sellable(size, reference, meta):
+        # the stop leg sells at most at the SL: sellable at the bid but not at the stop is a bracket the exchange
+        # would refuse, which leaves the position uncovered (spec 2.15, sez. 4.1.6 regola 4)
+        if not is_sellable(size, min(reference, intent.bracket.stop_loss), meta):
             await self._booking.to_dust(intent.product_id, position.base_qty, p.cost + p.prev_dust_cost)
             log.info("entry_below_min_sell_size_is_dust", client_order_id=cid, qty=str(position.base_qty))
             return filled("dust")
@@ -809,6 +825,14 @@ class LiveExecutionGateway:
             size = min(floor_to(request.base_size, meta.base_increment), sellable_base(position, self._balances, meta))
             if size <= 0:
                 raise BracketNotPlaced("refused", "insufficient_balance", "no base is sellable")
+            bid = await self._best_bid(product)
+            if not is_sellable(size, min(bid, request.stop_loss) if bid is not None else request.stop_loss, meta):
+                if position.base_qty - size >= meta.base_increment:  # part of the base is reserved elsewhere
+                    raise BracketNotPlaced("refused", "below_min_sell_size", f"{size} of {position.base_qty} held")
+                cost = (position.avg_entry or request.stop_loss) * position.base_qty
+                await self._booking.to_dust(product, position.base_qty, cost)  # not sellable at the stop: dust
+                log.info("position_below_min_sell_size_at_stop_is_dust", product_id=product, qty=str(position.base_qty))
+                return
             decision_id = position.entry_decision_id or product
             n = 0
             while True:  # a bracket id used before (cancelled, rejected) is never reused

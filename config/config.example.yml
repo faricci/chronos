@@ -149,6 +149,38 @@ live_ramp:
   step_min_trades: 30
   parity: {max_median_entry_delta_bps: 10, min_bracket_outcome_agreement: 0.90}
 
+exec_probe:                           # P4-pre, spec 2.15: minimum-size real-money execution probe. OFF. The configuration can
+  enabled: false                      # only LOWER the hard limits of modules/probe/limits.py; the real run needs 3 more acts.
+  product: "BTC-EUR"
+  max_total_loss_quote: "3.00"        # L_tot
+  max_entry_quote: "3.00"             # Q_max (required_quote of one entry, coverage fee included)
+  test_order_quote: "2.00"
+  max_daily_loss_quote: "0.30"
+  anomaly_loss_quote: "0.50"
+  tp_frac: "0.006"
+  sl_frac: "0.006"
+  horizon_min: 480
+  entry_timeout_s: 1800               # GTD: the exchange expires the entry 30 minutes after it is sent
+  gtd_grace_s: 30
+  max_atr1h_bps: 60
+  max_spread_bps: 10
+  quote_max_age_s: 5
+  max_consecutive_sl: 2
+  max_watchdog_exits: 1
+  max_entries_per_day: 2
+  max_entries_total: 5
+  max_orders_per_day: 16
+  bracket_open_alarm_s: 10
+  bracket_open_max_s: 30
+  sl_fill_max_s: 60
+  sl_floor_ratio: "0.96"
+  sl_slip_alarm_bps: 15
+  sl_slip_severe_bps: 50
+  entry_slots_utc: ["09:00", "11:00"]
+  accept_gtc_fallback: false
+  db_path: "state/chronos_probe.db"
+  out_dir: "data/exec_probe"
+
 telemetry:                            # sez. 6.3: status.json, events, equity, ops of the day (never stops trading)
   enabled: true
   dir: "telemetry"                    # status.json

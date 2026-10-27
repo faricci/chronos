@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -35,7 +36,7 @@ class ProductMeta(BaseModel):
 class OrderSpec(BaseModel):
     """What the caller wants to send. It becomes an order body only through a ``CoverageTicket``.
 
-    kind=limit   -> ``limit_limit_gtc`` (BUY or SELL)
+    kind=limit   -> ``limit_limit_gtc`` (BUY or SELL); a BUY with ``end_time`` is ``limit_limit_gtd`` (spec 2.15)
     kind=bracket -> ``trigger_bracket_gtc`` (SELL only, standalone): ``limit_price`` is the take profit
     kind=market  -> ``market_market_ioc`` (SELL only)
     """
@@ -51,3 +52,4 @@ class OrderSpec(BaseModel):
     limit_price: Decimal | None = None
     stop_trigger_price: Decimal | None = None
     post_only: bool = False
+    end_time: datetime | None = None  # UTC, timezone-aware: the exchange expires the order (BUY limit only)

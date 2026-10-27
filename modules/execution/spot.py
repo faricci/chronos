@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final, Protocol
 
@@ -25,11 +26,12 @@ _PRODUCT_ID = re.compile(r"^[A-Z0-9]+-[A-Z]+$")
 
 TOP_LEVEL_KEYS: Final = frozenset({"client_order_id", "product_id", "side", "order_configuration"})
 _LIMIT_KEYS: Final = frozenset({"base_size", "limit_price", "post_only"})
+_GTD_KEYS: Final = frozenset({"base_size", "limit_price", "end_time", "post_only"})  # BUY only (spec 2.15)
 _BRACKET_KEYS: Final = frozenset({"base_size", "limit_price", "stop_trigger_price"})
 _MARKET_KEYS: Final = frozenset({"base_size"})
 # side -> order_configuration kind -> exact set of inner keys. The only orders Chronos can ever send.
 ORDER_MATRIX: Final[dict[str, dict[str, frozenset[str]]]] = {
-    "BUY": {"limit_limit_gtc": _LIMIT_KEYS},
+    "BUY": {"limit_limit_gtc": _LIMIT_KEYS, "limit_limit_gtd": _GTD_KEYS},
     "SELL": {
         "limit_limit_gtc": _LIMIT_KEYS,
         "trigger_bracket_gtc": _BRACKET_KEYS,
@@ -144,8 +146,18 @@ def assert_live_key_permissions(
 # -------------------------------------------------------------------------------- order shape
 
 
-def validate_structure(spec: OrderSpec) -> None:
-    """Shape of the order, independent of the product: side/kind matrix and required prices."""
+def validate_structure(spec: OrderSpec, now: datetime | None = None) -> None:
+    """Shape of the order, independent of the product: side/kind matrix and required prices.
+
+    ``end_time`` (a GTD order) is allowed for a BUY limit only and must be timezone-aware; with ``now`` given it must
+    also lie in the future (the gateway passes its clock, the guard has none)."""
+    if spec.end_time is not None:
+        if spec.side != "BUY" or spec.kind != "limit":
+            raise SpotViolation("end_time (GTD) is allowed only for a BUY limit order")
+        if spec.end_time.tzinfo is None or spec.end_time.utcoffset() is None:
+            raise SpotViolation("end_time must be timezone-aware (UTC)")
+        if now is not None and spec.end_time <= now:
+            raise SpotViolation(f"end_time {spec.end_time.isoformat()} is not in the future")
     if spec.kind not in _KIND_TO_CONFIG:
         raise SpotViolation(f"unknown order kind {spec.kind!r}")
     if spec.side == "BUY" and spec.kind != "limit":
@@ -185,6 +197,28 @@ def _plain(d: Decimal) -> str:
     return format(d, "f")
 
 
+def format_end_time(end_time: datetime) -> str:
+    """``YYYY-MM-DDTHH:MM:SSZ`` in UTC, seconds floored (the order never lives longer than asked)."""
+    return end_time.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+_END_TIME = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
+def _valid_end_time(value: Any) -> bool:
+    if not isinstance(value, str) or not _END_TIME.match(value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
+
+
+def _config_name(spec: OrderSpec) -> str:
+    return "limit_limit_gtd" if spec.kind == "limit" and spec.end_time is not None else _KIND_TO_CONFIG[spec.kind]
+
+
 def build_order_body(spec: OrderSpec) -> dict[str, Any]:
     """The ONE place an order body is made. Decimal strings, only keys of the allowed matrix."""
     validate_structure(spec)
@@ -195,6 +229,8 @@ def build_order_body(spec: OrderSpec) -> dict[str, Any]:
             "limit_price": _plain(spec.limit_price),
             "post_only": spec.post_only,
         }
+        if spec.end_time is not None:
+            inner["end_time"] = format_end_time(spec.end_time)
     elif spec.kind == "bracket":
         assert spec.limit_price is not None and spec.stop_trigger_price is not None
         inner = {
@@ -208,7 +244,7 @@ def build_order_body(spec: OrderSpec) -> dict[str, Any]:
         "client_order_id": spec.client_order_id,
         "product_id": spec.product_id,
         "side": spec.side,
-        "order_configuration": {_KIND_TO_CONFIG[spec.kind]: inner},
+        "order_configuration": {_config_name(spec): inner},
     }
     validate_body(body)
     return body
@@ -238,3 +274,5 @@ def validate_body(body: Mapping[str, Any]) -> None:
         raise SpotViolation(f"{kind} keys must be exactly {sorted(allowed)}, got {sorted(inner)}")
     if kind == "limit_limit_gtc" and side == "SELL" and inner["post_only"] is not False:
         raise SpotViolation("SELL limit orders are not post-only")
+    if kind == "limit_limit_gtd" and not _valid_end_time(inner["end_time"]):
+        raise SpotViolation(f"limit_limit_gtd end_time must be YYYY-MM-DDTHH:MM:SSZ, got {inner['end_time']!r}")
