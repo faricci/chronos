@@ -69,6 +69,29 @@ R1 di XRP-EUR per blocco di 1.440 stati: `extended_forward` (il 24-ott ha 1.439 
 e' fuori dai prodotti di training (R1 era gia' vicino al limite il 23-ott: 0,417% con max m 0,0198). BTC, ETH e SOL, i tre
 prodotti di training, passano tutti i criteri.
 
+## Addendum (2026-10-26, dopo il fallimento su XRP-EUR): P0 sui tre prodotti del modello
+
+Decisione dell'UTENTE, presa DOPO aver visto il `fail` di XRP-EUR: il criterio P0 "barre REST" si certifica su BTC-EUR, ETH-EUR e
+SOL-EUR, l'universo reale del modello (`model_card.data.products`). XRP-EUR non fa parte del training: sta nel dry run come prova
+fuori campione e resta SOLO diagnostica, non entra nel criterio P0. Ragioni: il criterio serve a dire se i dati che il modello
+consuma sono stabili; per un prodotto che il modello non serve non c'e' skew train/serve da proteggere; e XRP ha una struttura di
+mercato diversa (65 minuti rivisti su 2.880, 3,4%, contro 4-21 degli altri). La restrizione e' una scelta di perimetro dichiarata,
+presa dopo il risultato e non prima: lo si scrive qui perche' non sembri una regola pre-registrata.
+
+Il risultato su XRP-EUR resta conservato e non si riscrive: `data/reports/p0_bars_certification_dry_2026-10-24_2026-10-25.json`
+(sha256 `88261afc...`), R1 `fail` (blocco `extended_forward` 12/1.440 = 0,83% contro 0,5%; 16 stati spostati su 2.880; max m 0,0157;
+R2 e R4 pass). XRP-EUR continua a essere misurato ogni notte da L0 (`bars.XRP-EUR.revision_impact`) come diagnostica.
+
+Seconda corsa (UNA, stesso comando con `--products BTC-EUR ETH-EUR SOL-EUR`, file nuovo
+`data/reports/p0_bars_certification_dry_2026-10-24_2026-10-25_btc_eth_sol.json`, sha256 `4405a21b...`): **`p0_bars_criterion` = `pass`**
+(exit 0, anche con la regola v1). 2.880 stati per prodotto, R1 pass con 0 stati spostati, R2 pass (max m 0,0037 / 0,0046 / 0,0028),
+R4 pass (0 minuti comparsi o scomparsi), R3 `unmeasured` (non fa parte di P0). Revisioni di valore: 4 / 21 / 6 minuti.
+
+Altre due decisioni dell'utente dello stesso giorno: (a) `gate_ops.window_start` (chiave di config, default null): i giorni precedenti
+non entrano nella finestra del gate; per il dry run il primo giorno intero sotto supervisore e' il 2026-10-24; (b) il controllo delle
+barre duplicate o fuori ordine di `OpsRecorder` e' per-processo (a un riavvio la coda flat ripubblicata non e' un'anomalia); il file ops
+del 23-ott non si ricalcola.
+
 ## Allegato: CONFLITTO P1g
 
 # CONFLITTO P1g - calibrazione di p_edge sugli esiti in un gate richiesto per P3

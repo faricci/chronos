@@ -277,3 +277,12 @@ def test_btc_stale_keys_defaults(tmp_path: Path) -> None:
     for key, value in (("max_btc_stale_share", 1.5), ("max_btc_stale_shift", 0.0), ("max_btc_stale_shift", 1.0)):
         with pytest.raises(ConfigError):
             load_config(_write(tmp_path, {"dry_run": {"gate_ops": {key: value}}}))
+
+
+def test_gate_window_start_default_and_yaml(tmp_path: Path) -> None:
+    """``dry_run.gate_ops.window_start``: null by default (nothing changes), an ISO date from the YAML."""
+    from datetime import date
+
+    assert AppConfig().dry_run.gate_ops.window_start is None
+    cfg = load_config(_write(tmp_path, "dry_run:\n  gate_ops:\n    window_start: 2026-10-24\n"))
+    assert cfg.dry_run.gate_ops.window_start == date(2026, 10, 24)

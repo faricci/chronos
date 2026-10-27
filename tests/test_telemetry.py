@@ -430,6 +430,30 @@ async def test_a_restart_on_the_same_day_continues_the_counts(tmp_path: Path) ->
     assert len(doc["kill_switch_trips"]) == 2  # the same guard tripping again in the new run is a new trip
 
 
+async def test_a_restart_with_a_flat_tail_is_not_an_order_anomaly(tmp_path: Path) -> None:
+    """The order check is per process: after a restart the engine republishes the flat minutes the file of the day
+    already holds (older than its last bar). That is not a duplicate and not out of order; a real one still is."""
+    clock = Clock()
+    first = recorder(tmp_path, clock)
+    first.start()
+    t = datetime(2026, 10, 19, 9, 0, tzinfo=UTC)
+    for i in range(4):
+        first.observe_bar(bar_event("SOL-EUR", t + timedelta(minutes=i)))
+    first.stop()
+    await first.flush()
+    clock.advance(seconds=30)
+    second = recorder(tmp_path, clock)
+    second.start()
+    for i in (1, 2, 3, 4):  # the tail of the first run is published again, flat, then the new minute
+        second.observe_bar(bar_event("SOL-EUR", t + timedelta(minutes=i), source="flat"))
+    b = second.today()["bars"]["SOL-EUR"]
+    assert (b["duplicates"], b["out_of_order"]) == (0, 0) and b["rest"] == 4 and b["flat"] == 4
+    second.observe_bar(bar_event("SOL-EUR", t + timedelta(minutes=4)))  # inside the same process: a duplicate
+    second.observe_bar(bar_event("SOL-EUR", t + timedelta(minutes=2)))  # and an old one
+    b = second.today()["bars"]["SOL-EUR"]
+    assert (b["duplicates"], b["out_of_order"]) == (1, 1)
+
+
 async def test_a_failing_write_is_retried_at_the_next_flush(tmp_path: Path) -> None:
     clock = Clock()
     blocker = tmp_path / "ops"

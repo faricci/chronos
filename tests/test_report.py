@@ -1279,3 +1279,23 @@ def test_watch_alarm_in_alarms_not_anomalies_not_gate(tmp_path: Path) -> None:
     text = (tmp_path / "out" / "2026-10-17.md").read_text(encoding="utf-8")
     assert "criteri not_covered (non certificati): feature_drift" in text
     assert "feature_drift not_testable (PSI_V3_VOLSTD respinta, definitivo) | watch: ALARM on SOL-EUR" in text
+
+
+def test_gate_window_start_leaves_out_the_days_before(tmp_path: Path) -> None:
+    """``gate_ops.window_start``: the days before it are not in the window of the gate (here the 16th, the day of a
+    crash, does not weigh on a window that starts on the 17th); without it the window is the last ``--days`` days."""
+    (tmp_path / "ops").mkdir()
+    (tmp_path / "ops" / "2026-10-16.json").write_text(json.dumps({"uptime": 0.5, "crashes": 3}), encoding="utf-8")
+    (tmp_path / "ops" / "2026-10-17.json").write_text(json.dumps({"uptime": 0.999, "crashes": 0}), encoding="utf-8")
+    paths = build(tmp_path).paths
+    free = DryReporter(DryRunConfig(), paths, Trades([]), JsonOpsSource(tmp_path / "ops")).generate(DAY1, 2)
+    assert [d["date"] for d in free["daily"]] == ["2026-10-16", "2026-10-17"]
+    assert crit(free["gate_ops"], "zero_crashes")["status"] == "fail"
+    cfg = DryRunConfig(gate_ops=GateOpsConfig(window_start=DAY1))
+    cut = DryReporter(cfg, paths, Trades([]), JsonOpsSource(tmp_path / "ops")).generate(DAY1, 2)
+    assert [d["date"] for d in cut["daily"]] == ["2026-10-17"] and cut["gate_ops"]["days"] == 1
+    assert crit(cut["gate_ops"], "zero_crashes")["status"] == "pass"
+    assert crit(cut["gate_ops"], "uptime")["value"] == 0.999
+    late = DryReporter(DryRunConfig(gate_ops=GateOpsConfig(window_start=DAY1 + timedelta(days=5))), paths,
+                       Trades([]), JsonOpsSource(tmp_path / "ops")).generate(DAY1, 2)  # fmt: skip
+    assert late["daily"] == [] and late["gate_ops"]["status"] == "IN_PROGRESS"

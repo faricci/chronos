@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import sys
 from collections.abc import Mapping
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Final, Literal
@@ -357,6 +358,10 @@ class LearnerConfig(_Section):
 
 
 class GateOpsConfig(_Section):
+    # First UTC day that counts for the gate (uptime, crashes and every other criterion): the days before it are left
+    # out of the window of ``report``. Default null = no restriction (the window is the last ``--days`` days). The dry
+    # run sets the first whole day under the supervisor, so that the days before it do not weigh on the gate.
+    window_start: date | None = None
     min_days: int = Field(default=7, ge=1)
     min_uptime: float = Field(default=0.99, gt=0, le=1)
     min_decision_parity: float = Field(default=0.99, gt=0, le=1)

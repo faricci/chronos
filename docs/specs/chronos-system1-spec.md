@@ -106,6 +106,7 @@ Changelog 2.13 (regola PSI-v3 e contesto BTC con policy non tarabile, conflitto 
 Changelog 2.14 (chiusura di `feature_drift` con PSI-v3 respinta, conflitto P1g; decisione in `docs/decisions/2026-10-26-p1g-chiusura-drift.md`):
 - `feature_drift` con PSI-v3 respinta (`not_testable`, definitivo per la versione): il criterio assume lo stato `not_covered` (non certificato, non e' mai `pass`, non blocca G-DRY-OPS, e' elencato in `gate_ops.not_covered`) se in OGNI giorno della finestra la sorveglianza `feature_drift_watch` e' misurata per ogni prodotto e la diagnostica `support` e il PSI di `p_edge` sono presenti; altrimenti `unmeasured`. La sorveglianza usa `reference_diagnostic` e `c_diagnostic` della corsa respinta con la stessa `window_stat`, e' solo un avviso (`alarms`: `feature_drift_watch:<prodotto>`) e dichiara i falsi allarmi fuori campione (`watch.false_alarm_oos`); nessuna costante di PSI toccata. La regola vale per ogni champion presente e futuro, fissata prima dei loro dati;
 - `python -m modules.dryrun.revision_impact certify --days START END --products ...` certifica il criterio P0 "barre REST" sui giorni UTC interi del dry run (finestra `[START 00:00Z, END+1 00:00Z)`, stesso calcolo del modo soak, chiave `dry_run_days` al posto del soak report);
+- il criterio P0 "barre REST" si certifica sui tre prodotti del modello (BTC-EUR, ETH-EUR, SOL-EUR; decisione dell'utente dopo il `fail` di XRP-EUR, che resta diagnostica): `pass` sui giorni 24-25 ott del dry run (`p0_bars_certification_dry_2026-10-24_2026-10-25_btc_eth_sol.json`); `gate_ops.window_start` (data, default null) esclude dalla finestra del gate i giorni precedenti; il controllo delle barre duplicate o fuori ordine dell'`OpsRecorder` e' per-processo;
 - differito a P4 (solo spec, nessun codice): `decider` nel `DecisionRecord`, `flips_basis` su R3, calibrazione di `p_edge` in G-DRY-ECON, guardia `drift` per prodotto per le versioni `not_covered`, stop di calibrazione in R0 (dettaglio in 5.1.7).
 
 ---
@@ -1686,6 +1687,7 @@ dry_run:
     min_days: 7
     min_uptime: 0.99
     min_decision_parity: 0.99
+    window_start: null                 # primo giorno UTC contato dal gate (2.14); null = ultimi `--days` giorni
     max_feature_psi: 0.10              # ALLARME della diagnostica `feature_psi_daily_v1` (P1f), non un gate
     max_btc_stale_share: 0.005         # btc_context_alignment: quota massima di stati alt con contesto BTC di un altro istante
     max_btc_stale_shift: 0.01          # ... e spostamento massimo m delle risposte del modello fra stato servito e allineato
@@ -2440,7 +2442,7 @@ Perimetro: fase locale a costo zero (C8). L'infrastruttura cloud e il fine-tunin
 
 | Fase | Contenuto | Criterio di uscita |
 |------|-----------|--------------------|
-| P0 Fondamenta | Sez. 0.5: config pydantic, `CostModel`, backfill storico in Parquet, indicatori batch e incrementali, barre, market stream WS + `LocalOrderBook`, ledger SQLite, recorder WS. Probe rieseguito con la key View. | Criterio di uscita della sez. 0.5 (barre REST: R1 su blocchi di 1.440 stati, R2 e R4 della sez. 5.1.7, non il rapporto di minuti rivisti; certificabile sui giorni UTC interi del dry run con `revision_impact certify --days`). |
+| P0 Fondamenta | Sez. 0.5: config pydantic, `CostModel`, backfill storico in Parquet, indicatori batch e incrementali, barre, market stream WS + `LocalOrderBook`, ledger SQLite, recorder WS. Probe rieseguito con la key View. | Criterio di uscita della sez. 0.5 (barre REST: R1 su blocchi di 1.440 stati, R2 e R4 della sez. 5.1.7, non il rapporto di minuti rivisti; certificabile sui giorni UTC interi del dry run con `revision_impact certify --days`, sui prodotti del modello; certificato `pass` il 2026-10-26 sui giorni 24-25 ott). |
 | P1 Fattibilita', dati e baseline | `training/feasibility.py` **per primo**; poi sez. 1 (sentiment live, in raccolta) + sez. 3 parte CPU: label triple-barrier, split purgati, `BaselineDecider` LightGBM, backtest con `BarFillModel`. | Lo studio di fattibilita' trova una combinazione con lift richiesto <= 0.10 (altrimenti stop, sez. 3.1.3); backtest walk-forward con PnL netto > 0 su >= 3/5 fold e sull'holdout; un fold o un holdout senza trade ha PnL 0 e non e' positivo (sez. 3.4). |
 | P2 Decision + Risk | Sez. 2 e sez. 4 completi, con `ShadowExecutionGateway` come unico gateway istanziabile. | Test e2e verdi; `test_dry_never_writes` verde. |
 | P3 Dry run | Sez. 5: book paralleli, label resolver, learner notturno, report. Esecuzione continua in locale. Etichettatura del sentiment (sez. 1.1.2) a meta' della prima settimana. | G-DRY-OPS superato (minimo 7 giorni; con `feature_drift` `unmeasured` o `not_testable` G-DRY-OPS e' al massimo INCOMPLETE e non chiude P3; `not_covered` non blocca). G-DRY-ECON continua a maturare. |

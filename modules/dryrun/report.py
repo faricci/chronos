@@ -1370,6 +1370,9 @@ class DryReporter:
         """Daily documents for the ``days`` UTC days ending at ``end`` (included), the two gates, and the files."""
         self._trades = self.trades.load()
         window = [end - timedelta(days=i) for i in range(days - 1, -1, -1)]
+        first = self.cfg.gate_ops.window_start  # declared in the config: the days before it do not count
+        if first is not None:
+            window = [d for d in window if d >= first]
         docs = [self.build_day(d) for d in window]
         champion = book or CHAMPION
         starting = {bc.name: bc.starting_quote for bc in self.cfg.books}

@@ -124,6 +124,7 @@ dry_run:
     min_days: 7
     min_uptime: 0.99
     min_decision_parity: 0.99
+    # window_start: 2026-10-24         # first UTC day counted by the gate (default: none; the dry run uses its first supervised day)
     max_feature_psi: 0.10             # ALARM of the diagnostic feature_psi_daily_v1 (conflict P1f), not a gate
     max_btc_stale_share: 0.005        # btc_context_alignment: max share of alt states with a BTC context of another instant
     max_btc_stale_shift: 0.01         # ... and max shift m of the model answers between the served and the aligned state
