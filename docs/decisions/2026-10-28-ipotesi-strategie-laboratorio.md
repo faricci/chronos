@@ -255,3 +255,44 @@ Perimetro e tracciabilita':
 - Secondo gate: F1-F6 al posto di "G-DRY-ECON superato senza modifiche"; nuovo F5 per A (drawdown <= HODL in forward).
 - Forward di B: esecuzione taker e settimo book B0.
 - Invariati: tutte le finestre, soglie e livelli di segnale (50/20, R28 e 0,05, 720 h, 3 sigma4h, L, 2 e 3 sigma4h, 4 h, 24 h, 30/180, q 20%, 30/15, 60 barre), i minimi offline, le regole GO/NO-GO della sez. 4 (salvo l'ultimo punto), tutto il braccio L.
+
+## 11. ERRATA CORRIGE E11 (2026-10-28, trader-quant): potenza di C e D e verdetto a priori
+
+Perimetro e tracciabilita':
+- Scritta DOPO il solo conteggio dei SEGNALI di C e D nel training del braccio U (`script/count_signals_cd.py`, commit dbd7b01: nessun rendimento, nessuna uscita simulata, holdout non letto; dettagli in `.claude/CONFLITTO_CD.md`) e PRIMA di qualunque calcolo di esito di C e D.
+- Dove questa sezione contraddice le sez. 3-5 o la sez. 10 per C e D, vale questa sezione. Non tocca A, B, i parametri di segnale, i minimi e le regole GO/NO-GO della sez. 4, ne' E1-E10 salvo dove indicato.
+- Richiede la presa d'atto dell'utente.
+
+### E11.1 Conteggi (training braccio U)
+
+- C: 147 unita' di segnale [M]; unita' di trade stimate 75-100 (fill 50-70%, posizione unica) [S]. Holdout stimato: 81 segnali, 40-56 trade [S].
+- D: 73-125 unita' (limiti inferiore e superiore delle convenzioni di conteggio) [M]; holdout stimato 40-69 [S].
+
+### E11.2 I minimi erano stimati in difetto
+
+- C: con s 1,8% e delta 0,4% (sez. 3.C) la formula della sez. 1 da' n_min = 9,5 x (1,8 / 0,4)^2 = 192 [D]: il minimo 150 era l'estremo basso della frequenza attesa, non n_min. Inoltre s 1,8% riflette la volatilita' EUR 2023-2026; nel 2016-2020 sigma1h e' ~1,5-2 volte maggiore [S] e il payoff a barriere (+4 / -6 sigma1h, tempo 24 h) implica s ~3,5-5 sigma1h [D], cioe' s ~2,5-4% [S]. Con s 3%: n_min ~530 [D].
+- D: n_min 152 con s 4% e delta 1% [D], coerente; ma delta 1% netto = 2,1% lordo per trade (ottimistico) e per tenute di 3-10 giorni nel 2016-2020 s ~6-8% [S]. Con s 7%: n_min ~470 [D].
+- Conclusione: nessun argomento statistico, indipendente dall'esito, per abbassare i minimi; il calcolo indica che andavano alzati. I minimi della sez. 4 restano invariati.
+
+### E11.3 Potenza effettiva [D]
+
+Una coda, alpha 0,0125, potenza = Phi(delta / s x sqrt(n) - 2,24).
+
+| Ipotesi | delta | s | n basso | n centrale | n alto |
+|---|---|---|---|---|---|
+| C | 0,4% | 1,8% | 0,38 (75) | 0,49 (100) | 0,67 (147, solo segnali) |
+| C | 0,4% | 3% [S] | 0,14 | 0,18 | 0,27 |
+| D | 1% | 4% | 0,46 (73) | 0,60 (100) | 0,71 (125) |
+| D | 1% | 7% [S] | 0,15 | 0,21 | 0,26 |
+
+Con effetti pari alla meta' di quelli della sez. 3 la potenza scende al 5-20% [D].
+
+### E11.4 Decisione
+
+1. C e D: INCONCLUSO per n sotto il minimo in training (sez. 4 come scritta), dichiarato ora, prima di qualunque calcolo di esito. Nessun GO ne' CANDIDATO offline per C e D.
+2. Nessun rendimento di C o D si calcola, ne' in training ne' in holdout, neppure come esplorativo: la simulazione di esito di `script/study_cd.py` (sez. 10) non si esegue.
+3. Holdout U 2021-01-01 .. 2023-09-30 per C e D: non letto e riservato. Utilizzabile solo da una futura pre-registrazione confermativa scritta prima della lettura, con parametri di segnale invariati e n_min ricalcolato con s misurata in cieco (punto 4).
+4. Facoltativa, su decisione dell'utente: una sola corsa in cieco sul training che scrive esclusivamente s (deviazione standard del netto per unita', ddof 1), numero di unita' di trade, tasso di fill di C e di C0. Vietato calcolare o scrivere media, mediana, somma, segno, t, p, quote di uscita a target/stop/tempo, hit rate, equity, PnL per anno. Uso unico: n_min = 9,5 x (s / delta)^2 con delta della sez. 3; se n_min supera le unita' ottenibili su holdout U + forward, C e D si chiudono per futilita'.
+5. Allargamento del campione, valutato e non adottato: altre monete USD 2016-2020 (LTC-USD, BCH-USD, ETC-USD [S]) aggiungono ~10-30 unita' di trade [S] per la correlazione dei crolli fra monete (198 eventi BTC + ETH = 147 unita' [M]), potenza C 0,43-0,62 con s 1,8% e 0,16-0,24 con s 3% [D]; barre 5m non aggiungono eventi (regole su 1h/4h, deduplica 24 h) e cambierebbero l'ipotesi; storia piu' lunga richiede altri exchange (venue, licenza); unire l'holdout al training da' per C 0,56-0,70 con s 1,8% e 0,21-0,30 con s 3% [D] e brucia l'unico holdout pulito.
+6. Forward: book C, C0, D come E1-E9; con verdetto INCONCLUSO lo sguardo e' descrittivo (E2) e non autorizza capitale. q20 di D (uscita di training, non esito) copiati congelati nel book D (E5): BTC-USD 0,5966; ETH-USD 0,6162; SOL-EUR 0,7192 [M].
+7. Con A, B, C e D INCONCLUSO la famiglia primaria non produce alcun GO offline; nessun book di laboratorio puo' arrivare al capitale reale con le regole attuali.
