@@ -116,3 +116,10 @@ Rules:
 - Un test con tempo finto in cui piu' task dormono sullo stesso orologio che avanza a ogni `sleep` fa correre il tempo a velocita' diverse e rende i test instabili. Per gli scenari con piu' cicli serve un tempo scalato coerente (`ScaledClock`: `sleep(s)` dorme davvero `s/scala`); i cicli con attese REALI dentro (riconciliatore, `asyncio.wait_for`) vanno regolati nella config del test.
 
 - 2026-10-28 (primo contatto reale, stadio preview): l endpoint `preview_order` di Coinbase risponde 400 "unknown field client_order_id". I fake accettavano qualsiasi corpo, quindi nessun test lo vedeva. Regola: ogni payload verso un endpoint nuovo va confrontato con lo schema reale dell SDK/API prima del primo contatto, e i fake devono rifiutare i campi non previsti; il primo stadio reale (preview, a costo zero) serve proprio a trovare queste differenze.
+
+## Il minimo di unita' di una pre-registrazione va calibrato sul CONTEGGIO dei segnali, non su una stima [S]
+
+- Due studi pre-registrati su due (volume 2026-10-26, trend/rotazione 2026-10-28) sono finiti INCONCLUSO per n sotto il minimo: la frequenza stimata a mano (A: 5-8 trade per moneta all'anno) era il doppio di quella osservata (circa 2,5), e 27 trade contro il minimo 30 hanno reso inutilizzabile un training con p grezzo 0,0005.
+- Regola: prima di congelare un minimo di n, contare i segnali (non i rendimenti: il conteggio non guarda l'esito) sul solo training con lo stesso codice, e fissare il minimo in funzione del conteggio e della potenza; scrivere nel documento la definizione esatta di "trade" (periodo di possesso o cambio di posizione) e come entra un test sotto-minimo nella correzione di Holm.
+- Dopo un esito INCONCLUSO per n non si abbassa il minimo ne' si rilancia sugli stessi dati: l'holdout e' consumato, resta solo il dato forward.
+
