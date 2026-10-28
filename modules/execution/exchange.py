@@ -642,6 +642,9 @@ class CoinbaseExchange:
     async def preview_order(self, spec: OrderSpec) -> PreviewResult:
         """``POST /orders/preview``: validates the body with the exchange without creating an order or a hold."""
         payload = build_order_body(spec)
+        # The preview endpoint rejects ``client_order_id`` (400 "unknown field"): a preview creates nothing, so it
+        # has no idempotency key. The id still labels the call for logging (``tag``); it is not sent.
+        payload.pop("client_order_id")
         try:
             data = await self._write("preview_order", self._client.preview_order, spec.client_order_id, **payload)
         except ExchangeRequestError as exc:

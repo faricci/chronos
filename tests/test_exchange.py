@@ -360,7 +360,8 @@ async def test_the_public_methods_that_post_or_delete_are_exactly_the_marked_one
                 and "convert" not in path
             )
             if name in ("create_order", "preview_order"):
-                assert body is not None and set(body) == TOP_LEVEL_KEYS  # no leverage, margin or attached orders
+                expected = TOP_LEVEL_KEYS - {"client_order_id"} if name == "preview_order" else TOP_LEVEL_KEYS
+                assert body is not None and set(body) == expected  # no leverage, margin or attached orders
     assert writers == write_methods(CoinbaseExchange)
 
 
@@ -682,7 +683,10 @@ async def test_preview_sends_the_validated_body_and_reports_errors() -> None:
                                   "errs": [{"message": "PREVIEW_INSUFFICIENT_FUND"}], "warning": []})  # fmt: skip
     res = await ex.preview_order(buy())
     assert res.errors == ("PREVIEW_INSUFFICIENT_FUND",) and res.commission_total == D("0.01")
-    assert client.calls == [("preview_order", build_order_body(buy()))]
+    # the real endpoint answers 400 "unknown field client_order_id" if it is sent (found by the first live preview)
+    sent = {k: v for k, v in build_order_body(buy()).items() if k != "client_order_id"}
+    assert client.calls == [("preview_order", sent)]
+    assert "client_order_id" not in client.calls[0][1]
     with pytest.raises(SpotViolation):  # the body check applies to previews as well
         await ex.preview_order(sell(kind="market").model_copy(update={"side": "BUY"}))
     assert client.count("preview_order") == 1
