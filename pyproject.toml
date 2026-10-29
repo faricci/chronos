@@ -43,8 +43,6 @@ extend-exclude = [
     "modules/trading_logic.py",
     "modules/utils.py",
     "modules/vector_storage.py",
-    "main.py",
-    "test.py",
     "script/train_timeseries_model.py",
     "tests/test_data_fetch.py",
     "tests/test_data_preprocessing.py",

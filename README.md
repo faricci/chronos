@@ -52,6 +52,27 @@ script/             studies, soaks, supervisor and tools
 tests/              test suite (includes wiring "tripwires" that forbid leverage and unguarded order paths)
 ```
 
+## How the model learns
+
+The training code is in [`training/`](training/); the nightly refit hook is `modules/dryrun/learner.py`.
+
+1. **Examples.** Every past moment of the 1-minute Coinbase candles (about 3 years) becomes one example described by indicators
+   (returns, RSI, ATR, realised volatility, MACD, volume z-score, BTC context for ETH/SOL, ...). Only past data is used.
+2. **Labels (triple barrier).** From each moment a long entry is simulated with a take-profit at 3 ATR and a stop at 1.5 ATR,
+   for at most 15 days. The label says which barrier was hit first, with real fees and spread already charged.
+3. **Models.** Three small LightGBM models: action (buy / wait / sell), expected edge, volatility regime. Probabilities are
+   calibrated out-of-fold (Platt) so that "70%" means about 70%.
+4. **No look-ahead.** Training is purged walk-forward (a gap between train and validation folds). The most recent months
+   (holdout, from 2026-06-20) are used only once, at the end.
+5. **Gates.** Written before looking at results: holdout similar to training, calibrated probabilities, beats a naive
+   baseline in at least 4 of 5 folds, and a statistically real net gain after costs (GE). A model that fails does not move on.
+6. **Nightly learner (dry run).** At 00:15 UTC it audits live-versus-batch parity and the drift report; it can rebuild the
+   dataset and refit a challenger, which is promoted only if it passes the promotion rule (at least 30 trades, positive PnL,
+   drawdown at most 5%, 14 shadow days). No challenger has ever been promoted.
+
+Current result: the champion (trained 2026-10-18) fails GE, so with the policy thresholds that survive validation it opens no
+trades. See [`docs/decisions/`](docs/decisions/) for the studies that followed.
+
 ## Running
 
 Python 3.14 and a virtual environment.
