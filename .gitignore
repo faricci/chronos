@@ -53,7 +53,8 @@ data/live_labels/
 data/events/
 data/equity/
 data/reports/
-telemetry/
+/telemetry/
+/data/telemetry/
 models/registry/
 data/backup/
 state/
@@ -69,5 +70,4 @@ data/labels/
 models/baseline/
 data/backtest_cache/
 
-docs/STATO.md
 data/external/

@@ -5,8 +5,9 @@
 $ErrorActionPreference = "Stop"
 Set-Location (Split-Path -Parent $PSScriptRoot)
 $py = ".\.venv\Scripts\python.exe"
-$cfg = "C:\Users\faric\Documents\sviluppo\chronos-probe\config.yml"
-$key = "C:\Users\faric\chronos-keys\probe.json"
+# Percorsi di default; si possono sovrascrivere con le variabili d'ambiente CHRONOS_PROBE_CONFIG e CHRONOS_PROBE_KEY.
+$cfg = if ($env:CHRONOS_PROBE_CONFIG) { $env:CHRONOS_PROBE_CONFIG } else { Join-Path (Split-Path -Parent (Get-Location).Path) "chronos-probe\config.yml" }
+$key = if ($env:CHRONOS_PROBE_KEY) { $env:CHRONOS_PROBE_KEY } else { Join-Path $env:USERPROFILE "chronos-keys\probe.json" }
 
 Remove-Item Env:COINBASE_API_KEY, Env:COINBASE_API_SECRET -ErrorAction SilentlyContinue
 $env:CHRONOS_LIVE_CONFIRM = "I_ACCEPT_REAL_ORDERS"

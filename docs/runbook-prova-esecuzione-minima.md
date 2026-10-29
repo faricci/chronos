@@ -8,18 +8,18 @@ Il piano completo e le tue risposte sono in `docs/decisions/2026-10-26-p4-prova-
 
 1. Portafoglio dedicato su Coinbase con circa 5 euro (non di piu').
 2. Chiave nuova (Coinbase, sezione sviluppatori / API): permessi di VISTA e di SCAMBIO, NESSUN permesso di prelievo o trasferimento, legata al solo portafoglio dedicato, con il tuo indirizzo IP nell'elenco consentito. Scarica il file.
-3. Metti il file FUORI dalla cartella del progetto, per esempio `C:\Users\faric\chronos-keys\probe.json`. Va bene il JSON scaricato cosi' com'e', oppure un file di testo con due righe: `COINBASE_API_KEY=...` e `COINBASE_API_SECRET="-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----\n"`. Il programma rifiuta un file dentro la cartella del progetto.
+3. Metti il file FUORI dalla cartella del progetto, per esempio `<CARTELLA-CHIAVI>\probe.json`. Va bene il JSON scaricato cosi' com'e', oppure un file di testo con due righe: `COINBASE_API_KEY=...` e `COINBASE_API_SECRET="-----BEGIN EC PRIVATE KEY-----\n...\n-----END EC PRIVATE KEY-----\n"`. Il programma rifiuta un file dentro la cartella del progetto.
 4. Nel file `.env` del progetto deve restare la chiave di SOLA LETTURA del dry run. La chiave di scambio non va mai li'.
 5. Windows: sospensione disattivata nei giorni di prova (Impostazioni, Sistema, Alimentazione). PC acceso e tu presente dalle 10:00 alle 20:30 ora italiana (giorni feriali).
-6. Cartella e file di configurazione della prova, separati dal dry run. Crea `C:\Users\faric\Documents\sviluppo\chronos-probe\config.yml`:
+6. Cartella e file di configurazione della prova, separati dal dry run. Crea `<CARTELLA-PROVA>\config.yml`:
 
 ```yaml
 paths:
-  state_dir: "C:/Users/faric/Documents/sviluppo/chronos-probe/state"
+  state_dir: "<CARTELLA-PROVA>/state"
 exec_probe:
   enabled: true
-  db_path: "C:/Users/faric/Documents/sviluppo/chronos-probe/state/chronos_probe.db"
-  out_dir: "C:/Users/faric/Documents/sviluppo/chronos-probe/out"
+  db_path: "<CARTELLA-PROVA>/state/chronos_probe.db"
+  out_dir: "<CARTELLA-PROVA>/out"
 ```
 
 Non cambiare nient'altro: i limiti (3 euro, 0,30 al giorno, 0,50 in totale, 5 ordini, 2 al giorno) sono nel codice e la configurazione puo' solo abbassarli.
@@ -29,13 +29,13 @@ Non cambiare nient'altro: i limiti (3 euro, 0,30 al giorno, 0,50 in totale, 5 or
 Apri PowerShell, entra nella cartella del progetto e prepara il terminale (queste variabili valgono solo in questa finestra):
 
 ```powershell
-cd C:\Users\faric\Documents\sviluppo\chronos
+cd <CARTELLA-PROGETTO>
 .\.venv\Scripts\Activate.ps1
 Remove-Item Env:COINBASE_API_KEY, Env:COINBASE_API_SECRET -ErrorAction SilentlyContinue
 $env:CHRONOS_LIVE_CONFIRM = "I_ACCEPT_REAL_ORDERS"
 $env:CHRONOS_EXEC_PROBE_CONFIRM = "BTC-EUR:3.00"
-$CFG = "C:\Users\faric\Documents\sviluppo\chronos-probe\config.yml"
-$KEY = "C:\Users\faric\chronos-keys\probe.json"
+$CFG = "<CARTELLA-PROVA>\config.yml"
+$KEY = "<CARTELLA-CHIAVI>\probe.json"
 ```
 
 Se nell'ambiente c'e' una chiave (`COINBASE_API_KEY`), il programma rifiuta di partire.
