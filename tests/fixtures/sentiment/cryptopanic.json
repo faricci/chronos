@@ -1,0 +1,19 @@
+{
+  "count": 2,
+  "results": [
+    {
+      "kind": "news",
+      "title": "Ethereum developers set date for next upgrade",
+      "published_at": "2026-10-17T13:00:00Z",
+      "url": "https://cryptopanic.com/news/1/eth-upgrade/",
+      "currencies": [{"code": "ETH", "title": "Ethereum"}, {"code": "XYZ", "title": "Unknown"}]
+    },
+    {
+      "kind": "news",
+      "title": "Markets await Fed decision",
+      "created_at": "2026-10-17T12:00:00Z",
+      "url": "https://cryptopanic.com/news/2/fed/",
+      "currencies": null
+    }
+  ]
+}

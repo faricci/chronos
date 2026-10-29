@@ -1,0 +1,192 @@
+# Chronos v2 configuration. Copy to config/config.yml.
+# Secrets are NOT stored here: COINBASE_API_KEY, COINBASE_API_SECRET, DECIDER_API_KEY, CRYPTOPANIC_TOKEN
+# are read from the environment only. Barrier parameters (k_tp, k_sl, atr_tf, entry_mode, horizon) and
+# policy thresholds belong to the model version in models/registry/, not to this file.
+# Every value below equals the built-in default (tests/test_config.py enforces it).
+
+paths:
+  state_dir: "state"                  # named Docker volume (SQLite WAL is unreliable on NTFS bind mounts)
+  data_dir: "data"
+  models_dir: "models"
+  news_db: "state/news.db"
+  live_db: "state/chronos_live.db"
+
+market:
+  products: ["BTC-EUR", "ETH-EUR", "SOL-EUR"]
+  backfill:
+    start: "2023-10-01"
+    rate_limit_per_s: 5.0
+    window_minutes: 300               # API limit is 350 candles per request
+    max_retries: 5
+  bars:                               # 1m bars = REST candles read S seconds after the minute closes
+    rest_delay_s: 120                 # S, 60..300: REST candles settle within ~92 s
+    rest_max_delay_s: 180             # S + 60: no candle and no proof past this lag -> flat_unproven
+    retry_s: 5
+    decision_max_lag_s: 240           # S + 120: past this lag the bar is consumed, no decision
+    store_flush_minutes: 15
+
+sentiment:
+  classifier:
+    model_dir: "models/sentiment/cryptobert-onnx-int8"
+    model_card: "models/sentiment/sentiment_model_card.json"
+    max_workers: 2
+    max_seq_len: 128
+  aggregation:
+    half_life_min: {asset: 90, market: 240}
+    half_life_slow_min: {asset: 1440, market: 2880}
+    retention_days: 7
+    shock_window_min: 15
+  dedup_window_hours: 48
+  assets:
+    BTC: {names: ["bitcoin"], tickers: ["BTC", "XBT"]}
+    ETH: {names: ["ethereum", "ether"], tickers: ["ETH"]}
+    SOL: {names: ["solana"], tickers: ["SOL"]}
+  market_keywords: ["sec", "etf", "fed", "regulation", "hack", "exchange", "stablecoin"]
+  sources:
+    - {name: coindesk_rss, kind: rss, url: "https://www.coindesk.com/arc/outboundfeeds/rss/", interval_s: 45}
+    - {name: cointelegraph_rss, kind: rss, url: "https://cointelegraph.com/rss", interval_s: 45}
+    - {name: decrypt_rss, kind: rss, url: "https://decrypt.co/feed", interval_s: 60}
+    - {name: theblock_rss, kind: rss, url: "https://www.theblock.co/rss.xml", interval_s: 60}
+    - {name: cryptoslate_rss, kind: rss, url: "https://cryptoslate.com/feed/", interval_s: 60}
+    - {name: cryptopanic, kind: cryptopanic, interval_s: 120, token_env: "CRYPTOPANIC_TOKEN", enabled_if_token: true}
+    - {name: fear_greed, kind: fear_greed, url: "https://api.alternative.me/fng/", interval_s: 3600}
+
+decision:
+  backend: "baseline"                 # baseline (default, CPU) | openjev | chronos-decider
+  model: "registry:champion"
+  fallback_to_baseline: true
+  questions_version: "QUESTIONS_V1"
+  remote:                             # used only if backend is openjev or chronos-decider
+    base_url: "http://decider:8080"
+    api_key_env: "DECIDER_API_KEY"
+    timeout_ms: 250
+
+risk:
+  risk_per_trade: 0.005
+  p_edge_full: 0.60
+  max_position_frac: 0.20
+  max_order_quote: "50.00"            # absolute cap per order (sez. 4.1.2); rises with the ramp
+  max_total_exposure_frac: 0.50
+  min_net_edge_bps: 30
+  ev_min_bps: 0
+  slippage_buffer_bps: 5
+  regime_multipliers: {1: 1.0, 2: 1.0, 3: 1.0}   # only allowed regimes; the veto lives in policy.json
+  kill_switch:
+    max_daily_loss_frac: 0.02
+    max_consecutive_losses: 4
+    loss_streak_pause_h: 48
+    stale_data_s: 90                  # last ticker
+    stale_bar_s: 270                  # last 1m bar (published at t + S) = S + 150; > decision_max_lag_s
+    max_fallback_ratio_1h: 0.20
+    psi_threshold: 0.25               # alert of the DIAGNOSTIC daily PSI v1 in L0; linked to no guard (conflict P1f)
+  watchdog:
+    sl_breach_atr_1h: 1.0
+    grace_s: 10
+
+execution:
+  mode: "dry"                         # dry | live ; live also requires env CHRONOS_LIVE_CONFIRM=I_ACCEPT_REAL_ORDERS
+  entry_timeout_s: {maker: 1800, taker: 20}
+  exit_timeout_s: 15
+  reconcile_interval_s: 60
+  fee_refresh_s: 3600
+  product_meta_refresh_s: 3600
+  balance_refresh_s: 30               # <= 40: three attempts before BUYs fail closed (sez. 4.1.6)
+  entry_poll_s: 5
+  cancel_confirm_timeout_s: 10
+
+dry_run:
+  db_path: "state/chronos_dry.db"
+  books:
+    - {name: champion, decider: "registry:champion", starting_quote: "100.00"}
+    - {name: challenger, decider: "registry:challenger", starting_quote: "100.00"}
+    - {name: random_entry, decider: random, match_frequency_of: champion, seed: 42, starting_quote: "100.00"}
+    - {name: buy_and_hold, decider: buy_and_hold, starting_quote: "100.00"}
+  fill_model:
+    mode: bar                                        # bar | tick: tick drives the brackets from WS trades and book
+    path: "models/registry/fill_model.json"
+    latency_ms: 300
+    queue_haircut: 0.25
+    stop_extra_slip_bps: 10
+    fallback_fees: {maker_bps: 60, taker_bps: 120}   # presumed lowest tier, flagged "assumed" until read from the account
+  recording:
+    enabled: true
+    dir: "data/ws_recordings"
+    retention_days: 30
+  learner:
+    run_at_utc: "00:15"
+    reload_at_utc: "00:30"
+    refit_day_of_month: 1
+    min_n_eff_calibration: 300
+    live_weight: 2.0
+    # Rule L5 (spec 5.1.6). Minimum trades and drawdown limit come from gate_econ (min_trades, max_drawdown_frac).
+    promotion: {backtest_recent_days: 90, min_shadow_days: 14, superiority_quantile: 0.05}
+  gate_ops:
+    min_days: 7
+    min_uptime: 0.99
+    min_decision_parity: 0.99
+    # window_start: 2026-10-24         # first UTC day counted by the gate (default: none; the dry run uses its first supervised day)
+    max_feature_psi: 0.10             # ALARM of the diagnostic feature_psi_daily_v1 (conflict P1f), not a gate
+    max_btc_stale_share: 0.005        # btc_context_alignment: max share of alt states with a BTC context of another instant
+    max_btc_stale_shift: 0.01         # ... and max shift m of the model answers between the served and the aligned state
+    buy_rate_tolerance: 0.50
+    min_maker_fill_rate: 0.50
+    max_spread_ratio_vs_labels: 2.0
+    max_fee_floor_skip_ratio: 0.80
+    max_rest_revision_ratio: 0.005     # ALARM of a diagnostic (raw share of revised minutes), not a gate (spec 2.11)
+    revision_shift_threshold: 0.01     # R1: a state is "shifted" if the model answer moves by more than this
+    max_revision_shift_share: 0.005    # R1: max share of shifted states per product and UTC day
+    max_revision_shift: 0.02           # R2: max shift of any state
+    max_revision_flip_share: 0.001     # R3: max share of states whose actionability flips
+  gate_econ:
+    min_trades: 30
+    min_profit_factor: 1.2
+    max_drawdown_frac: 0.05
+    max_ece_edge: 0.10
+
+live_ramp:
+  steps: ["R0", "R1", "R2"]
+  r0_min_trades: 10
+  step_min_trades: 30
+  parity: {max_median_entry_delta_bps: 10, min_bracket_outcome_agreement: 0.90}
+
+exec_probe:                           # P4-pre, spec 2.15: minimum-size real-money execution probe. OFF. The configuration can
+  enabled: false                      # only LOWER the hard limits of modules/probe/limits.py; the real run needs 3 more acts.
+  product: "BTC-EUR"
+  max_total_loss_quote: "3.00"        # L_tot
+  max_entry_quote: "3.00"             # Q_max (required_quote of one entry, coverage fee included)
+  test_order_quote: "2.00"
+  max_daily_loss_quote: "0.30"
+  anomaly_loss_quote: "0.50"
+  tp_frac: "0.006"
+  sl_frac: "0.006"
+  horizon_min: 480
+  entry_timeout_s: 1800               # GTD: the exchange expires the entry 30 minutes after it is sent
+  gtd_grace_s: 30
+  max_atr1h_bps: 60
+  max_spread_bps: 10
+  quote_max_age_s: 5
+  max_consecutive_sl: 2
+  max_watchdog_exits: 1
+  max_entries_per_day: 2
+  max_entries_total: 5
+  max_orders_per_day: 16
+  bracket_open_alarm_s: 10
+  bracket_open_max_s: 30
+  sl_fill_max_s: 60
+  sl_floor_ratio: "0.96"
+  sl_slip_alarm_bps: 15
+  sl_slip_severe_bps: 50
+  entry_slots_utc: ["09:00", "11:00"]
+  accept_gtc_fallback: false
+  db_path: "state/chronos_probe.db"
+  out_dir: "data/exec_probe"
+
+telemetry:                            # sez. 6.3: status.json, events, equity, ops of the day (never stops trading)
+  enabled: true
+  dir: "telemetry"                    # status.json
+  status_interval_s: 10
+  equity_interval_s: 60
+  ops_interval_s: 60
+  events_queue_max: 10000
+  events_retention_days: 180
+                                      # events_dir / equity_dir / ops_dir default to data/events, data/equity, data/reports/ops

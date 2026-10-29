@@ -2,7 +2,7 @@
 # Use this for local development and testing
 
 services:
-  # Main trading agent
+  # Main trading agent (v2 orchestrator, DRY RUN: real market data, simulated orders - spec sez. 5.1)
   chronos:
     build:
       context: .
@@ -11,20 +11,39 @@ services:
     volumes:
       # Mount config (contains secrets - never commit config.yml!)
       - ./config:/app/config:ro
-      # Mount data for persistence (historical data, positions, logs)
+      # Mount data for persistence (bar history, decisions, recordings, heartbeat)
       - ./data:/app/data
       # Mount model checkpoints
       - ./model_checkpoints:/app/model_checkpoints
+      # SQLite state lives on a named volume: WAL is not reliable on NTFS bind mounts (spec sez. 0.5)
+      - chronos-state:/app/state
+      # Trained models (models/baseline/<version>/ is read at start)
+      - ./models:/app/models
     environment:
       - PYTHONUNBUFFERED=1
       - TZ=Europe/Rome
+      # Secrets come from the host environment or from the ".env" next to this file (never from the YAML). Use a
+      # Coinbase View-only key (no Trade, no Transfer): the app refuses a key that can transfer funds.
+      - COINBASE_API_KEY
+      - COINBASE_API_SECRET
+      - DECIDER_API_KEY
+      - CRYPTOPANIC_TOKEN
+      # CHRONOS_LIVE_CONFIRM is deliberately NOT forwarded: this container can never be confirmed live
+      # (and the current build has no live path anyway).
     restart: unless-stopped
-    # Healthcheck to ensure the agent is running
+    # The app rewrites data/heartbeat every 10 s with "ok": false when the bars are stale, the feed is silent, a task
+    # died or the process is stopping. Healthy = the file is younger than 120 s AND says ok (spec sez. 4.3 punto 13).
+    # start_period covers the incremental backfill and the warm-up of three years of bars (the first start is long).
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json, sys, time; d = json.load(open('data/heartbeat')); sys.exit(0 if d.get('ok') is True and time.time() - d['ts'] < 120 else 1)"
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 40m
 
   # Test runner service
   test:
@@ -37,6 +56,7 @@ services:
       - ./data:/app/data
       - ./tests:/app/tests:ro
       - ./modules:/app/modules:ro
+      - chronos-state:/app/state
     environment:
       - PYTHONUNBUFFERED=1
     command: python -m unittest discover -s tests -v
@@ -52,6 +72,7 @@ services:
     volumes:
       # Mount entire project for live editing
       - .:/app
+      - chronos-state:/app/state
     environment:
       - PYTHONUNBUFFERED=1
     stdin_open: true
@@ -59,3 +80,6 @@ services:
     command: bash
     profiles:
       - dev  # Only run when explicitly requested
+
+volumes:
+  chronos-state:

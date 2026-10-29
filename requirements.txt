@@ -29,3 +29,29 @@ pyyaml
 
 # Coinbase API
 coinbase-advanced-py
+
+# v2 (P0 foundations, spec sez. 0.5 / Appendice B)
+pyarrow
+numba
+lightgbm
+scipy
+aiolimiter
+tenacity
+pydantic>=2
+pydantic-settings
+python-dotenv
+structlog
+sortedcontainers
+aiosqlite
+
+# v2 sentiment (spec sez. 1)
+httpx
+feedparser
+selectolax>=1.0
+cachetools
+readchar
+onnxruntime
+optimum[onnxruntime]
+# export of the ONNX model also needs torch (installed separately, see above); tests and type stubs:
+respx
+types-cachetools

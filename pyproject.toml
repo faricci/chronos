@@ -1,0 +1,61 @@
+[project]
+name = "chronos"
+version = "2.0.0"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+addopts = "-m \"not live and not data\" -rs"
+markers = [
+    "live: needs network access to Coinbase public endpoints (run manually)",
+    "data: needs the backfilled Parquet history, takes minutes (run for the P0 exit criterion)",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["modules", "training"]
+explicit_package_bases = true
+mypy_path = "."
+# v1 modules are removed together with their v2 replacement (spec sez. 0.5)
+exclude = [
+    "modules/data_fetch[.]py",
+    "modules/data_preprocessing[.]py",
+    "modules/monitoring[.]py",
+    "modules/sentiment_analysis[.]py",
+    "modules/trading_logic[.]py",
+    "modules/utils[.]py",
+    "modules/vector_storage[.]py",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+# v1 modules and tests are deleted with their v2 replacement (spec sez. 0.5); never lint-fix them
+extend-exclude = [
+    ".venv",
+    "modules/data_fetch.py",
+    "modules/data_preprocessing.py",
+    "modules/monitoring.py",
+    "modules/sentiment_analysis.py",
+    "modules/trading_logic.py",
+    "modules/utils.py",
+    "modules/vector_storage.py",
+    "script/train_timeseries_model.py",
+    "tests/test_data_fetch.py",
+    "tests/test_data_preprocessing.py",
+    "tests/test_monitoring.py",
+    "tests/test_sentiment_analysis.py",
+    "tests/test_trading_logic.py",
+    "tests/test_vector_storage.py",
+    "utils",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[[tool.mypy.overrides]]
+module = ["coinbase.*", "sortedcontainers", "numba", "numba.*", "lightgbm", "scipy.*", "sklearn.*", "feedparser", "onnxruntime", "onnxruntime.*", "optimum", "optimum.*"]
+ignore_missing_imports = true
